@@ -4,9 +4,7 @@ A Python-based GUI application for downloading Bandcamp albums with full metadat
 
 ## Why This Exists
 
-This project was created as an interim solution for users experiencing issues with [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader). While we wait for official updates and fixes to that excellent C# application, this Python-based alternative provides a working solution with a modern interface.
-
-**This is not intended to replace Otiel's project** - it's simply a stopgap measure. 
+This was created as an interim solution for users experiencing issues with [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader). While we wait for official updates and fixes to that excellent C# application, this Python-based alternative provides a working solution.
 
 ## What It Does
 
