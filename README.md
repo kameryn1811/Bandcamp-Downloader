@@ -12,6 +12,11 @@ This project was created as an interim solution for users experiencing issues wi
 
 Bandcamp Downloader GUI provides a simple way to download the freely available 128 kbps MP3 streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
 
+## Screenshots
+
+![Main Interface](images/screenshot-main.png)
+*The main download interface with album art preview and settings panel*
+
 ## Key Features
 
 * **Simple GUI** - No command-line knowledge required
@@ -55,11 +60,6 @@ That's it! No manual package installation needed - the script handles it.
 5. **Wait** for the thing to happen
 
 The interface shows real-time progress, and files are automatically organized and tagged when complete.
-
-## Screenshots
-
-![Main Interface](images/screenshot-main.png)
-*The main download interface with album art preview and settings panel*
 
 ## Audio Quality & Artist Support
 
