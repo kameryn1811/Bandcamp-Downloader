@@ -2118,6 +2118,7 @@ class BandcampDownloaderGUI:
     def apply_track_numbering(self, download_path):
         """Apply track numbering to downloaded files based on user preference."""
         import re
+        import time
         
         numbering_style = self.numbering_var.get()
         if numbering_style == "None":
@@ -2128,30 +2129,46 @@ class BandcampDownloaderGUI:
             if not base_path.exists():
                 return
             
-            # Find all audio files
-            format_val = self.format_var.get()
-            base_format = self._extract_format(format_val)
-            skip_postprocessing = self.skip_postprocessing_var.get()
-            if skip_postprocessing:
-                # When skipping post-processing, check all audio formats
-                target_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
-            else:
-                target_exts = self.FORMAT_EXTENSIONS.get(base_format, [])
-            if not target_exts:
-                return
+            # Only process files that were just downloaded
+            # Use downloaded_files set if available, otherwise use timestamp-based filtering
+            files_to_process = []
             
-            audio_files = []
-            for ext in target_exts:
-                audio_files.extend(base_path.rglob(f"*{ext}"))
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                # Process only files that were tracked as downloaded
+                for downloaded_file in self.downloaded_files:
+                    file_path = Path(downloaded_file)
+                    if file_path.exists():
+                        files_to_process.append(file_path)
+            elif hasattr(self, 'download_start_time') and self.download_start_time:
+                # Fallback: use timestamp-based filtering (files modified after download started)
+                # Use a 30 second buffer before download started to catch files from this session
+                time_threshold = self.download_start_time - 30
+                format_val = self.format_var.get()
+                base_format = self._extract_format(format_val)
+                skip_postprocessing = self.skip_postprocessing_var.get()
+                if skip_postprocessing:
+                    target_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
+                else:
+                    target_exts = self.FORMAT_EXTENSIONS.get(base_format, [])
+                
+                for ext in target_exts:
+                    for audio_file in base_path.rglob(f"*{ext}"):
+                        try:
+                            # Only include files modified after download started (with buffer)
+                            file_mtime = audio_file.stat().st_mtime
+                            if file_mtime >= time_threshold:
+                                files_to_process.append(audio_file)
+                        except Exception:
+                            pass  # Skip files we can't access
             
-            if not audio_files:
+            if not files_to_process:
                 return
             
             # Sort files by name to maintain order
-            audio_files.sort(key=lambda x: x.name)
+            files_to_process.sort(key=lambda x: x.name)
             
             # Process each file
-            for audio_file in audio_files:
+            for audio_file in files_to_process:
                 # Skip temporary files
                 if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
                     continue
@@ -2176,8 +2193,8 @@ class BandcampDownloaderGUI:
                     if match:
                         track_number = int(match.group(1))
                     else:
-                        # Use file index as fallback
-                        track_number = audio_files.index(audio_file) + 1
+                        # Use file index as fallback (within the files we're processing)
+                        track_number = files_to_process.index(audio_file) + 1
                 
                 # Use sanitized track title for the new filename
                 track_title = self.sanitize_filename(track_title)
