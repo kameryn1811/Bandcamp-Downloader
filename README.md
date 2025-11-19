@@ -46,7 +46,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 **Installation**
 
-1. Download the repository files and place in a folder
+1. Download the [Latest Release](https://github.com/kameryn1811/Bandcamp-Downloader/releases/latest) and extract it into a folder
 2. Place `ffmpeg.exe` in the folder
 3. Double-click `Bandcamp Downloader GUI.bat` (optionally create a shortcut to this file and pin it to your startmenu, taskbar, desktop, etc)
 4. The app will check for and help install any missing dependencies
