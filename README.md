@@ -32,7 +32,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 ## Quick Start
 
-### Prerequisites
+**Prerequisites**
 
 1. **Python 3.11 or higher**
    * Download: https://www.python.org/downloads/
@@ -44,7 +44,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
    * Extract `ffmpeg.exe` from the `bin` folder
    * Place it in the same folder as `bandcamp_dl_gui.py`
 
-### Installation
+**Installation**
 
 1. Download the repository files and place in a folder
 2. Place `ffmpeg.exe` in the folder
@@ -53,7 +53,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 That's it! No manual package installation needed - the script handles it.
 
-### Supported URLs
+**Supported URLs**
 
 * Album pages: `https://[artist].bandcamp.com/album/[album]`
 * Track pages: `https://[artist].bandcamp.com/track/[track]`
@@ -80,13 +80,13 @@ That's it! No manual package installation needed - the script handles it.
 
 ## Audio Quality & Artist Support
 
-### ⚠️ About Quality
+**⚠️ About Quality**
 
 This tool downloads the **128 kbps MP3 streams** that Bandcamp makes available for free listening. These are the same quality files you hear when streaming on the website.
 
 **Converting to FLAC, OGG, or WAV does NOT improve quality** - it only changes the file format. The source remains 128 kbps.
 
-### 🎵 Support the Artists
+**🎵 Support the Artists**
 
 For high-quality audio (FLAC, 320 kbps MP3, etc.), **please purchase albums directly from Bandcamp**. 
 
