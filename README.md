@@ -21,13 +21,12 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 ## Key Features
 
-* **Auto-Setup** - Checks dependencies and guides you through installation
+* **Automated-Setup** - Checks dependencies and guides you through installation
 * **Simple GUI** - No command-line knowledge required
-* **Organization** - Choose from 5 folder structures (Artist/Album is default)
+* **Organization** - Choose from several folder structure (e.g. Artist/Album) and file Numbering options
 * **Metadata** - Automatically tags files with artist, album, track number, and date
-* **Cover Art** - Embeds artwork into files and optionally saves separate copies
+* **Cover Art** - Embeds artwork into files and optionally includes a copy in dowloaded files
 * **Format Flexibility** - Output as MP3, FLAC, OGG, or WAV (note: all converted from 128 kbps source)
-* **Track Numbering** - Optional automatic track number prefixes
 * **Playlist Generation** - Create .m3u playlists automatically
 
 ## Quick Start
@@ -35,7 +34,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 **Prerequisites**
 
 1. **Python 3.11 or higher**
-   * Download: https://www.python.org/downloads/
+   * Download and Intall: https://www.python.org/downloads/
    * ⚠️ **Must check "Add Python to PATH" during installation**
 
 2. **ffmpeg.exe**
@@ -46,10 +45,11 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 **Installation**
 
-1. Download the [Latest Release](https://github.com/kameryn1811/Bandcamp-Downloader/releases/latest) and extract it into a folder
+1. Download the [Latest Release](https://github.com/kameryn1811/Bandcamp-Downloader/releases/latest) and extract it into a folder e.g. /Bandcamp Downloader
 2. Place `ffmpeg.exe` in the folder
-3. Double-click `Bandcamp Downloader GUI.bat` (optionally create a shortcut to this file and pin it to your startmenu, taskbar, desktop, etc)
+3. Double-click `Bandcamp Downloader GUI.bat` (optionally create a shortcut to this file and pin it to your start menu, taskbar, desktop, etc)
 4. The app will check for and help install any missing dependencies
+5. Profit
 
 **Supported URLs**
 
