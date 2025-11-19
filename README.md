@@ -10,6 +10,8 @@ This was created as an interim solution for users experiencing issues with [Otie
 
 Bandcamp Downloader GUI provides a simple way to download the freely available 128 kbps MP3 streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
 
+## Screenshots
+
 ![Main Interface](images/screenshot-main.png)
 *The main download interface with album art preview and settings panel*
 
@@ -72,13 +74,15 @@ That's it! No manual package installation needed - the script handles it.
 - Install Pillow: `python -m pip install Pillow`
 - The app will prompt to install it automatically
 
-### ⚠️ Important Quality Notice
+## Audio Quality & Artist Support
+
+### ⚠️ About Quality
 
 This tool downloads the **128 kbps MP3 streams** that Bandcamp makes available for free listening. These are the same quality files you hear when streaming on the website.
 
 **Converting to FLAC, OGG, or WAV does NOT improve quality** - it only changes the file format. The source remains 128 kbps.
 
-### 🎵 Support Artists
+### 🎵 Support the Artists
 
 For high-quality audio (FLAC, 320 kbps MP3, etc.), **please purchase albums directly from Bandcamp**. 
 
