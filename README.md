@@ -51,8 +51,6 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 3. Double-click `Bandcamp Downloader GUI.bat` (optionally create a shortcut to this file and pin it to your startmenu, taskbar, desktop, etc)
 4. The app will check for and help install any missing dependencies
 
-That's it! No manual package installation needed - the script handles it.
-
 **Supported URLs**
 
 * Album pages: `https://[artist].bandcamp.com/album/[album]`
