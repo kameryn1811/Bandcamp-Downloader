@@ -2233,11 +2233,293 @@ class BandcampDownloaderGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Error applying track numbering: {str(e)}"))
     
+    def rename_cover_art_files(self, download_path):
+        """Rename cover art files to 'artist - album' format."""
+        import re
+        try:
+            base_path = Path(download_path)
+            if not base_path.exists():
+                return
+            
+            # Get album info - try multiple sources for accuracy
+            artist = None
+            album = None
+            
+            # Method 1: Try to extract from folder structure (most reliable for "Artist / Album" structure)
+            # Check if we're in an "Artist/Album" folder structure
+            try:
+                # Get the folder structure choice
+                choice = self._extract_structure_choice(self.folder_structure_var.get())
+                
+                # If structure is "Artist / Album" (4) or "Album / Artist" (5), extract from path
+                if choice in ["4", "5"]:
+                    # Find any downloaded audio file to get its path
+                    if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                        for downloaded_file in list(self.downloaded_files)[:1]:  # Just check first file
+                            audio_path = Path(downloaded_file)
+                            if audio_path.exists():
+                                # For structure 4: Artist/Album/Track
+                                # For structure 5: Album/Artist/Track
+                                parts = audio_path.parts
+                                if len(parts) >= 3:
+                                    if choice == "4":
+                                        # Structure: base/Artist/Album/Track
+                                        artist = parts[-3]  # Second to last folder
+                                        album = parts[-2]  # Last folder before filename
+                                    elif choice == "5":
+                                        # Structure: base/Album/Artist/Track
+                                        album = parts[-3]  # Second to last folder
+                                        artist = parts[-2]  # Last folder before filename
+                                break
+            except Exception:
+                pass
+            
+            # Method 2: Try to get from download_info, but only if album field exists (not fallback to title)
+            if not album and hasattr(self, 'download_info') and self.download_info:
+                # Look for a track that has an explicit album field (not fallback)
+                for track_info in self.download_info.values():
+                    # Only use if album is explicitly set (not None and not empty)
+                    track_album = track_info.get("album")
+                    if track_album and track_album.strip():
+                        # Verify it's not the same as a track title (basic check)
+                        track_title = track_info.get("title", "")
+                        if track_album != track_title:
+                            album = track_album
+                    if track_info.get("artist"):
+                        artist = track_info.get("artist")
+                    if album and artist:
+                        break
+            
+            # Method 3: Fallback to album_info_stored
+            if not album:
+                album = self.album_info_stored.get("album") if hasattr(self, 'album_info_stored') else None
+            if not artist:
+                artist = self.album_info_stored.get("artist") if hasattr(self, 'album_info_stored') else None
+            
+            # Final fallback to "Unknown"
+            artist = self.sanitize_filename(artist) if artist else "Unknown Artist"
+            album = self.sanitize_filename(album) if album else "Unknown Album"
+            
+            # Create the target filename
+            cover_art_name = f"{artist} - {album}"
+            
+            # Find all cover art files that were just downloaded
+            cover_art_files = []
+            
+            if hasattr(self, 'download_start_time') and self.download_start_time:
+                # Use timestamp-based filtering to find recently downloaded cover art files
+                time_threshold = self.download_start_time - 30
+                for ext in self.THUMBNAIL_EXTENSIONS:
+                    for thumb_file in base_path.rglob(f"*{ext}"):
+                        try:
+                            file_mtime = thumb_file.stat().st_mtime
+                            if file_mtime >= time_threshold:
+                                # Skip files that already have the "artist - album" format
+                                if not re.match(r'^[^-]+ - [^-]+$', thumb_file.stem):
+                                    cover_art_files.append(thumb_file)
+                        except Exception:
+                            pass
+            
+            if not cover_art_files:
+                return
+            
+            # Group cover art files by directory (each album folder gets one cover art)
+            cover_art_by_dir = {}
+            for thumb_file in cover_art_files:
+                thumb_dir = thumb_file.parent
+                if thumb_dir not in cover_art_by_dir:
+                    cover_art_by_dir[thumb_dir] = []
+                cover_art_by_dir[thumb_dir].append(thumb_file)
+            
+            # Rename cover art files in each directory
+            for thumb_dir, thumb_files in cover_art_by_dir.items():
+                # Find the best cover art file to keep (prefer common names, then first one)
+                thumb_files.sort(key=lambda f: (
+                    0 if any(name in f.stem.lower() for name in ['cover', 'album', 'folder', 'artwork']) else 1,
+                    f.name
+                ))
+                
+                # Keep the first file, rename others or delete duplicates
+                kept_file = thumb_files[0]
+                target_name = cover_art_name + kept_file.suffix
+                target_path = thumb_dir / target_name
+                
+                # If the target already exists and is the same file, skip
+                if target_path == kept_file:
+                    # Already has the right name, just delete duplicates
+                    for thumb_file in thumb_files[1:]:
+                        try:
+                            thumb_file.unlink()
+                        except Exception:
+                            pass
+                    continue
+                
+                # Rename the kept file to "artist - album"
+                try:
+                    # If target exists, delete it first (might be from previous download)
+                    if target_path.exists():
+                        target_path.unlink()
+                    
+                    kept_file.rename(target_path)
+                    self.root.after(0, lambda old=kept_file.name, new=target_name: 
+                                   self.log(f"Renamed cover art: {old} → {new}"))
+                    
+                    # Delete any remaining duplicate cover art files
+                    for thumb_file in thumb_files[1:]:
+                        try:
+                            thumb_file.unlink()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.root.after(0, lambda name=kept_file.name: 
+                                   self.log(f"⚠ Could not rename cover art: {name}"))
+        
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"⚠ Error renaming cover art: {str(e)}"))
+    
+    def final_cover_art_cleanup(self, download_path):
+        """Final cleanup pass: rename all cover art files to 'artist - album' format based on folder structure."""
+        import re
+        try:
+            base_path = Path(download_path)
+            if not base_path.exists():
+                return
+            
+            # Get folder structure choice
+            choice = self._extract_structure_choice(self.folder_structure_var.get())
+            
+            # Find all directories that might contain cover art
+            directories_to_check = set()
+            
+            # For structure 4 (Artist/Album) or 5 (Album/Artist), check album-level directories
+            if choice in ["4", "5"]:
+                # Find all directories that are 2 levels deep (Artist/Album or Album/Artist)
+                for item in base_path.iterdir():
+                    if item.is_dir():
+                        for subitem in item.iterdir():
+                            if subitem.is_dir():
+                                directories_to_check.add(subitem)
+            elif choice == "2":
+                # Structure 2: Album folder - check album directories
+                for item in base_path.iterdir():
+                    if item.is_dir():
+                        directories_to_check.add(item)
+            elif choice == "3":
+                # Structure 3: Artist folder - check artist directories
+                for item in base_path.iterdir():
+                    if item.is_dir():
+                        directories_to_check.add(item)
+            else:
+                # Structure 1: Root - check base path
+                directories_to_check.add(base_path)
+            
+            # Process each directory
+            for directory in directories_to_check:
+                # Find all cover art files in this directory
+                cover_art_files = []
+                for ext in self.THUMBNAIL_EXTENSIONS:
+                    cover_art_files.extend(directory.glob(f"*{ext}"))
+                
+                if not cover_art_files:
+                    continue
+                
+                # Extract artist and album from folder structure
+                artist = None
+                album = None
+                
+                if choice == "4":
+                    # Structure: base/Artist/Album
+                    parts = directory.parts
+                    if len(parts) >= 2:
+                        artist = parts[-2]  # Second to last folder
+                        album = parts[-1]   # Last folder
+                elif choice == "5":
+                    # Structure: base/Album/Artist
+                    parts = directory.parts
+                    if len(parts) >= 2:
+                        album = parts[-2]   # Second to last folder
+                        artist = parts[-1]  # Last folder
+                elif choice == "2":
+                    # Structure: base/Album
+                    album = directory.name
+                    # Try to get artist from metadata or use "Unknown Artist"
+                    if hasattr(self, 'album_info_stored') and self.album_info_stored.get("artist"):
+                        artist = self.album_info_stored.get("artist")
+                    else:
+                        artist = "Unknown Artist"
+                elif choice == "3":
+                    # Structure: base/Artist
+                    artist = directory.name
+                    # Try to get album from metadata or use "Unknown Album"
+                    if hasattr(self, 'album_info_stored') and self.album_info_stored.get("album"):
+                        album = self.album_info_stored.get("album")
+                    else:
+                        album = "Unknown Album"
+                else:
+                    # Structure 1: Root - try to get from metadata
+                    if hasattr(self, 'album_info_stored'):
+                        artist = self.album_info_stored.get("artist", "Unknown Artist")
+                        album = self.album_info_stored.get("album", "Unknown Album")
+                    else:
+                        continue  # Can't determine, skip
+                
+                # Sanitize names
+                artist = self.sanitize_filename(artist) if artist else "Unknown Artist"
+                album = self.sanitize_filename(album) if album else "Unknown Album"
+                
+                # Create target filename
+                target_name = f"{artist} - {album}"
+                
+                # Find the best cover art file to keep (prefer common names)
+                cover_art_files.sort(key=lambda f: (
+                    0 if any(name in f.stem.lower() for name in ['cover', 'album', 'folder', 'artwork']) else 1,
+                    f.name
+                ))
+                
+                kept_file = cover_art_files[0]
+                target_path = directory / f"{target_name}{kept_file.suffix}"
+                
+                # Skip if already correctly named
+                if kept_file.name == target_path.name:
+                    # Delete duplicates
+                    for thumb_file in cover_art_files[1:]:
+                        try:
+                            thumb_file.unlink()
+                        except Exception:
+                            pass
+                    continue
+                
+                # Rename the kept file
+                try:
+                    # If target exists, delete it first
+                    if target_path.exists():
+                        target_path.unlink()
+                    
+                    kept_file.rename(target_path)
+                    self.root.after(0, lambda old=kept_file.name, new=target_path.name: 
+                                   self.log(f"Final cleanup: Renamed cover art {old} → {new}"))
+                    
+                    # Delete all other cover art files in this directory
+                    for thumb_file in cover_art_files[1:]:
+                        try:
+                            thumb_file.unlink()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.root.after(0, lambda name=kept_file.name: 
+                                   self.log(f"⚠ Could not rename cover art: {name}"))
+        
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"⚠ Error in final cover art cleanup: {str(e)}"))
+    
     def process_downloaded_files(self, download_path):
         """Process all downloaded files to embed cover art for FLAC, OGG, and WAV."""
         
         # Apply track numbering first
         self.apply_track_numbering(download_path)
+        
+        # Rename cover art files to "artist - album" format
+        self.rename_cover_art_files(download_path)
         
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
@@ -3025,6 +3307,9 @@ class BandcampDownloaderGUI:
                 # Create playlist file if enabled
                 if self.create_playlist_var.get():
                     self.create_playlist_file(download_path, base_format)
+                
+                # Final cleanup: rename all cover art files to "artist - album" format
+                self.final_cover_art_cleanup(download_path)
             
             # Success
             self.root.after(0, self.download_complete, True, "Download complete!")
