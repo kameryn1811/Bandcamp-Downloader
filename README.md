@@ -10,21 +10,19 @@ This was created as an interim solution for users experiencing issues with [Otie
 
 Bandcamp Downloader GUI provides a simple way to download the freely available 128 kbps MP3 streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
 
-## Screenshots
-
 ![Main Interface](images/screenshot-main.png)
 *The main download interface with album art preview and settings panel*
 
 ## Key Features
 
+* **Auto-Setup** - Checks dependencies and guides you through installation
 * **Simple GUI** - No command-line knowledge required
-* **Smart Organization** - Choose from 5 folder structures (Artist/Album is default)
-* **Complete Metadata** - Automatically tags files with artist, album, track number, and date
-* **Cover Art Handling** - Embeds artwork into files and optionally saves separate copies
+* **Organization** - Choose from 5 folder structures (Artist/Album is default)
+* **Metadata** - Automatically tags files with artist, album, track number, and date
+* **Cover Art** - Embeds artwork into files and optionally saves separate copies
 * **Format Flexibility** - Output as MP3, FLAC, OGG, or WAV (note: all converted from 128 kbps source)
 * **Track Numbering** - Optional automatic track number prefixes
 * **Playlist Generation** - Create .m3u playlists automatically
-* **Auto-Setup** - Checks dependencies and guides you through installation
 
 ## Quick Start
 
