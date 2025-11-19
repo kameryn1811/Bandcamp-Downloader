@@ -5,6 +5,13 @@
 !bandcamp_dl_gui.py
 !icon.ico
 !Bandcamp Downloader GUI.bat
+!README.md
+
+# Track images folder for screenshots
+!images/
+!images/*.png
+!images/*.jpg
+!images/*.jpeg
 
 # Also track .gitignore itself
 !.gitignore
