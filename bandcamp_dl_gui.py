@@ -612,7 +612,8 @@ class BandcampDownloaderGUI:
             if hasattr(self, 'settings_frame'):
                 self.settings_frame.grid_configure(columnspan=3)
             if hasattr(self, 'show_album_art_btn'):
-                self.show_album_art_btn.grid()
+                # Show the button by making it visible (it's always in grid, just invisible)
+                self.show_album_art_btn.config(fg='#808080', cursor='hand2')
     
     def save_album_art_state(self):
         """Save album art visibility state."""
@@ -874,31 +875,13 @@ class BandcampDownloaderGUI:
         self.settings_frame.grid_propagate(False)
         self.settings_frame.config(height=170)  # Reduced height with equal padding top and bottom
         
-        # Show album art button (hidden by default, shown when album art is hidden)
-        # Placed directly in settings_frame header area
-        settings_header = Frame(self.settings_frame, bg='#1E1E1E')
-        settings_header.grid(row=0, column=0, sticky=(W, E), padx=6, pady=(6, 0))
-        settings_header.columnconfigure(0, weight=1)
-        
-        self.show_album_art_btn = Label(
-            settings_header,
-            text="👁",
-            font=("Segoe UI", 10),
-            bg='#1E1E1E',
-            fg='#808080',
-            cursor='hand2',
-            width=2
-        )
-        self.show_album_art_btn.grid(row=0, column=0, sticky=E)
-        self.show_album_art_btn.bind("<Button-1>", lambda e: self.toggle_album_art())
-        self.show_album_art_btn.bind("<Enter>", lambda e: self.show_album_art_btn.config(fg='#D4D4D4'))
-        self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg='#808080'))
-        self.show_album_art_btn.grid_remove()  # Hidden by default
-        
         # Inner frame for content
-        settings_content = Frame(self.settings_frame, bg='#1E1E1E')
-        settings_content.grid(row=1, column=0, sticky=(W, E), padx=6, pady=(6, 6))  # Equal padding top and bottom
+        self.settings_content = Frame(self.settings_frame, bg='#1E1E1E')
+        # Start at row 0 (no separate header row)
+        self.settings_content.grid(row=0, column=0, sticky=(W, E), padx=6, pady=(6, 6))  # Equal padding top and bottom
         self.settings_frame.columnconfigure(0, weight=1)
+        # Configure columns: label, combo, button (right-aligned)
+        self.settings_content.columnconfigure(1, weight=1)  # Allow combo to expand
         
         # Album art panel (separate frame on the right, same height as settings, square for equal padding)
         self.album_art_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
@@ -933,10 +916,10 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8)
         )
         
-        # Audio Format (first)
-        ttk.Label(settings_content, text="Audio Format:", font=("Segoe UI", 8)).grid(row=0, column=0, padx=4, sticky=W, pady=1)
+        # Audio Format (first) - with eye icon button on the right when album art is hidden
+        ttk.Label(self.settings_content, text="Audio Format:", font=("Segoe UI", 8)).grid(row=0, column=0, padx=4, sticky=W, pady=1)
         format_combo = ttk.Combobox(
-            settings_content,
+            self.settings_content,
             textvariable=self.format_var,
             values=["mp3 (128kbps)", "flac", "ogg", "wav"],
             state="readonly",
@@ -945,10 +928,29 @@ class BandcampDownloaderGUI:
         format_combo.grid(row=0, column=1, padx=4, sticky=W, pady=1)
         format_combo.bind("<<ComboboxSelected>>", lambda e: (self._deselect_combobox_text(e), self.on_format_change(e), self.update_preview()))
         
+        # Show album art button (hidden by default, shown when album art is hidden)
+        # Placed in the same row as Audio Format, right-aligned
+        # Always keep it in grid to prevent layout shifts - just make it invisible when not needed
+        self.show_album_art_btn = Label(
+            self.settings_content,
+            text="👁",
+            font=("Segoe UI", 10),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=2
+        )
+        self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
+        self.show_album_art_btn.bind("<Button-1>", lambda e: self.toggle_album_art() if self.show_album_art_btn.cget('fg') != '#1E1E1E' else None)
+        self.show_album_art_btn.bind("<Enter>", lambda e: self.show_album_art_btn.config(fg='#D4D4D4') if self.show_album_art_btn.cget('fg') != '#1E1E1E' else None)
+        self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg='#808080') if self.show_album_art_btn.cget('fg') != '#1E1E1E' else None)
+        # Make invisible by default (only visible when album art is hidden)
+        self.show_album_art_btn.config(fg='#1E1E1E')  # Match background to make invisible
+        
         # Numbering (second, below Audio Format)
-        ttk.Label(settings_content, text="Numbering:", font=("Segoe UI", 8)).grid(row=1, column=0, padx=4, sticky=W, pady=1)
+        ttk.Label(self.settings_content, text="Numbering:", font=("Segoe UI", 8)).grid(row=1, column=0, padx=4, sticky=W, pady=1)
         numbering_combo = ttk.Combobox(
-            settings_content,
+            self.settings_content,
             textvariable=self.numbering_var,
             values=["None", "01. Track", "1. Track", "01 - Track", "1 - Track"],
             state="readonly",
@@ -958,12 +960,12 @@ class BandcampDownloaderGUI:
         numbering_combo.bind("<<ComboboxSelected>>", lambda e: (self._deselect_combobox_text(e), self.on_numbering_change(e), self.update_preview()))
         
         # Folder Structure (third, below Numbering)
-        ttk.Label(settings_content, text="Folder Structure:", font=("Segoe UI", 8)).grid(row=2, column=0, padx=4, sticky=W, pady=1)
+        ttk.Label(self.settings_content, text="Folder Structure:", font=("Segoe UI", 8)).grid(row=2, column=0, padx=4, sticky=W, pady=1)
         
         # Create a separate display variable for the combobox using class constants
         structure_display_values = list(self.FOLDER_STRUCTURES.values())
         structure_combo = ttk.Combobox(
-            settings_content,
+            self.settings_content,
             textvariable=self.folder_structure_var,
             values=structure_display_values,
             state="readonly",
@@ -981,7 +983,7 @@ class BandcampDownloaderGUI:
         
         # Skip post-processing checkbox (below Folder Structure) - only shown if developer flag is enabled
         skip_postprocessing_check = Checkbutton(
-            settings_content,
+            self.settings_content,
             text="Skip post-processing (output original files)",
             variable=self.skip_postprocessing_var,
             font=("Segoe UI", 8),
@@ -999,7 +1001,7 @@ class BandcampDownloaderGUI:
         
         # Download cover art separately checkbox (below Skip post-processing)
         download_cover_art_check = Checkbutton(
-            settings_content,
+            self.settings_content,
             text="Save copy of cover art in download folder",
             variable=self.download_cover_art_var,
             font=("Segoe UI", 8),
@@ -1014,7 +1016,7 @@ class BandcampDownloaderGUI:
         
         # Create playlist checkbox (below Save copy of cover art)
         create_playlist_check = Checkbutton(
-            settings_content,
+            self.settings_content,
             text="Create playlist file (.m3u)",
             variable=self.create_playlist_var,
             font=("Segoe UI", 8),
@@ -1029,7 +1031,7 @@ class BandcampDownloaderGUI:
         
         # Download artist discography checkbox (below Create playlist)
         download_discography_check = Checkbutton(
-            settings_content,
+            self.settings_content,
             text="Download artist discography",
             variable=self.download_discography_var,
             font=("Segoe UI", 8),
@@ -1042,9 +1044,10 @@ class BandcampDownloaderGUI:
         )
         download_discography_check.grid(row=6, column=0, columnspan=2, padx=4, sticky=W, pady=1)
         
-        # Configure column weights to keep dropdowns in place
-        settings_content.columnconfigure(0, weight=0)
-        settings_content.columnconfigure(1, weight=0)
+        # Configure column weights: label (0), combo (1), button (2)
+        self.settings_content.columnconfigure(0, weight=0)  # Label column - fixed width
+        self.settings_content.columnconfigure(1, weight=1)  # Combo column - can expand
+        self.settings_content.columnconfigure(2, weight=0)  # Button column - fixed width
         
         # Preview container (below both settings and album art panels)
         preview_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
@@ -1813,15 +1816,15 @@ class BandcampDownloaderGUI:
             self.album_art_frame.grid()
             # Update settings frame to span 2 columns (leaving room for album art)
             self.settings_frame.grid_configure(columnspan=2)
-            # Hide the "show" button in settings header
-            self.show_album_art_btn.grid_remove()
+            # Hide the show album art button by making it invisible (keep in grid to prevent layout shift)
+            self.show_album_art_btn.config(fg='#1E1E1E', cursor='arrow')  # Match background, no hand cursor
         else:
             # Hide album art panel
             self.album_art_frame.grid_remove()
             # Update settings frame to span 3 columns (full width)
             self.settings_frame.grid_configure(columnspan=3)
-            # Show the "show" button in settings header
-            self.show_album_art_btn.grid()
+            # Show the show album art button by making it visible
+            self.show_album_art_btn.config(fg='#808080', cursor='hand2')  # Visible, hand cursor
         
         # Save the state
         self.save_album_art_state()
@@ -1990,9 +1993,36 @@ class BandcampDownloaderGUI:
         
         path_obj = Path(path)
         
-        # Check if path exists
+        # Check if path exists - if not, offer to create it
         if not path_obj.exists():
-            return False, "The selected download path does not exist."
+            # Ask user if they want to create the directory
+            response = messagebox.askyesno(
+                "Path Does Not Exist",
+                f"The path does not exist:\n{path}\n\n"
+                "Would you like to create it?"
+            )
+            if response:
+                try:
+                    # Create the directory and all parent directories if needed
+                    path_obj.mkdir(parents=True, exist_ok=True)
+                    # Verify it was created successfully
+                    if not path_obj.exists() or not path_obj.is_dir():
+                        return False, f"Failed to create the directory:\n{path}\n\nPlease check the path and try again."
+                except PermissionError:
+                    return False, f"Permission denied: Cannot create directory at:\n{path}\n\nPlease choose a different location or run with administrator privileges."
+                except OSError as e:
+                    # Handle various OS errors (invalid characters, too long path, network issues, etc.)
+                    error_msg = str(e)
+                    if "invalid argument" in error_msg.lower() or "filename" in error_msg.lower():
+                        return False, f"Invalid path: The path contains invalid characters or is too long.\n\nPath: {path}\n\nPlease choose a different path."
+                    elif "network" in error_msg.lower() or "unreachable" in error_msg.lower():
+                        return False, f"Network error: Cannot access the network path:\n{path}\n\nPlease check your network connection."
+                    else:
+                        return False, f"Cannot create directory:\n{path}\n\nError: {error_msg}"
+                except Exception as e:
+                    return False, f"Unexpected error creating directory:\n{path}\n\nError: {str(e)}"
+            else:
+                return False, "Please select an existing download path or allow the app to create it."
         
         # Check if path is a directory
         if not path_obj.is_dir():
@@ -2455,9 +2485,63 @@ class BandcampDownloaderGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Error renaming cover art: {str(e)}"))
     
+    def _get_metadata_from_directory(self, directory):
+        """Extract artist and album metadata from the first audio file in a directory."""
+        try:
+            # Look for audio files in this directory
+            audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a"]
+            audio_files = []
+            for ext in audio_extensions:
+                audio_files.extend(directory.glob(f"*{ext}"))
+            
+            if not audio_files:
+                return None, None
+            
+            # Use the first audio file to get metadata
+            audio_file = audio_files[0]
+            
+            # Try to read metadata using ffprobe (works for all formats)
+            try:
+                ffprobe_path = self.ffmpeg_path.parent / "ffprobe.exe"
+                if not ffprobe_path.exists():
+                    ffprobe_path = self.script_dir / "ffprobe.exe"
+                    if not ffprobe_path.exists():
+                        return None, None
+                
+                cmd = [
+                    str(ffprobe_path),
+                    "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_format",
+                    str(audio_file)
+                ]
+                
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                
+                if result.returncode == 0:
+                    import json
+                    data = json.loads(result.stdout.decode('utf-8', errors='ignore'))
+                    tags = data.get("format", {}).get("tags", {})
+                    
+                    # Extract artist and album from tags
+                    artist = tags.get("artist") or tags.get("ARTIST") or tags.get("album_artist") or tags.get("ALBUMARTIST")
+                    album = tags.get("album") or tags.get("ALBUM")
+                    
+                    return artist, album
+            except Exception:
+                pass
+            
+            return None, None
+        except Exception:
+            return None, None
+    
     def final_cover_art_cleanup(self, download_path):
-        """Final cleanup pass: rename all cover art files to 'artist - album' format based on folder structure."""
-        import re
+        """Final cleanup pass: rename all cover art files to 'folder.{ext}' format."""
         try:
             base_path = Path(download_path)
             if not base_path.exists():
@@ -2501,64 +2585,19 @@ class BandcampDownloaderGUI:
                 if not cover_art_files:
                     continue
                 
-                # Extract artist and album from folder structure
-                artist = None
-                album = None
-                
-                if choice == "4":
-                    # Structure: base/Artist/Album
-                    parts = directory.parts
-                    if len(parts) >= 2:
-                        artist = parts[-2]  # Second to last folder
-                        album = parts[-1]   # Last folder
-                elif choice == "5":
-                    # Structure: base/Album/Artist
-                    parts = directory.parts
-                    if len(parts) >= 2:
-                        album = parts[-2]   # Second to last folder
-                        artist = parts[-1]  # Last folder
-                elif choice == "2":
-                    # Structure: base/Album
-                    album = directory.name
-                    # Try to get artist from metadata or use "Unknown Artist"
-                    if hasattr(self, 'album_info_stored') and self.album_info_stored.get("artist"):
-                        artist = self.album_info_stored.get("artist")
-                    else:
-                        artist = "Unknown Artist"
-                elif choice == "3":
-                    # Structure: base/Artist
-                    artist = directory.name
-                    # Try to get album from metadata or use "Unknown Album"
-                    if hasattr(self, 'album_info_stored') and self.album_info_stored.get("album"):
-                        album = self.album_info_stored.get("album")
-                    else:
-                        album = "Unknown Album"
-                else:
-                    # Structure 1: Root - try to get from metadata
-                    if hasattr(self, 'album_info_stored'):
-                        artist = self.album_info_stored.get("artist", "Unknown Artist")
-                        album = self.album_info_stored.get("album", "Unknown Album")
-                    else:
-                        continue  # Can't determine, skip
-                
-                # Sanitize names
-                artist = self.sanitize_filename(artist) if artist else "Unknown Artist"
-                album = self.sanitize_filename(album) if album else "Unknown Album"
-                
-                # Create target filename
-                target_name = f"{artist} - {album}"
-                
-                # Find the best cover art file to keep (prefer common names)
+                # Find the best cover art file to keep (prefer common names, then prefer jpg)
                 cover_art_files.sort(key=lambda f: (
                     0 if any(name in f.stem.lower() for name in ['cover', 'album', 'folder', 'artwork']) else 1,
+                    0 if f.suffix.lower() == '.jpg' else 1,  # Prefer .jpg
                     f.name
                 ))
                 
                 kept_file = cover_art_files[0]
-                target_path = directory / f"{target_name}{kept_file.suffix}"
+                target_name = f"folder{kept_file.suffix}"
+                target_path = directory / target_name
                 
                 # Skip if already correctly named
-                if kept_file.name == target_path.name:
+                if kept_file.name.lower() == target_name.lower():
                     # Delete duplicates
                     for thumb_file in cover_art_files[1:]:
                         try:
@@ -2574,7 +2613,7 @@ class BandcampDownloaderGUI:
                         target_path.unlink()
                     
                     kept_file.rename(target_path)
-                    self.root.after(0, lambda old=kept_file.name, new=target_path.name: 
+                    self.root.after(0, lambda old=kept_file.name, new=target_name: 
                                    self.log(f"Final cleanup: Renamed cover art {old} → {new}"))
                     
                     # Delete all other cover art files in this directory
@@ -3094,8 +3133,269 @@ class BandcampDownloaderGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Could not create playlist: {str(e)}"))
     
+    def download_single_album(self, album_url, album_index=0, total_albums=0):
+        """Download a single album (used for both single album and discography mode)."""
+        try:
+            # Get format settings
+            format_val = self.format_var.get()
+            base_format = self._extract_format(format_val)
+            skip_postprocessing = self.skip_postprocessing_var.get()
+            download_cover_art = self.download_cover_art_var.get()
+            
+            # Configure postprocessors based on format
+            postprocessors = []
+            
+            # If skip post-processing is enabled, only add metadata/thumbnail postprocessors (no format conversion)
+            if skip_postprocessing:
+                # Only add metadata and thumbnail embedding, no format conversion
+                # This will output whatever format yt-dlp downloads (likely original format from Bandcamp)
+                postprocessors = [
+                    {
+                        "key": "FFmpegMetadata",
+                        "add_metadata": True,
+                    },
+                ]
+                # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
+                if not download_cover_art:
+                    postprocessors.append({
+                        "key": "EmbedThumbnail",
+                        "already_have_thumbnail": False,
+                    })
+            elif base_format == "mp3":
+                # Always use 128kbps for MP3 (matches source quality)
+                postprocessors = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "128",
+                    },
+                    {
+                        "key": "FFmpegMetadata",
+                        "add_metadata": True,
+                    },
+                ]
+                # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
+                if not download_cover_art:
+                    postprocessors.append({
+                        "key": "EmbedThumbnail",
+                        "already_have_thumbnail": False,
+                    })
+            elif base_format == "flac":
+                postprocessors = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "flac",
+                    },
+                    {
+                        "key": "FFmpegMetadata",
+                        "add_metadata": True,
+                    },
+                ]
+            elif format_val == "ogg":
+                postprocessors = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "vorbis",
+                        "preferredquality": "9",  # High quality, but still converted from 128kbps source
+                    },
+                    {
+                        "key": "FFmpegMetadata",
+                        "add_metadata": True,
+                    },
+                ]
+            elif format_val == "wav":
+                postprocessors = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "wav",
+                    },
+                    {
+                        "key": "FFmpegMetadata",
+                        "add_metadata": True,
+                    },
+                ]
+            
+            # Match filter to reject entries when cancelling
+            def match_filter(info_dict):
+                """Reject entries if cancellation is requested."""
+                if self.is_cancelling:
+                    return "Cancelled by user"
+                return None  # None means accept the entry
+            
+            # yt-dlp options
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": self.get_outtmpl(),
+                "ffmpeg_location": str(self.ffmpeg_path),
+                "writethumbnail": True,
+                "postprocessors": postprocessors,
+                "noplaylist": False,
+                "ignoreerrors": True,
+                "quiet": False,  # Keep False to show console output and enable progress hooks
+                "no_warnings": False,  # Show warnings in console
+                "noprogress": False,  # Keep progress enabled so hooks are called frequently
+                "progress_hooks": [self.progress_hook],
+                "match_filter": match_filter,  # Reject entries when cancelling
+            }
+            
+            # Store info for post-processing (maps filenames to metadata)
+            self.download_info = {}
+            self.album_info_stored = {}
+            self.downloaded_files = set()  # Track files that were just downloaded
+            self.download_start_time = None  # Track when download started
+            self.total_tracks = 0  # Total number of tracks in current album
+            self.current_track = 0  # Current track being downloaded (0-based, will be incremented as tracks finish)
+            
+            # Discography tracking (for multi-album downloads) - only set if in discography mode
+            self.is_discography_mode = (total_albums > 1)  # True if downloading multiple albums
+            if self.is_discography_mode:
+                self.current_album = album_index  # Set current album index
+                self.total_albums = total_albums  # Set total albums
+            else:
+                self.total_albums = 0
+                self.current_album = 0
+            self.albums_info = []  # List of album info: [{"tracks": count, "name": name}, ...]
+            self.current_album_name = None  # Track current album name to detect album changes
+            self.current_album_path = None  # Track current album folder path to detect album changes
+            self.total_tracks_all_albums = 0  # Total tracks across all albums
+            self.completed_tracks_all_albums = 0  # Completed tracks across all albums
+            self.last_playlist_index = None  # Track last playlist_index to detect album changes
+            self.last_filename = None  # Track last filename to detect album changes via path
+            self.seen_album_paths = set()  # Track which album paths we've already seen to prevent duplicate detections
+            
+            # Get download start time
+            self.download_start_time = time.time()
+            
+            # Two-phase extraction for better user experience:
+            # Phase 1: Quick flat extraction to get track count (fast, ~1-2 seconds)
+            # Phase 2: Full extraction for detailed metadata (slower, but user already sees progress)
+            self.root.after(0, lambda: self.progress_var.set("Fetching album information..."))
+            self.root.after(0, lambda: self.log("Fetching album information..."))
+            
+            # Phase 1: Quick flat extraction to get track count immediately
+            try:
+                quick_opts = {
+                    "extract_flat": True,  # Fast mode - just get playlist structure
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": False,
+                    "socket_timeout": 10,  # Faster timeout detection
+                    "retries": 3,  # Fewer retries for faster failure
+                }
+                
+                with yt_dlp.YoutubeDL(quick_opts) as quick_ydl:
+                    quick_info = quick_ydl.extract_info(album_url, download=False)
+                    if quick_info and "entries" in quick_info:
+                        entries = [e for e in quick_info.get("entries", []) if e]
+                        
+                        # Single album mode, entries are tracks
+                        self.total_tracks = len(entries)
+                        self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
+                        self.root.after(0, lambda count=len(entries): self.progress_var.set(f"Found {count} track(s) - Fetching track data..."))
+            except Exception:
+                # If quick extraction fails, continue to full extraction
+                pass
+            
+            # Phase 2: Full extraction for detailed metadata (necessary for progress tracking and verification)
+            try:
+                extract_opts = ydl_opts.copy()
+                extract_opts["extract_flat"] = False  # Get full metadata
+                extract_opts["quiet"] = True
+                extract_opts["no_warnings"] = True
+                extract_opts["socket_timeout"] = 10  # Faster timeout detection
+                extract_opts["retries"] = 3  # Fewer retries for faster failure
+                
+                with yt_dlp.YoutubeDL(extract_opts) as extract_ydl:
+                    info = extract_ydl.extract_info(album_url, download=False)
+                    if info:
+                        # Store album-level info
+                        self.album_info_stored = {
+                            "artist": info.get("artist") or info.get("uploader") or info.get("creator"),
+                            "album": info.get("album") or info.get("title"),
+                            "date": info.get("release_date") or info.get("upload_date"),
+                        }
+                        
+                        # Store metadata for each track and update total tracks if not already set
+                        if "entries" in info:
+                            entries = [e for e in info.get("entries", []) if e]  # Filter out None entries
+                            
+                            # Single album mode, entries are tracks
+                            if self.total_tracks == 0:  # Only update if quick extraction didn't work
+                                self.total_tracks = len(entries)
+                                self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
+                            
+                            # Log format/bitrate info from first track (to show what yt-dlp is downloading)
+                            # Always show source info so users know what quality they're getting
+                            if entries:
+                                first_entry = entries[0]
+                                format_info = []
+                                if first_entry.get("format"):
+                                    format_info.append(f"Format: {first_entry.get('format')}")
+                                if first_entry.get("abr"):
+                                    format_info.append(f"Bitrate: {first_entry.get('abr')} kbps")
+                                elif first_entry.get("tbr"):
+                                    format_info.append(f"Bitrate: {first_entry.get('tbr')} kbps")
+                                if first_entry.get("acodec"):
+                                    format_info.append(f"Codec: {first_entry.get('acodec')}")
+                                if first_entry.get("ext"):
+                                    format_info.append(f"Extension: {first_entry.get('ext')}")
+                                if format_info:
+                                    self.root.after(0, lambda info=" | ".join(format_info): self.log(f"Source: {info}"))
+                            
+                            for entry in entries:
+                                # Use title as key (will match by filename later)
+                                title = entry.get("title", "")
+                                if title:
+                                    self.download_info[title.lower()] = {
+                                        "title": entry.get("title"),
+                                        "artist": entry.get("artist") or entry.get("uploader") or entry.get("creator") or self.album_info_stored.get("artist"),
+                                        "album": entry.get("album") or info.get("title") or self.album_info_stored.get("album"),
+                                        "track_number": entry.get("track_number") or entry.get("track"),
+                                        "date": entry.get("release_date") or entry.get("upload_date") or self.album_info_stored.get("date"),
+                                    }
+            except Exception:
+                # If extraction fails, continue with download anyway
+                self.root.after(0, lambda: self.log("Warning: Could not fetch full metadata, continuing anyway..."))
+                # Ensure album_info_stored is at least initialized (will try to get from files later)
+                if not self.album_info_stored or not self.album_info_stored.get("artist") or not self.album_info_stored.get("album"):
+                    self.album_info_stored = self.album_info_stored or {}
+            
+            # Get download path
+            download_path = self.path_var.get().strip()
+            
+            # Download and process the album
+            success = self._do_album_download_and_processing(album_url, ydl_opts, format_val, base_format, skip_postprocessing, download_path)
+            
+            # After download, if album_info_stored is still empty, try to get it from downloaded files
+            if success and (not self.album_info_stored or not self.album_info_stored.get("artist") or not self.album_info_stored.get("album")):
+                try:
+                    base_path = Path(download_path)
+                    if base_path.exists():
+                        # Find first audio file and get metadata
+                        audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a"]
+                        for ext in audio_extensions:
+                            audio_files = list(base_path.rglob(f"*{ext}"))
+                            if audio_files:
+                                file_artist, file_album = self._get_metadata_from_directory(audio_files[0].parent)
+                                if file_artist or file_album:
+                                    if not self.album_info_stored:
+                                        self.album_info_stored = {}
+                                    if file_artist and not self.album_info_stored.get("artist"):
+                                        self.album_info_stored["artist"] = file_artist
+                                    if file_album and not self.album_info_stored.get("album"):
+                                        self.album_info_stored["album"] = file_album
+                                break
+                except Exception:
+                    pass  # If we can't get it from files, continue anyway
+            
+            return success
+            
+        except Exception as e:
+            self.root.after(0, lambda msg=str(e): self.log(f"Error: {msg}"))
+            return False
+    
     def download_album(self, url):
-        """Download the album."""
+        """Download the album (main entry point - handles discography vs single album)."""
         try:
             # Get format settings
             format_val = self.format_var.get()
@@ -3223,227 +3523,104 @@ class BandcampDownloaderGUI:
             # Get download start time
             self.download_start_time = time.time()
             
-            # Two-phase extraction for better user experience:
-            # Phase 1: Quick flat extraction to get track count (fast, ~1-2 seconds)
-            # Phase 2: Full extraction for detailed metadata (slower, but user already sees progress)
-            self.root.after(0, lambda: self.progress_var.set("Fetching album information..."))
-            self.root.after(0, lambda: self.log("Fetching album information..."))
-            
-            # Phase 1: Quick flat extraction to get track count immediately
-            try:
-                quick_opts = {
-                    "extract_flat": True,  # Fast mode - just get playlist structure
-                    "quiet": True,
-                    "no_warnings": True,
-                    "noplaylist": False,
-                    "socket_timeout": 10,  # Faster timeout detection
-                    "retries": 3,  # Fewer retries for faster failure
-                }
+            # For discography mode, extract album URLs and download individually
+            if self.is_discography_mode:
+                # Show initial discography message
+                self.root.after(0, lambda: self.progress_var.set("Fetching artist discography..."))
+                self.root.after(0, lambda: self.log("Fetching artist discography..."))
                 
-                with yt_dlp.YoutubeDL(quick_opts) as quick_ydl:
-                    quick_info = quick_ydl.extract_info(url, download=False)
-                    if quick_info and "entries" in quick_info:
-                        entries = [e for e in quick_info.get("entries", []) if e]
-                        
-                        if self.is_discography_mode:
-                            # In discography mode, entries are albums
-                            self.total_albums = len(entries)
-                            self.root.after(0, lambda count=len(entries): self.log(f"Found {count} album(s) in discography"))
-                            self.root.after(0, lambda count=len(entries): self.progress_var.set(f"Found {count} album(s) - Fetching album data..."))
-                        else:
-                            # Single album mode, entries are tracks
-                            self.total_tracks = len(entries)
-                            self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
-                            self.root.after(0, lambda count=len(entries): self.progress_var.set(f"Found {count} track(s) - Fetching track data..."))
-            except Exception:
-                # If quick extraction fails, continue to full extraction
-                pass
-            
-            # Phase 2: Full extraction for detailed metadata (necessary for progress tracking and verification)
-            try:
-                extract_opts = ydl_opts.copy()
-                extract_opts["extract_flat"] = False  # Get full metadata
-                extract_opts["quiet"] = True
-                extract_opts["no_warnings"] = True
-                extract_opts["socket_timeout"] = 10  # Faster timeout detection
-                extract_opts["retries"] = 3  # Fewer retries for faster failure
-                
-                with yt_dlp.YoutubeDL(extract_opts) as extract_ydl:
-                    info = extract_ydl.extract_info(url, download=False)
-                    if info:
-                        # Store album-level info
-                        self.album_info_stored = {
-                            "artist": info.get("artist") or info.get("uploader") or info.get("creator"),
-                            "album": info.get("album") or info.get("title"),
-                            "date": info.get("release_date") or info.get("upload_date"),
-                        }
-                        
-                        # Store metadata for each track and update total tracks if not already set
-                        if "entries" in info:
-                            entries = [e for e in info.get("entries", []) if e]  # Filter out None entries
-                            
-                            if self.is_discography_mode:
-                                # In discography mode, entries are albums, each with their own tracks
-                                if self.total_albums == 0:  # Only update if quick extraction didn't work
-                                    self.total_albums = len(entries)
-                                
-                                # Count tracks across all albums
-                                self.albums_info = []
-                                for album_entry in entries:
-                                    if album_entry and "entries" in album_entry:
-                                        album_tracks = [e for e in album_entry.get("entries", []) if e]
-                                        album_name = album_entry.get("album") or album_entry.get("title") or "Unknown Album"
-                                        track_count = len(album_tracks)
-                                        self.albums_info.append({
-                                            "name": album_name,
-                                            "tracks": track_count
-                                        })
-                                        self.total_tracks_all_albums += track_count
-                                        
-                                        # Store metadata for tracks in this album
-                                        for track_entry in album_tracks:
-                                            title = track_entry.get("title", "")
-                                            if title:
-                                                self.download_info[title.lower()] = {
-                                                    "title": track_entry.get("title"),
-                                                    "artist": track_entry.get("artist") or album_entry.get("artist") or info.get("artist") or info.get("uploader") or info.get("creator"),
-                                                    "album": track_entry.get("album") or album_entry.get("album") or album_entry.get("title"),
-                                                    "track_number": track_entry.get("track_number") or track_entry.get("track"),
-                                                    "date": track_entry.get("release_date") or track_entry.get("upload_date") or album_entry.get("release_date") or album_entry.get("upload_date"),
-                                                }
-                                
-                                self.root.after(0, lambda albums=len(entries), tracks=self.total_tracks_all_albums: 
-                                               self.log(f"Found {albums} album(s) with {tracks} total track(s)"))
-                            else:
-                                # Single album mode, entries are tracks
-                                if self.total_tracks == 0:  # Only update if quick extraction didn't work
-                                    self.total_tracks = len(entries)
-                                    self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
-                                
-                                # Log format/bitrate info from first track (to show what yt-dlp is downloading)
-                                # Always show source info so users know what quality they're getting
-                                if entries:
-                                    first_entry = entries[0]
-                                    format_info = []
-                                    if first_entry.get("format"):
-                                        format_info.append(f"Format: {first_entry.get('format')}")
-                                    if first_entry.get("abr"):
-                                        format_info.append(f"Bitrate: {first_entry.get('abr')} kbps")
-                                    elif first_entry.get("tbr"):
-                                        format_info.append(f"Bitrate: {first_entry.get('tbr')} kbps")
-                                    if first_entry.get("acodec"):
-                                        format_info.append(f"Codec: {first_entry.get('acodec')}")
-                                    if first_entry.get("ext"):
-                                        format_info.append(f"Extension: {first_entry.get('ext')}")
-                                    if format_info:
-                                        self.root.after(0, lambda info=" | ".join(format_info): self.log(f"Source: {info}"))
-                                
-                                for entry in entries:
-                                    # Use title as key (will match by filename later)
-                                    title = entry.get("title", "")
-                                    if title:
-                                        self.download_info[title.lower()] = {
-                                            "title": entry.get("title"),
-                                            "artist": entry.get("artist") or entry.get("uploader") or entry.get("creator") or self.album_info_stored.get("artist"),
-                                            "album": entry.get("album") or info.get("title") or self.album_info_stored.get("album"),
-                                            "track_number": entry.get("track_number") or entry.get("track"),
-                                            "date": entry.get("release_date") or entry.get("upload_date") or self.album_info_stored.get("date"),
-                                        }
-            except Exception:
-                # If extraction fails, continue with download anyway
-                self.root.after(0, lambda: self.log("Warning: Could not fetch full metadata, continuing anyway..."))
-                pass
-            
-            # Update status before starting download
-            self.root.after(0, lambda: self.progress_var.set("Starting download..."))
-            self.root.after(0, lambda: self.log("Starting download..."))
-            
-            # Get download path and count existing files before download
-            download_path = self.path_var.get().strip()
-            base_path = Path(download_path) if download_path else None
-            
-            # Count existing audio files before download (to verify files were actually downloaded)
-            existing_files_before = set()
-            if base_path and base_path.exists():
-                for ext in self.FORMAT_EXTENSIONS.get(format_val, []):
-                    existing_files_before.update(base_path.rglob(f"*{ext}"))
-            
-            # Download (store instance for cancellation)
-            ydl = yt_dlp.YoutubeDL(ydl_opts)
-            self.ydl_instance = ydl
-            
-            try:
-                ydl.download([url])
-            except KeyboardInterrupt:
-                # Check if this was our cancellation or user's Ctrl+C
-                if self.is_cancelling:
-                    # Our cancellation - exit gracefully
-                    self.ydl_instance = None
-                    self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                # Extract album URLs from the artist page
+                album_urls = []
+                try:
+                    extract_opts = ydl_opts.copy()
+                    extract_opts["extract_flat"] = True  # Fast extraction to get album URLs
+                    extract_opts["quiet"] = True
+                    extract_opts["no_warnings"] = True
+                    
+                    with yt_dlp.YoutubeDL(extract_opts) as extract_ydl:
+                        info = extract_ydl.extract_info(url, download=False)
+                        if info and "entries" in info:
+                            entries = [e for e in info.get("entries", []) if e]
+                            for entry in entries:
+                                # Get the URL for each album
+                                entry_url = entry.get("url") or entry.get("webpage_url")
+                                if entry_url:
+                                    album_urls.append(entry_url)
+                    
+                    if not album_urls:
+                        self.root.after(0, self.download_complete, False, 
+                                      "Could not find any albums in the discography. The artist page may be empty or require login.")
+                        return
+                    
+                    self.total_albums = len(album_urls)
+                    # Show queuing message
+                    self.root.after(0, lambda count=len(album_urls): 
+                                  self.progress_var.set(f"Queuing {count} album(s)..."))
+                    self.root.after(0, lambda count=len(album_urls): 
+                                  self.log(f"Queuing {count} album(s)..."))
+                    
+                    # Add a brief delay so the user can see the queuing message
+                    time.sleep(0.8)
+                    
+                except Exception as e:
+                    self.root.after(0, self.download_complete, False, 
+                                  f"Failed to extract album list from artist page:\n{str(e)}")
                     return
-                # User's Ctrl+C - re-raise
-                raise
-            finally:
-                # Clear instance after download
-                self.ydl_instance = None
                 
-                # Check if cancelled - if so, exit early
-                if self.is_cancelling:
-                    self.root.after(0, self.download_complete, False, "Download cancelled by user.")
-                    return
-            
-            # Verify that files were actually downloaded
-            files_downloaded = False
-            if base_path and base_path.exists():
-                # Count files after download
-                existing_files_after = set()
-                if skip_postprocessing:
-                    # When skipping post-processing, check all audio formats
-                    all_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
-                    for ext in all_exts:
-                        existing_files_after.update(base_path.rglob(f"*{ext}"))
+                # Download each album individually
+                successful_albums = 0
+                failed_albums = 0
+                
+                for idx, album_url in enumerate(album_urls):
+                    # Check for cancellation
+                    if self.is_cancelling:
+                        self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                        return
+                    
+                    # Update current album counter
+                    self.current_album = idx
+                    if self.current_album >= self.total_albums:
+                        self.total_albums = self.current_album + 1
+                    
+                    # Log which album we're starting
+                    album_num = idx + 1
+                    self.root.after(0, lambda num=album_num, total=self.total_albums, url=album_url: 
+                                  self.log(f"Downloading album {num} of {total}: {url}"))
+                    
+                    # Download this album
+                    success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_urls))
+                    
+                    if success:
+                        successful_albums += 1
+                        # Add completed tracks from this album
+                        if self.total_tracks > 0:
+                            self.completed_tracks_all_albums += self.total_tracks
+                    else:
+                        failed_albums += 1
+                        self.root.after(0, lambda num=album_num, url=album_url: 
+                                      self.log(f"⚠ Failed to download album {num}: {url}"))
+                    
+                    # Reset track counter for next album
+                    self.current_track = 0
+                    self.total_tracks = 0
+                    self.downloaded_files = set()  # Clear for next album
+                
+                # Final summary
+                if successful_albums > 0:
+                    msg = f"Downloaded {successful_albums} album(s)"
+                    if failed_albums > 0:
+                        msg += f" ({failed_albums} failed)"
+                    self.root.after(0, self.download_complete, True, msg + "!")
                 else:
-                    for ext in self.FORMAT_EXTENSIONS.get(format_val, []):
-                        existing_files_after.update(base_path.rglob(f"*{ext}"))
-                
-                # Check if new files were created
-                new_files = existing_files_after - existing_files_before
-                files_downloaded = len(new_files) > 0
-                
-                # Also check if files in downloaded_files set exist
-                if hasattr(self, 'downloaded_files') and self.downloaded_files:
-                    for file_path in self.downloaded_files:
-                        if Path(file_path).exists():
-                            files_downloaded = True
-                            break
-            
-            # If no files were downloaded, it likely requires purchase/login
-            if not files_downloaded:
-                error_msg = (
-                    "No files were downloaded. This album may require purchase or login.\n\n"
-                    "Bandcamp albums that require purchase cannot be downloaded without:\n"
-                    "• Purchasing the album first\n"
-                    "• Logging into your Bandcamp account\n"
-                    "• Using cookies for authentication\n\n"
-                    "Please purchase the album on Bandcamp or check if it's available for free download."
-                )
-                self.root.after(0, self.download_complete, False, error_msg)
+                    self.root.after(0, self.download_complete, False, 
+                                  f"Failed to download any albums. {failed_albums} album(s) failed.")
                 return
             
-            # Process downloaded files
-            if download_path:
-                # For MP3, verify and fix metadata if needed
-                if base_format == "mp3":
-                    self.verify_and_fix_mp3_metadata(download_path)
-                # Process other formats (FLAC, OGG, WAV)
-                self.process_downloaded_files(download_path)
-                
-                # Create playlist file if enabled
-                if self.create_playlist_var.get():
-                    self.create_playlist_file(download_path, base_format)
-                
-                # Final cleanup: rename all cover art files to "artist - album" format
-                self.final_cover_art_cleanup(download_path)
+            # Single album mode - download normally
+            success = self.download_single_album(url, album_index=0, total_albums=1)
+            if not success:
+                # Error already logged in download_single_album
+                return
             
             # Success
             self.root.after(0, self.download_complete, True, "Download complete!")
@@ -3457,6 +3634,98 @@ class BandcampDownloaderGUI:
         except Exception as e:
             error_msg = self._format_error_message(str(e), is_unexpected=True)
             self.root.after(0, self.download_complete, False, error_msg)
+    
+    def _do_album_download_and_processing(self, album_url, ydl_opts, format_val, base_format, skip_postprocessing, download_path):
+        """Helper method to perform the actual download and processing of a single album."""
+        # Update status before starting download
+        self.root.after(0, lambda: self.progress_var.set("Starting download..."))
+        self.root.after(0, lambda: self.log("Starting download..."))
+        
+        # Get download path and count existing files before download
+        base_path = Path(download_path) if download_path else None
+        
+        # Count existing audio files before download (to verify files were actually downloaded)
+        existing_files_before = set()
+        if base_path and base_path.exists():
+            for ext in self.FORMAT_EXTENSIONS.get(format_val, []):
+                existing_files_before.update(base_path.rglob(f"*{ext}"))
+        
+        # Download (store instance for cancellation)
+        ydl = yt_dlp.YoutubeDL(ydl_opts)
+        self.ydl_instance = ydl
+        
+        try:
+            ydl.download([album_url])
+        except KeyboardInterrupt:
+            # Check if this was our cancellation or user's Ctrl+C
+            if self.is_cancelling:
+                # Our cancellation - exit gracefully
+                self.ydl_instance = None
+                return False
+            # User's Ctrl+C - re-raise
+            raise
+        except yt_dlp.utils.DownloadError as e:
+            self.ydl_instance = None
+            self.root.after(0, lambda msg=str(e): self.log(f"Download error: {msg}"))
+            return False
+        finally:
+            # Clear instance after download
+            self.ydl_instance = None
+            
+            # Check if cancelled - if so, exit early
+            if self.is_cancelling:
+                return False
+        
+        # Verify that files were actually downloaded
+        files_downloaded = False
+        if base_path and base_path.exists():
+            # Count files after download
+            existing_files_after = set()
+            if skip_postprocessing:
+                # When skipping post-processing, check all audio formats
+                all_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
+                for ext in all_exts:
+                    existing_files_after.update(base_path.rglob(f"*{ext}"))
+            else:
+                for ext in self.FORMAT_EXTENSIONS.get(format_val, []):
+                    existing_files_after.update(base_path.rglob(f"*{ext}"))
+            
+            # Check if new files were created
+            new_files = existing_files_after - existing_files_before
+            files_downloaded = len(new_files) > 0
+            
+            # Also check if files in downloaded_files set exist
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                for file_path in self.downloaded_files:
+                    if Path(file_path).exists():
+                        files_downloaded = True
+                        break
+        
+        # If no files were downloaded, it likely requires purchase/login
+        if not files_downloaded:
+            self.root.after(0, lambda: self.log("⚠ No files were downloaded. This album may require purchase or login."))
+            return False
+        
+        # Process downloaded files
+        if download_path:
+            try:
+                # For MP3, verify and fix metadata if needed
+                if base_format == "mp3":
+                    self.verify_and_fix_mp3_metadata(download_path)
+                # Process other formats (FLAC, OGG, WAV)
+                self.process_downloaded_files(download_path)
+                
+                # Create playlist file if enabled
+                if self.create_playlist_var.get():
+                    self.create_playlist_file(download_path, base_format)
+                
+                # Final cleanup: rename all cover art files to "artist - album" format
+                self.final_cover_art_cleanup(download_path)
+            except Exception as e:
+                self.root.after(0, lambda msg=str(e): self.log(f"⚠ Error during post-processing: {msg}"))
+                # Continue anyway - files were downloaded
+        
+        return True
     
     def format_bytes(self, bytes_val):
         """Format bytes to human-readable string."""
