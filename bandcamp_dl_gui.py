@@ -37,7 +37,7 @@ import json
 from pathlib import Path
 from tkinter import (
     Tk, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, END, WORD, BOTH,
-    Frame, Label, Canvas, Checkbutton
+    Frame, Label, Canvas, Checkbutton, Menu
 )
 
 # yt-dlp will be imported after checking if it's installed
@@ -188,6 +188,12 @@ class BandcampDownloaderGUI:
         self.download_cover_art_var = BooleanVar(value=self.load_saved_download_cover_art())
         self.download_discography_var = BooleanVar(value=False)  # Always default to off, not persistent
         
+        # Batch URL mode tracking
+        self.batch_mode = False  # Track if we're in batch mode (multiple URLs)
+        self.url_entry_widget = None  # Store reference to Entry widget
+        self.url_text_widget = None  # Store reference to ScrolledText widget
+        self.url_container_frame = None  # Container frame for URL widgets
+        
         # Store metadata for preview
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None}
         self.url_check_timer = None  # For debouncing URL changes
@@ -211,6 +217,8 @@ class BandcampDownloaderGUI:
         self.load_saved_path()
         self.load_saved_album_art_state()
         self.update_preview()
+        # Initialize URL count and button text
+        self.root.after(100, self._update_url_count_and_button)
         # Show format warnings if selected on startup
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
@@ -285,7 +293,7 @@ class BandcampDownloaderGUI:
         # Default is darker, hover is brighter/more prominent
         style.configure('Download.TButton', background='#2599b8', foreground='#FFFFFF',
                        borderwidth=2, bordercolor='#2599b8', relief='flat',
-                       padding=(15, 8), font=("Segoe UI", 10, "bold"), width=20)
+                       padding=(15, 8), font=("Segoe UI", 10, "bold"), width=25)
         style.map('Download.TButton',
                  background=[('active', success_color), ('pressed', '#1d7a95')],
                  bordercolor=[('active', success_color), ('pressed', '#1d7a95')])
@@ -684,8 +692,8 @@ class BandcampDownloaderGUI:
     
     def on_download_discography_change(self):
         """Handle download discography checkbox change."""
-        # Intentionally does nothing - download_discography is not persistent
-        pass
+        # Update button text when discography mode changes
+        self._update_url_count_and_button()
     
     def check_dependencies(self):
         """Check Python version, yt-dlp, and ffmpeg."""
@@ -839,21 +847,106 @@ class BandcampDownloaderGUI:
         main_frame = ttk.Frame(self.root, padding="12")
         main_frame.grid(row=0, column=0, sticky=(W, E, N, S))
         
-        # URL input - compact
+        # URL input - supports both single Entry and multi-line ScrolledText
         ttk.Label(main_frame, text="Album URL:", font=("Segoe UI", 9)).grid(
-            row=0, column=0, sticky=W, pady=2
+            row=0, column=0, sticky=(W, N), pady=2
         )
-        url_entry = ttk.Entry(main_frame, textvariable=self.url_var, width=45, font=("Segoe UI", 9))
-        url_entry.grid(row=0, column=1, columnspan=2, sticky=(W, E), pady=2, padx=(8, 0))
         
-        # Bind paste events for instant detection (no debounce for paste)
-        url_entry.bind('<Control-v>', lambda e: self.root.after(10, self._check_url))
-        url_entry.bind('<Shift-Insert>', lambda e: self.root.after(10, self._check_url))
-        url_entry.bind('<Button-2>', lambda e: self.root.after(10, self._check_url))  # Middle mouse button paste
-        # Right-click paste support
-        url_entry.bind('<Button-3>', self._handle_right_click_paste)  # Right mouse button
-        # Key release with shorter debounce for typing
-        url_entry.bind('<KeyRelease>', lambda e: self.on_url_change())
+        # Container frame for URL widgets (Entry and ScrolledText)
+        self.url_container_frame = Frame(main_frame, bg='#1E1E1E')
+        self.url_container_frame.grid(row=0, column=1, columnspan=2, sticky=(W, E), pady=2, padx=(8, 0))
+        self.url_container_frame.columnconfigure(0, weight=1)
+        self.url_container_frame.rowconfigure(0, weight=1)  # Allow vertical expansion for ScrolledText
+        
+        # Single-line Entry widget (default)
+        url_entry = ttk.Entry(
+            self.url_container_frame,
+            textvariable=self.url_var,
+            width=45,
+            font=("Segoe UI", 9)
+        )
+        url_entry.grid(row=0, column=0, sticky=(W, E), pady=0)
+        self.url_entry_widget = url_entry
+        
+        # Add placeholder text to Entry
+        self._set_entry_placeholder(url_entry, "Paste one URL or multiple to create a batch.")
+        
+        # Bind events for Entry
+        url_entry.bind('<Control-v>', self._handle_entry_paste)
+        url_entry.bind('<Shift-Insert>', self._handle_entry_paste)
+        url_entry.bind('<Button-2>', self._handle_entry_paste)  # Middle mouse button paste
+        url_entry.bind('<Button-3>', self._handle_right_click_paste_entry)  # Right mouse button
+        url_entry.bind('<KeyRelease>', lambda e: (self.on_url_change(), self._check_entry_for_newlines()))
+        url_entry.bind('<Return>', self._handle_entry_return)  # Enter key - expand to multi-line
+        
+        # Multi-line ScrolledText widget (hidden initially, shown when needed)
+        url_text_frame = Frame(self.url_container_frame, bg='#1E1E1E')
+        url_text_frame.grid(row=0, column=0, sticky=(W, E, N, S), pady=0)
+        url_text_frame.columnconfigure(0, weight=1)
+        url_text_frame.rowconfigure(0, weight=1)
+        url_text_frame.grid_remove()  # Hidden initially
+        self.url_text_frame = url_text_frame  # Store reference for easier access
+        
+        url_text = scrolledtext.ScrolledText(
+            url_text_frame,
+            width=45,
+            height=2,  # Start with 2 lines (collapsed)
+            font=("Segoe UI", 9),
+            bg='#252526',
+            fg='#CCCCCC',
+            insertbackground='#D4D4D4',
+            relief='flat',
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground='#3E3E42',
+            highlightcolor='#007ACC',
+            wrap='none'  # Disable text wrapping
+        )
+        url_text.grid(row=0, column=0, sticky=(W, E, N, S))
+        self.url_text_widget = url_text
+        
+        # Create placeholder label overlay (ghost text that doesn't interfere with content)
+        # This will be positioned over the ScrolledText but won't interfere with editing
+        placeholder_label = Label(
+            url_text_frame,
+            text="Paste one URL or multiple to create a batch.",
+            font=("Segoe UI", 9),
+            bg='#252526',
+            fg='#808080',
+            anchor='nw',
+            justify='left',
+            padx=4,
+            pady=2
+        )
+        # Position the label to overlay the text widget (same position)
+        placeholder_label.place(x=4, y=2, anchor='nw')
+        # Make label non-interactive - pass all events through to text widget
+        placeholder_label.bind('<Button-1>', lambda e: url_text.focus_set())
+        placeholder_label.bind('<Key>', lambda e: url_text.focus_set())
+        placeholder_label.bind('<FocusIn>', lambda e: url_text.focus_set())
+        # Allow right-click on placeholder to show context menu
+        placeholder_label.bind('<Button-3>', self._show_text_context_menu)
+        self.url_text_placeholder_label = placeholder_label
+        # Initially show placeholder since widget is empty
+        self._update_text_placeholder_visibility()
+        
+        # Create custom context menu for ScrolledText
+        context_menu = Menu(url_text, tearoff=0, bg='#252526', fg='#CCCCCC', 
+                           activebackground='#007ACC', activeforeground='#FFFFFF',
+                           selectcolor='#007ACC')
+        context_menu.add_command(label="Paste", command=self._handle_right_click_paste_text)
+        self.url_text_context_menu = context_menu
+        
+        # Bind events for ScrolledText
+        url_text.bind('<Control-v>', self._handle_text_paste)
+        url_text.bind('<Shift-Insert>', self._handle_text_paste)
+        url_text.bind('<Button-2>', self._handle_text_paste)  # Middle mouse button paste
+        url_text.bind('<Button-3>', self._show_text_context_menu)  # Right mouse button - show context menu
+        url_text.bind('<KeyRelease>', lambda e: self._on_text_key_release())
+        url_text.bind('<KeyPress>', lambda e: self._hide_text_placeholder())  # Hide on any key press
+        url_text.bind('<Button-1>', lambda e: self._hide_text_placeholder())  # Hide on click
+        url_text.bind('<FocusIn>', lambda e: self._on_text_focus_in())
+        url_text.bind('<FocusOut>', lambda e: self._on_text_focus_out())
         
         # Download path - compact
         ttk.Label(main_frame, text="Download Path:", font=("Segoe UI", 9)).grid(
@@ -867,7 +960,8 @@ class BandcampDownloaderGUI:
         # Bind path changes to update preview
         self.path_var.trace_add('write', lambda *args: self.update_preview())
         self.folder_structure_var.trace_add('write', lambda *args: self.update_preview())
-        self.url_var.trace_add('write', lambda *args: self.on_url_change())
+        # Note: URL changes are handled by direct event bindings, not trace_add
+        # (trace_add would trigger on placeholder text changes)
         
         # Settings section - reduced width to make room for album art panel
         self.settings_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
@@ -1043,6 +1137,7 @@ class BandcampDownloaderGUI:
             command=self.on_download_discography_change
         )
         download_discography_check.grid(row=6, column=0, columnspan=2, padx=4, sticky=W, pady=1)
+        self.download_discography_check = download_discography_check  # Store reference for enabling/disabling
         
         # Configure column weights: label (0), combo (1), button (2)
         self.settings_content.columnconfigure(0, weight=0)  # Label column - fixed width
@@ -1207,6 +1302,39 @@ class BandcampDownloaderGUI:
         main_frame.columnconfigure(1, weight=1)
         main_frame.columnconfigure(2, weight=0)  # Album art column doesn't expand
         main_frame.rowconfigure(10, weight=1)  # Status log row expands
+        
+        # Bind click events to main frame and root to unfocus URL field when clicking elsewhere
+        def unfocus_url_field(event):
+            """Unfocus URL field when clicking on empty areas or non-interactive widgets."""
+            # Get the widget that was clicked
+            widget_clicked = event.widget
+            
+            # Check if click is on URL field or any of its parent containers
+            current = widget_clicked
+            is_url_field = False
+            while current:
+                if (current == self.url_entry_widget or 
+                    current == self.url_text_widget or 
+                    current == self.url_container_frame or
+                    current == self.url_text_frame):
+                    is_url_field = True
+                    break
+                try:
+                    current = current.master
+                except:
+                    break
+            
+            # Only unfocus if the click is NOT on the URL field
+            if not is_url_field:
+                # Remove focus from URL field by focusing on root or main frame
+                try:
+                    main_frame.focus_set()
+                except:
+                    self.root.focus_set()
+        
+        # Bind to main frame and root window
+        main_frame.bind('<Button-1>', unfocus_url_field)
+        self.root.bind('<Button-1>', unfocus_url_field)
     
     def _minimize_console_immediately(self):
         """Minimize console window immediately at startup."""
@@ -1356,6 +1484,9 @@ class BandcampDownloaderGUI:
     
     def on_url_change(self):
         """Handle URL changes - fetch metadata for preview with debouncing."""
+        # Update URL count dynamically
+        self._update_url_count_and_button()
+        
         # Cancel any pending timer
         if self.url_check_timer:
             self.root.after_cancel(self.url_check_timer)
@@ -1364,7 +1495,7 @@ class BandcampDownloaderGUI:
         self.url_check_timer = self.root.after(200, self._check_url)
     
     def _handle_right_click_paste(self, event):
-        """Handle right-click paste in URL field."""
+        """Handle right-click paste in URL field (Entry widget)."""
         try:
             # Get clipboard content
             clipboard_text = self.root.clipboard_get()
@@ -1373,15 +1504,532 @@ class BandcampDownloaderGUI:
                 url_entry = event.widget
                 url_entry.delete(0, END)
                 url_entry.insert(0, clipboard_text)
-                # Trigger URL check
-                self.root.after(10, self._check_url)
+                # Check if paste contains newlines - if so, expand to multi-line
+                if '\n' in clipboard_text:
+                    self._expand_to_multiline(clipboard_text)
+                else:
+                    # Trigger URL check
+                    self.root.after(10, self._check_url)
+                    self._update_url_count_and_button()
         except Exception:
             # If clipboard is empty or not text, ignore
             pass
     
+    def _handle_right_click_paste_entry(self, event):
+        """Handle right-click paste in Entry widget."""
+        self._handle_right_click_paste(event)
+    
+    def _show_text_context_menu(self, event):
+        """Show context menu for ScrolledText widget on right-click."""
+        try:
+            # Show context menu at cursor position
+            self.url_text_context_menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            pass
+        finally:
+            # Ensure menu is released
+            self.url_text_context_menu.grab_release()
+    
+    def _handle_right_click_paste_text(self, event=None):
+        """Handle right-click paste in ScrolledText widget (can be called from context menu or event)."""
+        try:
+            # Hide placeholder immediately when pasting
+            self._hide_text_placeholder()
+            # Get clipboard content
+            clipboard_text = self.root.clipboard_get()
+            if clipboard_text:
+                # Get the text widget - from event or use stored reference
+                url_text = event.widget if event and hasattr(event, 'widget') else self.url_text_widget
+                if url_text:
+                    # Insert at cursor position (Text widget)
+                    url_text.insert("insert", clipboard_text)
+                    # Trigger URL check and update count
+                    self.root.after(10, lambda: (self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility()))
+        except Exception:
+            # If clipboard is empty or not text, ignore
+            pass
+    
+    def _handle_entry_paste(self, event):
+        """Handle paste in Entry widget - check for newlines and expand if needed."""
+        # Let the paste happen first, then check
+        self.root.after(10, self._check_entry_paste)
+    
+    def _check_entry_paste(self):
+        """Check if Entry content has newlines and expand if needed."""
+        if self.url_entry_widget:
+            content = self.url_var.get()
+            # Skip placeholder text
+            if content == "Paste one URL or multiple to create a batch.":
+                content = ""
+            if '\n' in content:
+                # Has newlines - expand to multi-line
+                self._expand_to_multiline(content)
+            else:
+                # No newlines - just update count
+                self._update_url_count_and_button()
+                self.root.after(10, self._check_url)
+    
+    def _check_entry_for_newlines(self):
+        """Check if Entry content has newlines (from typing) and expand if needed."""
+        if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            content = self.url_var.get()
+            # Skip placeholder text
+            if content == "Paste one URL or multiple to create a batch.":
+                return
+            if '\n' in content:
+                # Has newlines - expand to multi-line
+                self._expand_to_multiline(content)
+    
+    def _handle_entry_return(self, event):
+        """Handle Enter key in Entry - expand to multi-line."""
+        # Get current content
+        content = self.url_var.get()
+        # Expand to multi-line with current content
+        self._expand_to_multiline(content + '\n')
+        # Focus the text widget
+        if self.url_text_widget:
+            self.url_text_widget.focus_set()
+            # Move cursor to end
+            self.url_text_widget.mark_set("insert", "end")
+        return "break"  # Prevent default behavior
+    
+    def _handle_text_paste(self, event):
+        """Handle paste in ScrolledText widget."""
+        # Hide placeholder immediately when pasting
+        self._hide_text_placeholder()
+        # Let the paste happen first, then check
+        self.root.after(10, lambda: (self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility()))
+    
+    def _on_text_key_release(self):
+        """Handle key release in ScrolledText - update URL count dynamically and update placeholder visibility."""
+        # Update placeholder visibility based on content
+        self._update_text_placeholder_visibility()
+        
+        self._update_url_count_and_button()
+        # Also trigger URL check with debounce
+        self.on_url_change()
+    
+    def _hide_text_placeholder(self):
+        """Hide the placeholder label overlay."""
+        if hasattr(self, 'url_text_placeholder_label') and self.url_text_placeholder_label:
+            self.url_text_placeholder_label.place_forget()
+    
+    def _show_text_placeholder(self):
+        """Show the placeholder label overlay."""
+        if hasattr(self, 'url_text_placeholder_label') and self.url_text_placeholder_label:
+            self.url_text_placeholder_label.place(x=4, y=2, anchor='nw')
+            # Raise above text widget to be visible, but keep it non-interactive
+            self.url_text_placeholder_label.lift(self.url_text_widget)
+    
+    def _update_text_placeholder_visibility(self):
+        """Update placeholder visibility based on ScrolledText content."""
+        if self.url_text_widget:
+            content = self.url_text_widget.get(1.0, END).strip()
+            if not content:
+                # Field is empty - show placeholder
+                self._show_text_placeholder()
+            else:
+                # Field has content - hide placeholder
+                self._hide_text_placeholder()
+    
+    def _on_text_focus_in(self):
+        """Handle focus in on ScrolledText - keep at minimum height (content is scrollable)."""
+        # Keep height at minimum (2 lines) - content is scrollable
+        if self.url_text_widget:
+            self.url_text_widget.config(height=2)
+    
+    def _on_text_focus_out(self):
+        """Handle focus out on ScrolledText - collapse height and update placeholder visibility."""
+        if self.url_text_widget:
+            # Collapse height to 2 lines (hide extra lines but keep content)
+            self.url_text_widget.config(height=2)
+            
+            # Scroll to top to show first lines
+            self.url_text_widget.see(1.0)
+            
+            # Update placeholder visibility based on content
+            self._update_text_placeholder_visibility()
+            
+            # Force update to ensure height change is applied
+            self.url_text_widget.update_idletasks()
+    
+    def _expand_to_multiline(self, initial_content=""):
+        """Expand from Entry to ScrolledText for multi-line input."""
+        if not self.url_text_widget:
+            return
+        
+        # Get content from Entry if not provided
+        if not initial_content and self.url_entry_widget:
+            initial_content = self.url_var.get()
+            # Remove placeholder text if present
+            if initial_content == "Paste one URL or multiple to create a batch.":
+                initial_content = ""
+        
+        # Get the text frame - use stored reference if available, otherwise get from widget
+        text_frame = getattr(self, 'url_text_frame', None) or self.url_text_widget.master
+        
+        # Hide Entry first - completely remove it from grid
+        if self.url_entry_widget:
+            try:
+                self.url_entry_widget.grid_forget()
+            except:
+                pass  # Already removed
+        
+        # Show the text frame - it was grid_remove'd initially, so grid() will restore it
+        # Explicitly configure it with all parameters to ensure it's visible
+        text_frame.grid(row=0, column=0, sticky=(W, E, N, S), pady=0)
+        
+        # The ScrolledText is already gridded inside text_frame, but ensure it's configured
+        # Re-grid it to ensure it's visible and properly sized
+        self.url_text_widget.grid(row=0, column=0, sticky=(W, E, N, S))
+        
+        # Ensure the widget is in normal state (not disabled)
+        self.url_text_widget.config(state='normal')
+        
+        # Force the container and frame to update their layout immediately
+        self.url_container_frame.update_idletasks()
+        text_frame.update_idletasks()
+        self.url_text_widget.update_idletasks()
+        
+        # Set content in ScrolledText
+        self.url_text_widget.delete(1.0, END)
+        if initial_content and initial_content.strip():
+            self.url_text_widget.insert(1.0, initial_content)
+            self.url_text_widget.config(foreground='#CCCCCC')  # Normal text color
+        
+        # Update placeholder visibility based on content
+        self._update_text_placeholder_visibility()
+        
+        # Set height based on content (min 2, max 8)
+        content = initial_content.strip() if initial_content else ""
+        if content:
+            lines = content.split('\n')
+            line_count = len([line for line in lines if line.strip()])
+            height = max(2, min(line_count + 1, 8))
+        else:
+            height = 2
+        self.url_text_widget.config(height=height)
+        
+        # Make sure the widget is actually visible
+        self.url_text_widget.update_idletasks()
+        text_frame.update_idletasks()
+        self.url_container_frame.update_idletasks()
+        
+        # Focus the text widget
+        self.url_text_widget.focus_set()
+        
+        # Update URL count
+        self._update_url_count_and_button()
+    
+    def _collapse_to_entry(self):
+        """Collapse from ScrolledText back to Entry (single URL mode)."""
+        if not self.url_entry_widget or not self.url_text_widget:
+            return
+        
+        # Get content from ScrolledText
+        content = self.url_text_widget.get(1.0, END).strip()
+        
+        # Skip placeholder text
+        if content == "Paste one URL or multiple to create a batch.":
+            content = ""
+        
+        # Get first URL (or all if single line)
+        urls = [line.strip() for line in content.split('\n') 
+               if line.strip() and line.strip() != "Paste one URL or multiple to create a batch."]
+        if urls:
+            # Use first URL
+            first_url = urls[0]
+            self.url_var.set(first_url)
+            # Remove placeholder styling
+            self.url_entry_widget.config(foreground='#CCCCCC')
+        else:
+            self.url_var.set("")
+            # Set placeholder
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
+        
+        # Hide ScrolledText, show Entry
+        text_frame = self.url_text_widget.master
+        text_frame.grid_forget()  # Completely remove from grid
+        # Re-grid the Entry widget
+        self.url_entry_widget.grid(row=0, column=0, sticky=(W, E), pady=0)
+        
+        # Update URL count
+        self._update_url_count_and_button()
+        
+        # Trigger URL check
+        self.root.after(10, self._check_url)
+    
+    def _count_urls_in_text(self, text):
+        """Count number of bandcamp.com URLs in text (by counting 'bandcamp.com' occurrences)."""
+        if not text or not text.strip():
+            return 0
+        # Skip placeholder text
+        if text.strip() == "Paste one URL or multiple to create a batch.":
+            return 0
+        # Count occurrences of 'bandcamp.com' (case-insensitive)
+        text_lower = text.lower()
+        count = text_lower.count('bandcamp.com')
+        return count
+    
+    def _extract_urls_from_content(self, content):
+        """Extract URLs from content string, handling both single and multi-line input.
+        Also handles concatenated URLs (no separator) on the same line."""
+        if not content or not content.strip():
+            return []
+        # Skip placeholder text
+        if content.strip() == "Paste one URL or multiple to create a batch.":
+            return []
+        
+        import re
+        # Split by lines first
+        lines = content.split('\n')
+        all_urls = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line or line == "Paste one URL or multiple to create a batch.":
+                continue
+            
+            # Check if line contains multiple URLs (by counting 'bandcamp.com' or 'https://' patterns)
+            line_lower = line.lower()
+            bandcamp_count = line_lower.count('bandcamp.com')
+            https_count = len(re.findall(r'https?://', line, re.IGNORECASE))
+            
+            if bandcamp_count > 1 or https_count > 1:
+                # Multiple URLs on same line - extract all URLs
+                # Find all positions where URLs start (https:// or http://)
+                url_starts = []
+                for match in re.finditer(r'https?://', line, re.IGNORECASE):
+                    url_starts.append(match.start())
+                
+                # Extract each URL
+                for i, start_pos in enumerate(url_starts):
+                    # Find the end of this URL (start of next URL or end of line)
+                    if i + 1 < len(url_starts):
+                        # There's another URL after this one
+                        end_pos = url_starts[i + 1]
+                        url = line[start_pos:end_pos]
+                    else:
+                        # This is the last URL
+                        url = line[start_pos:]
+                    
+                    # Clean up the URL (remove trailing whitespace, commas, semicolons)
+                    url = url.rstrip(' \t,;')
+                    
+                    # Validate it contains bandcamp.com
+                    if 'bandcamp.com' in url.lower():
+                        all_urls.append(url)
+            else:
+                # Single URL (or no URL) - just add the line
+                all_urls.append(line)
+        
+        return all_urls
+    
+    def _remove_duplicate_urls(self, urls):
+        """Remove duplicate URLs, normalizing them first (case-insensitive, trailing slash handling)."""
+        if not urls:
+            return []
+        seen = set()
+        unique_urls = []
+        for url in urls:
+            # Normalize URL: lowercase, remove trailing slash (except for root URLs)
+            normalized = url.lower().strip()
+            # Remove trailing slash unless it's just the domain
+            if normalized.endswith('/') and normalized.count('/') > 3:
+                normalized = normalized.rstrip('/')
+            # Check if we've seen this URL before
+            if normalized not in seen:
+                seen.add(normalized)
+                unique_urls.append(url)  # Keep original case for display
+        return unique_urls
+    
+    def _get_urls_from_text(self):
+        """Extract URLs from text widget, one per line."""
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            text_content = self.url_text_widget.get(1.0, END).strip()
+            if not text_content:
+                return []
+            # Skip placeholder text
+            if text_content == "Paste one URL or multiple to create a batch.":
+                return []
+            # Split by lines and filter out empty lines and placeholder
+            urls = [line.strip() for line in text_content.split('\n') 
+                   if line.strip() and line.strip() != "Paste one URL or multiple to create a batch."]
+            return urls
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Fallback to Entry widget
+            content = self.url_var.get().strip()
+            if not content:
+                return []
+            # Skip placeholder text
+            if content == "Paste one URL or multiple to create a batch.":
+                return []
+            # Check if it has newlines (shouldn't happen in Entry, but handle it)
+            if '\n' in content:
+                urls = [line.strip() for line in content.split('\n') 
+                       if line.strip() and line.strip() != "Paste one URL or multiple to create a batch."]
+                return urls
+            return [content] if content else []
+        return []
+    
+    def _validate_and_clean_urls(self, text):
+        """Validate and clean URLs: split multiple URLs per line, remove empty lines, trim."""
+        if not text or not text.strip():
+            return ""
+        
+        # Remove placeholder text if present
+        if text.strip() == "Paste one URL or multiple to create a batch.":
+            return ""
+        
+        import re
+        lines = text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Skip placeholder text
+            if line == "Paste one URL or multiple to create a batch.":
+                continue
+            
+            # Check if line contains multiple 'bandcamp.com' occurrences
+            line_lower = line.lower()
+            bandcamp_count = line_lower.count('bandcamp.com')
+            
+            if bandcamp_count > 1:
+                # Multiple URLs on same line - extract all URLs
+                # First, find all positions where URLs start (https:// or http://)
+                url_starts = []
+                for match in re.finditer(r'https?://', line, re.IGNORECASE):
+                    url_starts.append(match.start())
+                
+                # Extract each URL
+                extracted_urls = []
+                for i, start_pos in enumerate(url_starts):
+                    # Find the end of this URL (start of next URL or end of line)
+                    if i + 1 < len(url_starts):
+                        # There's another URL after this one
+                        end_pos = url_starts[i + 1]
+                        url = line[start_pos:end_pos]
+                    else:
+                        # This is the last URL
+                        url = line[start_pos:]
+                    
+                    # Clean up the URL (remove trailing whitespace, commas, semicolons)
+                    url = url.rstrip(' \t,;')
+                    
+                    # Validate it contains bandcamp.com
+                    if 'bandcamp.com' in url.lower():
+                        extracted_urls.append(url)
+                
+                if extracted_urls:
+                    # Add each found URL as a separate line
+                    cleaned_lines.extend(extracted_urls)
+                else:
+                    # Fallback: try the original regex pattern (for URLs with separators)
+                    url_pattern = r'https?://[^\s]*bandcamp\.com[^\s,;]*'
+                    urls = re.findall(url_pattern, line, re.IGNORECASE)
+                    if urls:
+                        cleaned_lines.extend(urls)
+                    else:
+                        # Last resort: split by common delimiters and then extract URLs
+                        parts = re.split(r'[\s,;]+', line)
+                        for part in parts:
+                            part = part.strip()
+                            if part and 'bandcamp.com' in part.lower():
+                                # Try to extract a valid URL from this part
+                                url_match = re.search(r'https?://[^\s]*bandcamp\.com[^\s,;]*', part, re.IGNORECASE)
+                                if url_match:
+                                    cleaned_lines.append(url_match.group())
+            elif bandcamp_count == 1:
+                # Single URL - just add the line
+                cleaned_lines.append(line)
+            else:
+                # No bandcamp.com - might be partial URL or invalid, keep it anyway
+                cleaned_lines.append(line)
+        
+        # Join with newlines
+        return '\n'.join(cleaned_lines)
+    
+    def _update_url_count_and_button(self):
+        """Update URL count and download button text dynamically."""
+        # Get current content
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # ScrolledText is visible
+            content = self.url_text_widget.get(1.0, END)
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Entry is visible
+            content = self.url_var.get()
+        else:
+            content = ""
+        
+        # Get unique URLs (remove duplicates for counting)
+        urls = self._extract_urls_from_content(content)
+        unique_urls = self._remove_duplicate_urls(urls)
+        url_count = len(unique_urls)
+        
+        # Update batch mode
+        self.batch_mode = (url_count > 1)
+        
+        # Update download button text
+        if hasattr(self, 'download_btn'):
+            # Check if discography mode is enabled (for single URL or no URL)
+            if url_count <= 1 and hasattr(self, 'download_discography_var') and self.download_discography_var.get():
+                self.download_btn.config(text="Download Discography")
+            elif url_count > 1:
+                self.download_btn.config(text=f"Download {url_count} Albums")
+            else:
+                self.download_btn.config(text="Download Album")
+        
+        # Update discography checkbox state
+        if hasattr(self, 'download_discography_var'):
+            if url_count > 1:
+                # Multiple URLs - disable discography checkbox
+                self._disable_discography_checkbox()
+            else:
+                # Single URL - enable discography checkbox
+                self._enable_discography_checkbox()
+    
+    def _disable_discography_checkbox(self):
+        """Disable discography checkbox."""
+        if hasattr(self, 'download_discography_check'):
+            self.download_discography_check.config(state='disabled', fg='#808080')
+            # Also uncheck it
+            self.download_discography_var.set(False)
+    
+    def _enable_discography_checkbox(self):
+        """Enable discography checkbox."""
+        if hasattr(self, 'download_discography_check'):
+            self.download_discography_check.config(state='normal', fg='#D4D4D4')
+    
+    def _set_entry_placeholder(self, entry, placeholder_text):
+        """Set placeholder text for Entry widget."""
+        # Only set if entry is empty
+        if not entry.get():
+            entry.insert(0, placeholder_text)
+            entry.config(foreground='#808080')  # Gray color for placeholder
+        
+        def on_focus_in(event):
+            if entry.get() == placeholder_text:
+                entry.delete(0, END)
+                entry.config(foreground='#CCCCCC')  # Normal text color
+        
+        def on_focus_out(event):
+            if not entry.get():
+                entry.insert(0, placeholder_text)
+                entry.config(foreground='#808080')
+        
+        entry.bind('<FocusIn>', on_focus_in)
+        entry.bind('<FocusOut>', on_focus_out)
+    
+    
     def _check_url(self):
         """Actually check the URL and fetch metadata."""
-        url = self.url_var.get().strip()
+        # Get first URL from either Entry or ScrolledText
+        urls = self._get_urls_from_text()
+        url = urls[0] if urls else ""
         
         # Reset metadata if URL is empty
         if not url:
@@ -1396,7 +2044,7 @@ class BandcampDownloaderGUI:
         if "bandcamp.com" not in url.lower() and not url.startswith(("http://", "https://")):
             return
         
-        # Fetch metadata in background thread
+        # Fetch metadata in background thread (only for first URL for preview)
         threading.Thread(target=self.fetch_album_metadata, args=(url,), daemon=True).start()
     
     def fetch_album_metadata(self, url):
@@ -2059,27 +2707,76 @@ class BandcampDownloaderGUI:
     
     def start_download(self):
         """Start the download process in a separate thread."""
-        # Validate inputs
-        url = self.url_var.get().strip()
-        if not url:
-            messagebox.showerror("Error", "Please enter a Bandcamp album URL.")
+        # Get content from current input widget
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            content = self.url_text_widget.get(1.0, END)
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            content = self.url_var.get()
+        else:
+            content = ""
+        
+        # Validate and clean URLs (split multiple URLs on same line, etc.)
+        cleaned_content = self._validate_and_clean_urls(content)
+        
+        # Extract URLs from cleaned content
+        urls = self._extract_urls_from_content(cleaned_content)
+        
+        # Remove duplicates
+        unique_urls = self._remove_duplicate_urls(urls)
+        
+        if not unique_urls:
+            messagebox.showerror("Error", "Please enter at least one Bandcamp album URL.")
             return
         
-        if "bandcamp.com" not in url.lower():
-            response = messagebox.askyesno(
-                "Warning",
-                "This doesn't appear to be a Bandcamp URL.\n\nContinue anyway?"
-            )
-            if not response:
-                return
+        # Validate URLs
+        valid_urls = []
+        for url in unique_urls:
+            url = url.strip()
+            if not url:
+                continue
+            if "bandcamp.com" not in url.lower():
+                response = messagebox.askyesno(
+                    "Warning",
+                    f"This doesn't appear to be a Bandcamp URL:\n{url}\n\nContinue anyway?"
+                )
+                if not response:
+                    continue
+            valid_urls.append(url)
         
-        # Check if discography download is enabled
-        original_url = url
-        if self.download_discography_var.get():
+        if not valid_urls:
+            messagebox.showerror("Error", "No valid URLs to download.")
+            return
+        
+        # Update the UI with cleaned, deduplicated URLs
+        cleaned_display = '\n'.join(valid_urls)
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # Update ScrolledText
+            self.url_text_widget.delete(1.0, END)
+            if cleaned_display:
+                self.url_text_widget.insert(1.0, cleaned_display)
+            # Collapse to 2 lines
+            self.url_text_widget.config(height=2)
+            self.url_text_widget.see(1.0)
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Update Entry (single URL)
+            if len(valid_urls) == 1:
+                self.url_var.set(valid_urls[0])
+            else:
+                # Multiple URLs - switch to ScrolledText
+                self._expand_to_multiline(cleaned_display)
+                self.url_text_widget.config(height=2)
+                self.url_text_widget.see(1.0)
+        
+        # Update button text with deduplicated count
+        self._update_url_count_and_button()
+        
+        # Check if discography download is enabled (only for single URL)
+        if len(valid_urls) == 1 and self.download_discography_var.get():
             # Extract artist page URL from album/track URL
-            artist_url = self.extract_artist_page_url(url)
+            original_url = valid_urls[0]
+            artist_url = self.extract_artist_page_url(original_url)
             if artist_url:
-                url = artist_url
+                valid_urls = [artist_url]
             else:
                 messagebox.showerror("Error", "Could not extract artist page URL from the provided URL.")
                 return
@@ -2115,16 +2812,15 @@ class BandcampDownloaderGUI:
         self.progress_var.set("Starting download...")
         self.log_text.delete(1.0, END)
         self.log("Starting download...")
-        if self.download_discography_var.get() and original_url != url:
-            self.log(f"Original URL: {original_url}")
-            self.log(f"Downloading artist discography from: {url}")
+        if len(valid_urls) > 1:
+            self.log(f"Found {len(valid_urls)} album URL(s) to download")
         else:
-            self.log(f"URL: {url}")
+            self.log(f"URL: {valid_urls[0]}")
         self.log(f"Path: {path}")
         self.log("")
         
-        # Start download in thread
-        self.download_thread = threading.Thread(target=self.download_album, args=(url,), daemon=True)
+        # Start download in thread - pass list of URLs
+        self.download_thread = threading.Thread(target=self.download_album, args=(valid_urls,), daemon=True)
         self.download_thread.start()
     
     def embed_cover_art_ffmpeg(self, audio_file, thumbnail_file):
@@ -3394,9 +4090,13 @@ class BandcampDownloaderGUI:
             self.root.after(0, lambda msg=str(e): self.log(f"Error: {msg}"))
             return False
     
-    def download_album(self, url):
-        """Download the album (main entry point - handles discography vs single album)."""
+    def download_album(self, urls):
+        """Download albums (main entry point - handles multiple URLs, discography, or single album)."""
         try:
+            # Handle both single URL (string) and multiple URLs (list) for backward compatibility
+            if isinstance(urls, str):
+                urls = [urls]
+            
             # Get format settings
             format_val = self.format_var.get()
             base_format = self._extract_format(format_val)
@@ -3508,8 +4208,12 @@ class BandcampDownloaderGUI:
             self.current_track = 0  # Current track being downloaded (0-based, will be incremented as tracks finish)
             
             # Discography tracking (for multi-album downloads)
-            self.is_discography_mode = self.download_discography_var.get()
-            self.total_albums = 0  # Total number of albums in discography
+            # Check if discography mode is enabled (only for single URL)
+            # OR if multiple URLs are provided (batch mode)
+            is_discography_checkbox = (len(urls) == 1 and self.download_discography_var.get())
+            is_batch_mode = (len(urls) > 1)
+            self.is_discography_mode = is_discography_checkbox or is_batch_mode
+            self.total_albums = 0  # Total number of albums (will be set after metadata fetch)
             self.current_album = 0  # Current album being downloaded (0-based)
             self.albums_info = []  # List of album info: [{"tracks": count, "name": name}, ...]
             self.current_album_name = None  # Track current album name to detect album changes
@@ -3523,8 +4227,8 @@ class BandcampDownloaderGUI:
             # Get download start time
             self.download_start_time = time.time()
             
-            # For discography mode, extract album URLs and download individually
-            if self.is_discography_mode:
+            # Handle discography mode (single URL with discography checkbox enabled)
+            if is_discography_checkbox:
                 # Show initial discography message
                 self.root.after(0, lambda: self.progress_var.set("Fetching artist discography..."))
                 self.root.after(0, lambda: self.log("Fetching artist discography..."))
@@ -3538,7 +4242,7 @@ class BandcampDownloaderGUI:
                     extract_opts["no_warnings"] = True
                     
                     with yt_dlp.YoutubeDL(extract_opts) as extract_ydl:
-                        info = extract_ydl.extract_info(url, download=False)
+                        info = extract_ydl.extract_info(urls[0], download=False)
                         if info and "entries" in info:
                             entries = [e for e in info.get("entries", []) if e]
                             for entry in entries:
@@ -3616,10 +4320,140 @@ class BandcampDownloaderGUI:
                                   f"Failed to download any albums. {failed_albums} album(s) failed.")
                 return
             
+            # Batch mode (multiple URLs) or single album mode
+            # Phase 1: Fetch metadata for all albums first (for batch mode)
+            if is_batch_mode:
+                self.root.after(0, lambda: self.progress_var.set("Fetching metadata for all albums..."))
+                self.root.after(0, lambda: self.log("Fetching metadata for all albums..."))
+                
+                album_metadata = []
+                extract_opts_quick = {
+                    "extract_flat": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                    "socket_timeout": 10,
+                    "retries": 3,
+                }
+                
+                for idx, url in enumerate(urls):
+                    if self.is_cancelling:
+                        self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                        return
+                    
+                    try:
+                        self.root.after(0, lambda num=idx+1, total=len(urls), u=url:
+                                      self.log(f"Fetching metadata [{num}/{total}]: {u}"))
+                        
+                        with yt_dlp.YoutubeDL(extract_opts_quick) as extract_ydl:
+                            info = extract_ydl.extract_info(url, download=False)
+                            if info:
+                                album_name = info.get("album") or info.get("title") or url
+                                artist_name = info.get("artist") or info.get("uploader") or info.get("creator") or "Unknown"
+                                track_count = len(info.get("entries", [])) if "entries" in info else 0
+                                album_metadata.append({
+                                    "url": url,
+                                    "name": album_name,
+                                    "artist": artist_name,
+                                    "track_count": track_count,
+                                    "info": info
+                                })
+                                self.root.after(0, lambda name=album_name, artist=artist_name, count=track_count:
+                                              self.log(f"  ✓ {artist} - {name} ({count} tracks)"))
+                            else:
+                                album_metadata.append({
+                                    "url": url,
+                                    "name": url,
+                                    "artist": "Unknown",
+                                    "track_count": 0,
+                                    "info": None
+                                })
+                                self.root.after(0, lambda u=url: self.log(f"  ⚠ Could not fetch metadata for: {u}"))
+                    except Exception as e:
+                        album_metadata.append({
+                            "url": url,
+                            "name": url,
+                            "artist": "Unknown",
+                            "track_count": 0,
+                            "info": None
+                        })
+                        self.root.after(0, lambda u=url, err=str(e): self.log(f"  ⚠ Error fetching metadata for {u}: {err}"))
+                
+                if not album_metadata:
+                    self.root.after(0, self.download_complete, False, "No valid albums found.")
+                    return
+                
+                self.total_albums = len(album_metadata)
+                total_tracks = sum(meta.get("track_count", 0) for meta in album_metadata)
+                self.root.after(0, lambda count=len(album_metadata), tracks=total_tracks:
+                              self.log(f"\nFound {count} album(s) with {tracks} total track(s)"))
+                self.root.after(0, lambda: self.log(""))
+                
+                # Phase 2: Download each album
+                successful_albums = 0
+                failed_albums = 0
+                
+                for idx, meta in enumerate(album_metadata):
+                    # Check for cancellation
+                    if self.is_cancelling:
+                        self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                        return
+                    
+                    # Update current album counter
+                    self.current_album = idx
+                    album_url = meta["url"]
+                    album_name = meta["name"]
+                    artist_name = meta["artist"]
+                    
+                    # Log which album we're starting
+                    album_num = idx + 1
+                    self.root.after(0, lambda num=album_num, total=self.total_albums, name=album_name, artist=artist_name:
+                                  self.log(f"Downloading album {num} of {total}: {artist} - {name}"))
+                    self.root.after(0, lambda u=album_url: self.log(f"  URL: {u}"))
+                    
+                    # Download this album
+                    success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_metadata))
+                    
+                    if success:
+                        successful_albums += 1
+                        # Add completed tracks from this album
+                        if self.total_tracks > 0:
+                            self.completed_tracks_all_albums += self.total_tracks
+                    else:
+                        failed_albums += 1
+                        self.root.after(0, lambda num=album_num, name=album_name:
+                                      self.log(f"⚠ Failed to download album {num}: {name}"))
+                    
+                    # Reset track counter for next album
+                    self.current_track = 0
+                    self.total_tracks = 0
+                    self.downloaded_files = set()  # Clear for next album
+                
+                # Final summary
+                if successful_albums > 0:
+                    msg = f"Downloaded {successful_albums} album(s)"
+                    if failed_albums > 0:
+                        msg += f" ({failed_albums} failed)"
+                    self.root.after(0, self.download_complete, True, msg + "!")
+                else:
+                    self.root.after(0, self.download_complete, False,
+                                  f"Failed to download any albums. {failed_albums} album(s) failed.")
+                return
+            
             # Single album mode - download normally
-            success = self.download_single_album(url, album_index=0, total_albums=1)
+            # Check for cancellation before starting download
+            if self.is_cancelling:
+                self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                return
+            
+            success = self.download_single_album(urls[0], album_index=0, total_albums=1)
             if not success:
-                # Error already logged in download_single_album
+                # Check if this was a cancellation
+                if self.is_cancelling:
+                    self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                else:
+                    # Error already logged in download_single_album
+                    # Still need to restore UI
+                    self.root.after(0, self.download_complete, False, "Download failed.")
                 return
             
             # Success
@@ -3638,8 +4472,13 @@ class BandcampDownloaderGUI:
     def _do_album_download_and_processing(self, album_url, ydl_opts, format_val, base_format, skip_postprocessing, download_path):
         """Helper method to perform the actual download and processing of a single album."""
         # Update status before starting download
-        self.root.after(0, lambda: self.progress_var.set("Starting download..."))
-        self.root.after(0, lambda: self.log("Starting download..."))
+        # Check if cancellation was requested - if so, show "Cancelling..." instead
+        if self.is_cancelling:
+            self.root.after(0, lambda: self.progress_var.set("Cancelling..."))
+            self.root.after(0, lambda: self.log("Cancelling..."))
+        else:
+            self.root.after(0, lambda: self.progress_var.set("Starting download..."))
+            self.root.after(0, lambda: self.log("Starting download..."))
         
         # Get download path and count existing files before download
         base_path = Path(download_path) if download_path else None
