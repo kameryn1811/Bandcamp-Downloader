@@ -219,6 +219,8 @@ class BandcampDownloaderGUI:
         self.update_preview()
         # Initialize URL count and button text
         self.root.after(100, self._update_url_count_and_button)
+        # Initialize clear button visibility
+        self.root.after(100, self._update_url_clear_button)
         # Show format warnings if selected on startup
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
@@ -855,7 +857,9 @@ class BandcampDownloaderGUI:
         # Container frame for URL widgets (Entry and ScrolledText)
         self.url_container_frame = Frame(main_frame, bg='#1E1E1E')
         self.url_container_frame.grid(row=0, column=1, columnspan=2, sticky=(W, E), pady=2, padx=(8, 0))
-        self.url_container_frame.columnconfigure(0, weight=1)
+        self.url_container_frame.columnconfigure(0, weight=1)  # URL field expands
+        self.url_container_frame.columnconfigure(1, weight=0, minsize=20)  # Clear button fixed width
+        self.url_container_frame.columnconfigure(2, weight=0, minsize=20)  # Expand button fixed width
         self.url_container_frame.rowconfigure(0, weight=1)  # Allow vertical expansion for ScrolledText
         
         # Single-line Entry widget (default)
@@ -865,18 +869,61 @@ class BandcampDownloaderGUI:
             width=45,
             font=("Segoe UI", 9)
         )
-        url_entry.grid(row=0, column=0, sticky=(W, E), pady=0)
+        url_entry.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
         self.url_entry_widget = url_entry
         
         # Add placeholder text to Entry
         self._set_entry_placeholder(url_entry, "Paste one URL or multiple to create a batch.")
+        
+        # Clear button (X) - appears when URL field has content
+        # Use smaller font and minimal padding to match entry field height
+        self.url_clear_btn = Label(
+            self.url_container_frame,
+            text="✕",
+            font=("Segoe UI", 9),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=1,
+            height=1,
+            padx=2,
+            pady=0
+        )
+        # Use grid_remove (not grid_forget) to preserve space, sticky='' prevents expansion
+        # Align to center vertically to match entry field
+        self.url_clear_btn.grid(row=0, column=1, sticky='', pady=0, padx=(2, 0))
+        self.url_clear_btn.bind("<Button-1>", lambda e: self._clear_url_field())
+        self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(fg='#D4D4D4'))
+        self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(fg='#808080'))
+        self.url_clear_btn.grid_remove()  # Hidden initially (preserves space)
+        
+        # Expand/Collapse button - toggles between Entry and ScrolledText modes
+        # Shows expand icon (⤢) in Entry mode, collapse icon (⤡) in ScrolledText mode
+        self.url_expand_btn = Label(
+            self.url_container_frame,
+            text="⤢",  # Default to expand icon
+            font=("Segoe UI", 9),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=1,
+            height=1,
+            padx=2,
+            pady=0
+        )
+        # Use grid_remove to preserve space, sticky='' prevents expansion
+        self.url_expand_btn.grid(row=0, column=2, sticky='', pady=0, padx=(2, 0))
+        self.url_expand_btn.bind("<Button-1>", lambda e: self._toggle_url_field_mode())
+        self.url_expand_btn.bind("<Enter>", lambda e: self.url_expand_btn.config(fg='#D4D4D4'))
+        self.url_expand_btn.bind("<Leave>", lambda e: self.url_expand_btn.config(fg='#808080'))
+        self.url_expand_btn.grid_remove()  # Hidden initially (preserves space)
         
         # Bind events for Entry
         url_entry.bind('<Control-v>', self._handle_entry_paste)
         url_entry.bind('<Shift-Insert>', self._handle_entry_paste)
         url_entry.bind('<Button-2>', self._handle_entry_paste)  # Middle mouse button paste
         url_entry.bind('<Button-3>', self._handle_right_click_paste_entry)  # Right mouse button
-        url_entry.bind('<KeyRelease>', lambda e: (self.on_url_change(), self._check_entry_for_newlines()))
+        url_entry.bind('<KeyRelease>', lambda e: (self.on_url_change(), self._check_entry_for_newlines(), self._update_url_clear_button()))
         url_entry.bind('<Return>', self._handle_entry_return)  # Enter key - expand to multi-line
         
         # Multi-line ScrolledText widget (hidden initially, shown when needed)
@@ -916,7 +963,8 @@ class BandcampDownloaderGUI:
             anchor='nw',
             justify='left',
             padx=4,
-            pady=2
+            pady=2,
+            cursor='xterm'  # Text cursor (I-beam) to blend with the field
         )
         # Position the label to overlay the text widget (same position)
         placeholder_label.place(x=4, y=2, anchor='nw')
@@ -942,7 +990,7 @@ class BandcampDownloaderGUI:
         url_text.bind('<Shift-Insert>', self._handle_text_paste)
         url_text.bind('<Button-2>', self._handle_text_paste)  # Middle mouse button paste
         url_text.bind('<Button-3>', self._show_text_context_menu)  # Right mouse button - show context menu
-        url_text.bind('<KeyRelease>', lambda e: self._on_text_key_release())
+        url_text.bind('<KeyRelease>', lambda e: (self._on_text_key_release(), self._update_url_clear_button()))
         url_text.bind('<KeyPress>', lambda e: self._hide_text_placeholder())  # Hide on any key press
         url_text.bind('<Button-1>', lambda e: self._hide_text_placeholder())  # Hide on click
         url_text.bind('<FocusIn>', lambda e: self._on_text_focus_in())
@@ -952,10 +1000,12 @@ class BandcampDownloaderGUI:
         ttk.Label(main_frame, text="Download Path:", font=("Segoe UI", 9)).grid(
             row=1, column=0, sticky=W, pady=2
         )
-        path_entry = ttk.Entry(main_frame, textvariable=self.path_var, width=35, font=("Segoe UI", 9))
+        path_entry = ttk.Entry(main_frame, textvariable=self.path_var, width=35, font=("Segoe UI", 9), state='normal')
         path_entry.grid(row=1, column=1, sticky=(W, E), pady=2, padx=(8, 0))
+        self.path_entry = path_entry  # Store reference for unfocus handling
         browse_btn = ttk.Button(main_frame, text="Browse", command=self.browse_folder)
         browse_btn.grid(row=1, column=2, padx=(4, 0), pady=2)
+        self.browse_btn = browse_btn  # Store reference for unfocus handling
         
         # Bind path changes to update preview
         self.path_var.trace_add('write', lambda *args: self.update_preview())
@@ -1309,23 +1359,27 @@ class BandcampDownloaderGUI:
             # Get the widget that was clicked
             widget_clicked = event.widget
             
-            # Check if click is on URL field or any of its parent containers
+            # Check if click is on URL field, path entry, browse button, clear button, expand button, or any of their parent containers
             current = widget_clicked
-            is_url_field = False
+            is_interactive_widget = False
             while current:
                 if (current == self.url_entry_widget or 
                     current == self.url_text_widget or 
                     current == self.url_container_frame or
-                    current == self.url_text_frame):
-                    is_url_field = True
+                    current == self.url_text_frame or
+                    current == self.path_entry or
+                    current == self.browse_btn or
+                    (hasattr(self, 'url_clear_btn') and current == self.url_clear_btn) or
+                    (hasattr(self, 'url_expand_btn') and current == self.url_expand_btn)):
+                    is_interactive_widget = True
                     break
                 try:
                     current = current.master
                 except:
                     break
             
-            # Only unfocus if the click is NOT on the URL field
-            if not is_url_field:
+            # Only unfocus URL field if the click is NOT on any interactive widget
+            if not is_interactive_widget:
                 # Remove focus from URL field by focusing on root or main frame
                 try:
                     main_frame.focus_set()
@@ -1487,12 +1541,100 @@ class BandcampDownloaderGUI:
         # Update URL count dynamically
         self._update_url_count_and_button()
         
+        # Update clear button visibility
+        self._update_url_clear_button()
+        
         # Cancel any pending timer
         if self.url_check_timer:
             self.root.after_cancel(self.url_check_timer)
         
         # Debounce: wait 200ms after last change before fetching (shorter for faster response)
         self.url_check_timer = self.root.after(200, self._check_url)
+    
+    def _update_url_clear_button(self):
+        """Show or hide the clear button and expand button based on URL field content and mode."""
+        if not hasattr(self, 'url_clear_btn'):
+            return
+        
+        # Get content from current visible widget
+        has_content = False
+        is_entry_mode = False
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # ScrolledText is visible (multi-line mode)
+            content = self.url_text_widget.get(1.0, END).strip()
+            # Skip placeholder text
+            if content and content != "Paste one URL or multiple to create a batch.":
+                has_content = True
+            is_entry_mode = False
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Entry is visible (single-line mode)
+            content = self.url_var.get().strip()
+            # Skip placeholder text
+            if content and content != "Paste one URL or multiple to create a batch.":
+                has_content = True
+            is_entry_mode = True
+        
+        # Show or hide clear button (whenever there's content)
+        if has_content:
+            self.url_clear_btn.grid()
+        else:
+            self.url_clear_btn.grid_remove()
+        
+        # Show or hide expand/collapse button (in both Entry and ScrolledText modes when there's content)
+        if hasattr(self, 'url_expand_btn'):
+            if has_content:
+                # Show button and update icon based on current mode
+                self.url_expand_btn.grid()
+                if is_entry_mode:
+                    # Entry mode - show expand icon (⤢)
+                    self.url_expand_btn.config(text="⤢")
+                else:
+                    # ScrolledText mode - show collapse icon (⤡)
+                    self.url_expand_btn.config(text="⤡")
+            else:
+                self.url_expand_btn.grid_remove()
+    
+    def _toggle_url_field_mode(self):
+        """Toggle between Entry (single-line) and ScrolledText (multi-line) modes."""
+        if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Currently in Entry mode - expand to ScrolledText
+            content = self.url_var.get().strip()
+            # Remove placeholder text if present
+            if content == "Paste one URL or multiple to create a batch.":
+                content = ""
+            # Expand to multi-line
+            self._expand_to_multiline(content)
+        elif self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # Currently in ScrolledText mode - collapse to Entry
+            self._collapse_to_entry()
+    
+    def _clear_url_field(self):
+        """Clear the URL field and unfocus it."""
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # ScrolledText is visible - clear it
+            self.url_text_widget.delete(1.0, END)
+            self._update_text_placeholder_visibility()
+            # Unfocus
+            self.root.focus_set()
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Entry is visible - clear it and restore placeholder
+            self.url_var.set("")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
+            # Unfocus
+            self.root.focus_set()
+        
+        # Update clear button visibility
+        self._update_url_clear_button()
+        
+        # Reset metadata and preview
+        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None}
+        self.current_thumbnail_url = None
+        self.album_art_fetching = False
+        self.update_preview()
+        self.clear_album_art()
+        
+        # Update URL count
+        self._update_url_count_and_button()
     
     def _handle_right_click_paste(self, event):
         """Handle right-click paste in URL field (Entry widget)."""
@@ -1511,6 +1653,7 @@ class BandcampDownloaderGUI:
                     # Trigger URL check
                     self.root.after(10, self._check_url)
                     self._update_url_count_and_button()
+                    self._update_url_clear_button()
         except Exception:
             # If clipboard is empty or not text, ignore
             pass
@@ -1544,7 +1687,7 @@ class BandcampDownloaderGUI:
                     # Insert at cursor position (Text widget)
                     url_text.insert("insert", clipboard_text)
                     # Trigger URL check and update count
-                    self.root.after(10, lambda: (self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility()))
+                    self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
         except Exception:
             # If clipboard is empty or not text, ignore
             pass
@@ -1567,6 +1710,7 @@ class BandcampDownloaderGUI:
             else:
                 # No newlines - just update count
                 self._update_url_count_and_button()
+                self._update_url_clear_button()
                 self.root.after(10, self._check_url)
     
     def _check_entry_for_newlines(self):
@@ -1598,16 +1742,64 @@ class BandcampDownloaderGUI:
         # Hide placeholder immediately when pasting
         self._hide_text_placeholder()
         # Let the paste happen first, then check
-        self.root.after(10, lambda: (self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility()))
+        self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
     
     def _on_text_key_release(self):
         """Handle key release in ScrolledText - update URL count dynamically and update placeholder visibility."""
+        # Ensure trailing newline for easy editing
+        self._ensure_trailing_newline()
+        
         # Update placeholder visibility based on content
         self._update_text_placeholder_visibility()
         
         self._update_url_count_and_button()
         # Also trigger URL check with debounce
         self.on_url_change()
+    
+    def _ensure_trailing_newline(self):
+        """Ensure ScrolledText always ends with an empty line for easy editing."""
+        if not self.url_text_widget or not self.url_text_widget.winfo_viewable():
+            return
+        
+        try:
+            # Get current content (END includes trailing newline)
+            content = self.url_text_widget.get(1.0, END)
+            
+            # Text widget's END always includes a trailing newline, so content[-1] is always '\n'
+            # We want to ensure the last line (before the implicit trailing newline) is empty
+            # So we check if content ends with '\n\n' (content + implicit newline = two newlines)
+            
+            # Get current cursor position before modifying
+            cursor_pos = self.url_text_widget.index("insert")
+            
+            # Check if we need to add a newline to create an empty line
+            # If content has at least 2 chars, check if second-to-last is '\n'
+            # If content is just '\n' (empty), we need to add another '\n' to have an empty line
+            needs_newline = False
+            
+            if len(content) >= 2:
+                # Check if second-to-last character is a newline (meaning last line is empty)
+                if content[-2] != '\n':
+                    needs_newline = True
+            elif len(content) == 1:
+                # Only the implicit newline - need another for empty line
+                needs_newline = True
+            # If content is empty, we already have the empty line (just '\n')
+            
+            if needs_newline:
+                # Insert newline at the end (before the implicit trailing newline)
+                # END is after the last character, so END + "-1c" is the last character
+                # Inserting there will add a newline before the implicit one
+                self.url_text_widget.insert(END + "-1c", '\n')
+                
+                # Restore cursor position
+                try:
+                    self.url_text_widget.mark_set("insert", cursor_pos)
+                except:
+                    pass
+        except Exception:
+            # Silently fail if there's any issue
+            pass
     
     def _hide_text_placeholder(self):
         """Hide the placeholder label overlay."""
@@ -1665,6 +1857,18 @@ class BandcampDownloaderGUI:
             if initial_content == "Paste one URL or multiple to create a batch.":
                 initial_content = ""
         
+        # Extract URLs from the single-line content (handles multiple URLs on one line)
+        urls = self._extract_urls_from_content(initial_content)
+        
+        # Format content: if multiple URLs were found, put each on its own line
+        if len(urls) > 1:
+            formatted_content = '\n'.join(urls)
+        elif initial_content and initial_content.strip():
+            # Single URL or non-URL text, keep as-is
+            formatted_content = initial_content
+        else:
+            formatted_content = ""
+        
         # Get the text frame - use stored reference if available, otherwise get from widget
         text_frame = getattr(self, 'url_text_frame', None) or self.url_text_widget.master
         
@@ -1693,15 +1897,18 @@ class BandcampDownloaderGUI:
         
         # Set content in ScrolledText
         self.url_text_widget.delete(1.0, END)
-        if initial_content and initial_content.strip():
-            self.url_text_widget.insert(1.0, initial_content)
+        if formatted_content and formatted_content.strip():
+            self.url_text_widget.insert(1.0, formatted_content)
             self.url_text_widget.config(foreground='#CCCCCC')  # Normal text color
+        
+        # Ensure trailing newline for easy editing
+        self._ensure_trailing_newline()
         
         # Update placeholder visibility based on content
         self._update_text_placeholder_visibility()
         
         # Set height based on content (min 2, max 8)
-        content = initial_content.strip() if initial_content else ""
+        content = formatted_content.strip() if formatted_content else ""
         if content:
             lines = content.split('\n')
             line_count = len([line for line in lines if line.strip()])
@@ -1718,8 +1925,9 @@ class BandcampDownloaderGUI:
         # Focus the text widget
         self.url_text_widget.focus_set()
         
-        # Update URL count
+        # Update URL count and clear button
         self._update_url_count_and_button()
+        self._update_url_clear_button()
     
     def _collapse_to_entry(self):
         """Collapse from ScrolledText back to Entry (single URL mode)."""
@@ -1733,13 +1941,13 @@ class BandcampDownloaderGUI:
         if content == "Paste one URL or multiple to create a batch.":
             content = ""
         
-        # Get first URL (or all if single line)
-        urls = [line.strip() for line in content.split('\n') 
-               if line.strip() and line.strip() != "Paste one URL or multiple to create a batch."]
+        # Extract all URLs from content (handles both single and multi-line)
+        urls = self._extract_urls_from_content(content)
+        
         if urls:
-            # Use first URL
-            first_url = urls[0]
-            self.url_var.set(first_url)
+            # Join all URLs with a space to flatten them into a single line
+            flattened_urls = ' '.join(urls)
+            self.url_var.set(flattened_urls)
             # Remove placeholder styling
             self.url_entry_widget.config(foreground='#CCCCCC')
         else:
@@ -1748,13 +1956,24 @@ class BandcampDownloaderGUI:
             self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
         
         # Hide ScrolledText, show Entry
-        text_frame = self.url_text_widget.master
-        text_frame.grid_forget()  # Completely remove from grid
-        # Re-grid the Entry widget
-        self.url_entry_widget.grid(row=0, column=0, sticky=(W, E), pady=0)
+        text_frame = getattr(self, 'url_text_frame', None) or self.url_text_widget.master
+        if text_frame:
+            text_frame.grid_remove()  # Hide but preserve space
         
-        # Update URL count
+        # Re-grid the Entry widget with original padding
+        if self.url_entry_widget:
+            self.url_entry_widget.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
+        
+        # Force layout update
+        self.url_container_frame.update_idletasks()
+        
+        # Update URL count and clear button
         self._update_url_count_and_button()
+        self._update_url_clear_button()
+        
+        # Focus the Entry widget
+        if self.url_entry_widget:
+            self.url_entry_widget.focus_set()
         
         # Trigger URL check
         self.root.after(10, self._check_url)
@@ -2707,11 +2926,16 @@ class BandcampDownloaderGUI:
     
     def start_download(self):
         """Start the download process in a separate thread."""
-        # Get content from current input widget
+        # If multi-line field is visible, collapse to single-line to preserve all URLs
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
-            content = self.url_text_widget.get(1.0, END)
-        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            self._collapse_to_entry()
+        
+        # Get content from current input widget (should be Entry now)
+        if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get()
+        elif self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # Fallback in case collapse didn't work
+            content = self.url_text_widget.get(1.0, END)
         else:
             content = ""
         
@@ -2748,24 +2972,28 @@ class BandcampDownloaderGUI:
             return
         
         # Update the UI with cleaned, deduplicated URLs
-        cleaned_display = '\n'.join(valid_urls)
+        # Flatten all URLs to single line for Entry widget
+        flattened_urls = ' '.join(valid_urls)
+        
+        # Always update Entry widget (we collapsed it earlier if it was multiline)
+        if self.url_entry_widget:
+            self.url_var.set(flattened_urls)
+            # Remove placeholder styling
+            self.url_entry_widget.config(foreground='#CCCCCC')
+            # Ensure Entry is visible
+            if not self.url_entry_widget.winfo_viewable():
+                # Re-grid Entry if it's not visible
+                text_frame = getattr(self, 'url_text_frame', None) or (self.url_text_widget.master if self.url_text_widget else None)
+                if text_frame:
+                    text_frame.grid_remove()
+                self.url_entry_widget.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
+                self.url_container_frame.update_idletasks()
+        
+        # Hide multiline widget if it's visible
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
-            # Update ScrolledText
-            self.url_text_widget.delete(1.0, END)
-            if cleaned_display:
-                self.url_text_widget.insert(1.0, cleaned_display)
-            # Collapse to 2 lines
-            self.url_text_widget.config(height=2)
-            self.url_text_widget.see(1.0)
-        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
-            # Update Entry (single URL)
-            if len(valid_urls) == 1:
-                self.url_var.set(valid_urls[0])
-            else:
-                # Multiple URLs - switch to ScrolledText
-                self._expand_to_multiline(cleaned_display)
-                self.url_text_widget.config(height=2)
-                self.url_text_widget.see(1.0)
+            text_frame = getattr(self, 'url_text_frame', None) or self.url_text_widget.master
+            if text_frame:
+                text_frame.grid_remove()
         
         # Update button text with deduplicated count
         self._update_url_count_and_button()
