@@ -4519,6 +4519,10 @@ class BandcampDownloaderGUI:
                     self.root.after(0, lambda num=album_num, total=self.total_albums, url=album_url: 
                                   self.log(f"Downloading album {num} of {total}: {url}"))
                     
+                    # Update preview and artwork for current album
+                    # Fetch metadata and artwork (will update preview and artwork)
+                    self.fetch_album_metadata(album_url)
+                    
                     # Download this album
                     success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_urls))
                     
@@ -4637,6 +4641,44 @@ class BandcampDownloaderGUI:
                     self.root.after(0, lambda num=album_num, total=self.total_albums, name=album_name, artist=artist_name:
                                   self.log(f"Downloading album {num} of {total}: {artist} - {name}"))
                     self.root.after(0, lambda u=album_url: self.log(f"  URL: {u}"))
+                    
+                    # Update preview and artwork for current album
+                    # Update album_info with metadata we already have
+                    self.album_info = {
+                        "artist": artist_name or "Artist",
+                        "album": album_name or "Album",
+                        "title": "Track",
+                        "thumbnail_url": None
+                    }
+                    self.root.after(0, self.update_preview)
+                    
+                    # Fetch and display album art for this album
+                    # Try to get thumbnail from metadata info if available
+                    thumbnail_url = None
+                    if meta.get("info"):
+                        info = meta["info"]
+                        # Try to get thumbnail from various locations
+                        thumbnail_url = (info.get("thumbnail") or 
+                                       info.get("thumbnail_url") or
+                                       info.get("artwork_url") or
+                                       info.get("cover"))
+                        # Try thumbnails list
+                        if not thumbnail_url and info.get("thumbnails"):
+                            thumbnails = info.get("thumbnails")
+                            if thumbnails and len(thumbnails) > 0:
+                                if isinstance(thumbnails[0], dict):
+                                    thumbnail_url = thumbnails[0].get("url")
+                                else:
+                                    thumbnail_url = thumbnails[0]
+                    
+                    # If we have thumbnail, display it; otherwise fetch it
+                    if thumbnail_url:
+                        self.album_info["thumbnail_url"] = thumbnail_url
+                        self.current_thumbnail_url = thumbnail_url
+                        self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
+                    else:
+                        # Fetch metadata and artwork (will update preview and artwork)
+                        self.fetch_album_metadata(album_url)
                     
                     # Download this album
                     success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_metadata))
