@@ -213,6 +213,8 @@ class BandcampDownloaderGUI:
         self.album_art_image = None  # Store reference to prevent garbage collection
         self.album_art_fetching = False  # Flag to prevent multiple simultaneous fetches
         self.current_thumbnail_url = None  # Track current thumbnail to avoid re-downloading
+        self.artwork_fetch_id = 0  # Track fetch requests to cancel stale ones
+        self.current_url_being_processed = None  # Track URL currently being processed to avoid cancelling valid fetches
         self.album_art_visible = True  # Track album art panel visibility
         
         # Download control
@@ -1867,6 +1869,9 @@ class BandcampDownloaderGUI:
             return None  # No history, allow default behavior
         
         # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Increment fetch ID to cancel any in-flight artwork fetches
+        self.artwork_fetch_id += 1
+        self.album_art_fetching = False
         # Cancel any pending URL check timer and content save timer
         if self.url_check_timer:
             self.root.after_cancel(self.url_check_timer)
@@ -1906,7 +1911,18 @@ class BandcampDownloaderGUI:
                 self._update_url_count_and_button()
                 self._update_url_clear_button()
         else:
-            # At the beginning of history - clear the field
+            # At the beginning of history - insert empty state at position 0 so we can redo
+            # This ensures that if we undo past the beginning, we can still redo back
+            if self.content_history and self.content_history[0] != "":
+                # Insert empty state at the beginning
+                self.content_history.insert(0, "")
+                self.content_history_index = 0
+            elif not self.content_history:
+                # No history at all - create empty state
+                self.content_history = [""]
+                self.content_history_index = 0
+            
+            # Clear the field
             self.url_var.set("")
             self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
             # Immediately clear preview and artwork
@@ -1927,6 +1943,9 @@ class BandcampDownloaderGUI:
             return None  # No history, allow default behavior
         
         # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Increment fetch ID to cancel any in-flight artwork fetches
+        self.artwork_fetch_id += 1
+        self.album_art_fetching = False
         # Cancel any pending URL check timer and content save timer
         if self.url_check_timer:
             self.root.after_cancel(self.url_check_timer)
@@ -1978,6 +1997,9 @@ class BandcampDownloaderGUI:
             return None  # No history or widget, allow default behavior
         
         # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Increment fetch ID to cancel any in-flight artwork fetches
+        self.artwork_fetch_id += 1
+        self.album_art_fetching = False
         # Cancel any pending URL check timer and content save timer
         if self.url_check_timer:
             self.root.after_cancel(self.url_check_timer)
@@ -2013,7 +2035,18 @@ class BandcampDownloaderGUI:
             # Trigger URL check and update count (will handle empty content correctly)
             self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
         else:
-            # At the beginning of history - clear the field
+            # At the beginning of history - insert empty state at position 0 so we can redo
+            # This ensures that if we undo past the beginning, we can still redo back
+            if self.content_history and self.content_history[0] != "":
+                # Insert empty state at the beginning
+                self.content_history.insert(0, "")
+                self.content_history_index = 0
+            elif not self.content_history:
+                # No history at all - create empty state
+                self.content_history = [""]
+                self.content_history_index = 0
+            
+            # Clear the field
             self.url_text_widget.delete(1.0, END)
             self._update_text_placeholder_visibility()
             # Immediately clear preview and artwork
@@ -2032,6 +2065,9 @@ class BandcampDownloaderGUI:
             return None  # No history or widget, allow default behavior
         
         # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Increment fetch ID to cancel any in-flight artwork fetches
+        self.artwork_fetch_id += 1
+        self.album_art_fetching = False
         # Cancel any pending URL check timer and content save timer
         if self.url_check_timer:
             self.root.after_cancel(self.url_check_timer)
@@ -2595,6 +2631,9 @@ class BandcampDownloaderGUI:
         
         # Reset metadata if URL is empty or just whitespace
         if not url or url == "Paste one URL or multiple to create a batch.":
+            # Cancel any in-flight artwork fetches
+            self.artwork_fetch_id += 1
+            self.current_url_being_processed = None
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
             self.format_suggestion_shown = False  # Reset format suggestion flag
             self.current_thumbnail_url = None
@@ -2607,10 +2646,14 @@ class BandcampDownloaderGUI:
         if "bandcamp.com" not in url.lower() and not url.startswith(("http://", "https://")):
             return
         
-        # Reset artwork flags when URL changes to allow new artwork to be fetched
-        # This ensures artwork syncs properly when switching between URLs
-        self.current_thumbnail_url = None
-        self.album_art_fetching = False
+        # Only cancel artwork fetches if the URL actually changed
+        # This prevents cancelling valid fetches when _check_url is called multiple times for the same URL
+        if self.current_url_being_processed != url:
+            # URL changed - cancel any in-flight artwork fetches for the old URL
+            self.artwork_fetch_id += 1
+            self.current_url_being_processed = url
+            self.current_thumbnail_url = None
+            self.album_art_fetching = False
         
         # Fetch metadata in background thread (only for first URL for preview)
         threading.Thread(target=self.fetch_album_metadata, args=(url,), daemon=True).start()
@@ -3111,6 +3154,52 @@ class BandcampDownloaderGUI:
         except Exception:
             return True  # If we can't check, assume empty to be safe
     
+    def _verify_file_fully_written(self, file_path, is_fast_mode=False):
+        """
+        Verify that a file is fully written to disk.
+        Checks: file exists, has non-zero size, is readable, and size is stable.
+        Returns True if file is fully written and accessible, False otherwise.
+        
+        Args:
+            file_path: Path object to the file to verify
+            is_fast_mode: If True, uses longer delay for stability check (for Original Format mode)
+        """
+        try:
+            if not file_path.exists():
+                return False
+            
+            # Check file has non-zero size
+            size1 = file_path.stat().st_size
+            if size1 == 0:
+                return False  # Empty file, not fully written yet
+            
+            # Small delay to check if size is stable (not still being written)
+            # Fast modes (Original Format) need slightly longer delay since files complete very quickly
+            import time
+            stability_delay = 0.15 if is_fast_mode else 0.1
+            time.sleep(stability_delay)
+            
+            # Check size again - if it changed, file is still being written
+            if not file_path.exists():
+                return False
+            size2 = file_path.stat().st_size
+            if size1 != size2:
+                return False  # Size changed, still being written
+            
+            # Try to open file to ensure it's readable (fully flushed to disk)
+            try:
+                with open(file_path, 'rb') as f:
+                    # Try to read first byte to ensure file is accessible
+                    f.read(1)
+                return True
+            except (IOError, OSError, PermissionError):
+                # File exists but can't be read - might still be locked by writer
+                return False
+                
+        except (OSError, PermissionError, Exception):
+            # Any error means file isn't ready
+            return False
+    
     def fetch_and_display_album_art(self, thumbnail_url):
         """Fetch and display album art asynchronously (second phase - doesn't block preview)."""
         if not thumbnail_url:
@@ -3123,17 +3212,49 @@ class BandcampDownloaderGUI:
             return
         
         # Prevent multiple simultaneous fetches
+        # If flag is stuck (has been True for more than 30 seconds), reset it to allow new fetches
         if self.album_art_fetching:
-            return
+            # Check if we should force reset (safety mechanism)
+            if hasattr(self, '_artwork_fetch_start_time'):
+                import time
+                if time.time() - self._artwork_fetch_start_time > 30:
+                    # Flag has been stuck for 30+ seconds, reset it
+                    self.album_art_fetching = False
+                else:
+                    return
+            else:
+                return
+        
+        # Increment fetch ID to cancel any in-flight fetches
+        self.artwork_fetch_id += 1
+        fetch_id = self.artwork_fetch_id
+        
+        # Track when fetch started (for timeout detection)
+        import time
+        self._artwork_fetch_start_time = time.time()
         
         self.album_art_fetching = True
         
         def download_and_display():
             try:
+                # Check if this fetch was cancelled (new fetch started)
+                if fetch_id != self.artwork_fetch_id:
+                    # Reset flag in a thread-safe way
+                    def reset_flag():
+                        self.album_art_fetching = False
+                    self.root.after(0, reset_flag)
+                    return
+                
                 # Check again before downloading (field might have been cleared)
                 if self._is_url_field_empty():
-                    self.root.after(0, self.clear_album_art)
-                    self.album_art_fetching = False
+                    if fetch_id == self.artwork_fetch_id:  # Only clear if still current
+                        self.root.after(0, self.clear_album_art)
+                    # Reset flag in a thread-safe way
+                    def reset_flag():
+                        self.album_art_fetching = False
+                        if hasattr(self, '_artwork_fetch_start_time'):
+                            del self._artwork_fetch_start_time
+                    self.root.after(0, reset_flag)
                     return
                 
                 import io
@@ -3142,10 +3263,24 @@ class BandcampDownloaderGUI:
                 # Download the image with retry logic
                 image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
                 
+                # Check if this fetch was cancelled during download
+                if fetch_id != self.artwork_fetch_id:
+                    # Reset flag in a thread-safe way
+                    def reset_flag():
+                        self.album_art_fetching = False
+                    self.root.after(0, reset_flag)
+                    return
+                
                 # Check again after download (field might have been cleared during download)
                 if self._is_url_field_empty():
-                    self.root.after(0, self.clear_album_art)
-                    self.album_art_fetching = False
+                    if fetch_id == self.artwork_fetch_id:  # Only clear if still current
+                        self.root.after(0, self.clear_album_art)
+                    # Reset flag in a thread-safe way
+                    def reset_flag():
+                        self.album_art_fetching = False
+                        if hasattr(self, '_artwork_fetch_start_time'):
+                            del self._artwork_fetch_start_time
+                    self.root.after(0, reset_flag)
                     return
                 
                 # Open and resize image
@@ -3159,6 +3294,10 @@ class BandcampDownloaderGUI:
                 
                 # Update UI on main thread
                 def update_ui():
+                    # Check if this fetch was cancelled before updating UI
+                    if fetch_id != self.artwork_fetch_id:
+                        return
+                    
                     # Final check before displaying - field might have been cleared
                     if self._is_url_field_empty():
                         self.clear_album_art()
@@ -3179,22 +3318,40 @@ class BandcampDownloaderGUI:
                     # Keep a reference to prevent garbage collection
                     self.album_art_image = photo
                 
-                self.root.after(0, update_ui)
-                self.album_art_fetching = False
+                if fetch_id == self.artwork_fetch_id:  # Only update if still current
+                    self.root.after(0, update_ui)
+                
+                # Always reset flag after completion (use root.after to ensure thread safety)
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
                 
             except ImportError:
                 # PIL not available - can't display images
-                self.root.after(0, lambda: self.album_art_canvas.delete("all"))
-                self.root.after(0, lambda: self.album_art_canvas.create_text(
-                    75, 75, text="PIL required\nfor album art\n\nInstall Pillow:\npip install Pillow", 
-                    fill='#808080', font=("Segoe UI", 7), justify='center'
-                ))
-                self.album_art_fetching = False
+                if fetch_id == self.artwork_fetch_id:  # Only update if still current
+                    self.root.after(0, lambda: self.album_art_canvas.delete("all"))
+                    self.root.after(0, lambda: self.album_art_canvas.create_text(
+                        75, 75, text="PIL required\nfor album art\n\nInstall Pillow:\npip install Pillow", 
+                        fill='#808080', font=("Segoe UI", 7), justify='center'
+                    ))
+                # Always reset flag after error
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
             except Exception as e:
                 # Failed to load image - clear and show placeholder
-                self.root.after(0, self.clear_album_art)
-                self.album_art_fetching = False
-                self.album_art_fetching = False
+                if fetch_id == self.artwork_fetch_id:  # Only clear if still current
+                    self.root.after(0, self.clear_album_art)
+                # Always reset flag after error
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
         
         # Download in background thread
         threading.Thread(target=download_and_display, daemon=True).start()
@@ -5707,34 +5864,81 @@ class BandcampDownloaderGUI:
             if self.is_cancelling:
                 return False
         
-        # Verify that files were actually downloaded
+        # Verify that files were actually downloaded (with retry logic for batch and discography modes)
+        import time
         files_downloaded = False
-        if base_path and base_path.exists():
-            # Count files after download
-            existing_files_after = set()
-            if skip_postprocessing:
-                # When skipping post-processing, check all audio formats
-                all_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
-                for ext in all_exts:
-                    existing_files_after.update(base_path.rglob(f"*{ext}"))
+        # Use more retries and longer delays for discography/batch modes (multiple albums in sequence)
+        is_multi_album = hasattr(self, 'is_discography_mode') and self.is_discography_mode
+        # Original Format or skip_postprocessing mode is much faster (no re-encoding), so files complete quickly
+        # Need more time for file system to flush writes
+        is_fast_mode = (base_format == "original" or skip_postprocessing)
+        max_retries = 5 if is_multi_album else 3  # More retries for multi-album downloads
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            # Small delay to ensure files are fully written to disk
+            # Fast modes (Original Format) need slightly longer delay since files complete very quickly
+            if attempt > 0:
+                time.sleep(retry_delay * attempt)  # Exponential backoff: 0.5s, 1s, 1.5s, 2s, 2.5s
             else:
-                for ext in self.FORMAT_EXTENSIONS.get(format_val, []):
-                    existing_files_after.update(base_path.rglob(f"*{ext}"))
+                if is_multi_album:
+                    time.sleep(0.5)  # Multi-album: 0.5s
+                elif is_fast_mode:
+                    time.sleep(0.4)  # Fast mode (Original Format): 0.4s (slightly longer than normal)
+                else:
+                    time.sleep(0.3)  # Normal mode: 0.3s
             
-            # Check if new files were created
-            new_files = existing_files_after - existing_files_before
-            files_downloaded = len(new_files) > 0
-            
-            # Also check if files in downloaded_files set exist
+            # First, check downloaded_files set (most reliable - tracks files from progress hook)
             if hasattr(self, 'downloaded_files') and self.downloaded_files:
                 for file_path in self.downloaded_files:
-                    if Path(file_path).exists():
+                    file_path_obj = Path(file_path)
+                    # Verify file exists, is readable, and has a stable size (fully written)
+                    # Pass is_fast_mode flag for Original Format mode
+                    if self._verify_file_fully_written(file_path_obj, is_fast_mode=is_fast_mode):
                         files_downloaded = True
                         break
+            
+            # If downloaded_files check found files, we're done
+            if files_downloaded:
+                break
+            
+            # If downloaded_files check didn't find anything, fall back to file system comparison
+            if base_path and base_path.exists():
+                # Count files after download
+                existing_files_after = set()
+                if skip_postprocessing:
+                    # When skipping post-processing, check all audio formats
+                    all_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
+                    for ext in all_exts:
+                        existing_files_after.update(base_path.rglob(f"*{ext}"))
+                else:
+                    for ext in self.FORMAT_EXTENSIONS.get(format_val, []):
+                        existing_files_after.update(base_path.rglob(f"*{ext}"))
+                
+                # Check if new files were created and verify they're fully written
+                new_files = existing_files_after - existing_files_before
+                if len(new_files) > 0:
+                    # Verify at least one new file is fully written
+                    # Pass is_fast_mode flag for Original Format mode
+                    for new_file in new_files:
+                        if self._verify_file_fully_written(new_file, is_fast_mode=is_fast_mode):
+                            files_downloaded = True
+                            break
+                    if files_downloaded:
+                        break
         
-        # If no files were downloaded, it likely requires purchase/login
+        # If no files were downloaded after retries, it likely requires purchase/login
         if not files_downloaded:
-            self.root.after(0, lambda: self.log("⚠ No files were downloaded. This album may require purchase or login."))
+            # Log more details for debugging
+            debug_info = []
+            if hasattr(self, 'downloaded_files'):
+                debug_info.append(f"downloaded_files count: {len(self.downloaded_files) if self.downloaded_files else 0}")
+            if base_path and base_path.exists():
+                debug_info.append(f"base_path exists: {base_path}")
+            debug_msg = "⚠ No files were downloaded. This album may require purchase or login."
+            if debug_info:
+                debug_msg += f" ({', '.join(debug_info)})"
+            self.root.after(0, lambda msg=debug_msg: self.log(msg))
             return False
         
         # Process downloaded files
