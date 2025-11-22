@@ -201,6 +201,10 @@ class BandcampDownloaderGUI:
         self.url_text_widget = None  # Store reference to ScrolledText widget
         self.url_container_frame = None  # Container frame for URL widgets
         
+        # Paste history for undo/redo functionality
+        self.paste_history = []  # List of pasted clipboard contents
+        self.paste_history_index = -1  # Current position in history (-1 = most recent)
+        
         # Store metadata for preview
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
         self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
@@ -933,6 +937,9 @@ class BandcampDownloaderGUI:
         url_entry.bind('<Button-3>', self._handle_right_click_paste_entry)  # Right mouse button
         url_entry.bind('<KeyRelease>', lambda e: (self.on_url_change(), self._check_entry_for_newlines(), self._update_url_clear_button()))
         url_entry.bind('<Return>', self._handle_entry_return)  # Enter key - expand to multi-line
+        url_entry.bind('<Control-z>', self._handle_entry_undo)  # Undo (Ctrl+Z)
+        url_entry.bind('<Control-Shift-Z>', self._handle_entry_redo)  # Redo (Ctrl+Shift+Z)
+        url_entry.bind('<Control-y>', self._handle_entry_redo)  # Redo (Ctrl+Y - alternative)
         
         # Multi-line ScrolledText widget (hidden initially, shown when needed)
         url_text_frame = Frame(self.url_container_frame, bg='#1E1E1E')
@@ -1003,6 +1010,9 @@ class BandcampDownloaderGUI:
         url_text.bind('<Button-1>', lambda e: self._hide_text_placeholder())  # Hide on click
         url_text.bind('<FocusIn>', lambda e: self._on_text_focus_in())
         url_text.bind('<FocusOut>', lambda e: self._on_text_focus_out())
+        url_text.bind('<Control-z>', self._handle_text_undo)  # Undo (Ctrl+Z)
+        url_text.bind('<Control-Shift-Z>', self._handle_text_redo)  # Redo (Ctrl+Shift+Z)
+        url_text.bind('<Control-y>', self._handle_text_redo)  # Redo (Ctrl+Y - alternative)
         
         # Download path - compact
         ttk.Label(main_frame, text="Download Path:", font=("Segoe UI", 9)).grid(
@@ -1367,7 +1377,7 @@ class BandcampDownloaderGUI:
             # Get the widget that was clicked
             widget_clicked = event.widget
             
-            # Check if click is on URL field, path entry, browse button, clear button, expand button, or any of their parent containers
+            # Check if click is on URL field, path entry, browse button, clear button, expand button, log text, or any of their parent containers
             current = widget_clicked
             is_interactive_widget = False
             while current:
@@ -1377,6 +1387,7 @@ class BandcampDownloaderGUI:
                     current == self.url_text_frame or
                     current == self.path_entry or
                     current == self.browse_btn or
+                    (hasattr(self, 'log_text') and current == self.log_text) or
                     (hasattr(self, 'url_clear_btn') and current == self.url_clear_btn) or
                     (hasattr(self, 'url_expand_btn') and current == self.url_expand_btn)):
                     is_interactive_widget = True
@@ -1654,6 +1665,15 @@ class BandcampDownloaderGUI:
             # Get clipboard content
             clipboard_text = self.root.clipboard_get()
             if clipboard_text:
+                # Save to history
+                if clipboard_text.strip():
+                    if self.paste_history_index < len(self.paste_history) - 1:
+                        self.paste_history = self.paste_history[:self.paste_history_index + 1]
+                    self.paste_history.append(clipboard_text)
+                    self.paste_history_index = len(self.paste_history) - 1
+                    if len(self.paste_history) > 20:
+                        self.paste_history = self.paste_history[-20:]
+                        self.paste_history_index = len(self.paste_history) - 1
                 # Clear current selection if any
                 url_entry = event.widget
                 url_entry.delete(0, END)
@@ -1693,6 +1713,15 @@ class BandcampDownloaderGUI:
             # Get clipboard content
             clipboard_text = self.root.clipboard_get()
             if clipboard_text:
+                # Save to history
+                if clipboard_text.strip():
+                    if self.paste_history_index < len(self.paste_history) - 1:
+                        self.paste_history = self.paste_history[:self.paste_history_index + 1]
+                    self.paste_history.append(clipboard_text)
+                    self.paste_history_index = len(self.paste_history) - 1
+                    if len(self.paste_history) > 20:
+                        self.paste_history = self.paste_history[-20:]
+                        self.paste_history_index = len(self.paste_history) - 1
                 # Get the text widget - from event or use stored reference
                 url_text = event.widget if event and hasattr(event, 'widget') else self.url_text_widget
                 if url_text:
@@ -1706,6 +1735,22 @@ class BandcampDownloaderGUI:
     
     def _handle_entry_paste(self, event):
         """Handle paste in Entry widget - check for newlines and expand if needed."""
+        # Save clipboard content to history before pasting
+        try:
+            clipboard_text = self.root.clipboard_get()
+            if clipboard_text and clipboard_text.strip():
+                # Add to history (remove any future history if we're not at the end)
+                if self.paste_history_index < len(self.paste_history) - 1:
+                    self.paste_history = self.paste_history[:self.paste_history_index + 1]
+                # Add new paste to history
+                self.paste_history.append(clipboard_text)
+                self.paste_history_index = len(self.paste_history) - 1
+                # Limit history size to 20 items
+                if len(self.paste_history) > 20:
+                    self.paste_history = self.paste_history[-20:]
+                    self.paste_history_index = len(self.paste_history) - 1
+        except Exception:
+            pass
         # Let the paste happen first, then check
         self.root.after(10, self._check_entry_paste)
     
@@ -1751,10 +1796,122 @@ class BandcampDownloaderGUI:
     
     def _handle_text_paste(self, event):
         """Handle paste in ScrolledText widget."""
+        # Save clipboard content to history before pasting
+        try:
+            clipboard_text = self.root.clipboard_get()
+            if clipboard_text and clipboard_text.strip():
+                # Add to history (remove any future history if we're not at the end)
+                if self.paste_history_index < len(self.paste_history) - 1:
+                    self.paste_history = self.paste_history[:self.paste_history_index + 1]
+                # Add new paste to history
+                self.paste_history.append(clipboard_text)
+                self.paste_history_index = len(self.paste_history) - 1
+                # Limit history size to 20 items
+                if len(self.paste_history) > 20:
+                    self.paste_history = self.paste_history[-20:]
+                    self.paste_history_index = len(self.paste_history) - 1
+        except Exception:
+            pass
         # Hide placeholder immediately when pasting
         self._hide_text_placeholder()
         # Let the paste happen first, then check
         self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+    
+    def _handle_entry_undo(self, event):
+        """Handle undo (Ctrl+Z) in Entry widget - cycle to previous paste."""
+        # Check if Shift is pressed (Ctrl+Shift+Z = redo)
+        if event.state & 0x1:  # Shift key is pressed (state bit 0)
+            return self._handle_entry_redo(event)
+        
+        if not self.paste_history:
+            return None  # No history, allow default behavior
+        
+        # Move back in history
+        if self.paste_history_index > 0:
+            self.paste_history_index -= 1
+            previous_paste = self.paste_history[self.paste_history_index]
+            
+            # Replace current content with previous paste
+            self.url_var.set(previous_paste)
+            
+            # Check if paste contains newlines - if so, expand to multi-line
+            if '\n' in previous_paste:
+                self._expand_to_multiline(previous_paste)
+            else:
+                # Trigger URL check
+                self.root.after(10, self._check_url)
+                self._update_url_count_and_button()
+                self._update_url_clear_button()
+        
+        return "break"  # Prevent default undo behavior
+    
+    def _handle_entry_redo(self, event):
+        """Handle redo (Ctrl+Shift+Z) in Entry widget - cycle to next paste."""
+        if not self.paste_history:
+            return None  # No history, allow default behavior
+        
+        # Move forward in history
+        if self.paste_history_index < len(self.paste_history) - 1:
+            self.paste_history_index += 1
+            next_paste = self.paste_history[self.paste_history_index]
+            
+            # Replace current content with next paste
+            self.url_var.set(next_paste)
+            
+            # Check if paste contains newlines - if so, expand to multi-line
+            if '\n' in next_paste:
+                self._expand_to_multiline(next_paste)
+            else:
+                # Trigger URL check
+                self.root.after(10, self._check_url)
+                self._update_url_count_and_button()
+                self._update_url_clear_button()
+        
+        return "break"  # Prevent default redo behavior
+    
+    def _handle_text_undo(self, event):
+        """Handle undo (Ctrl+Z) in ScrolledText widget - cycle to previous paste."""
+        # Check if Shift is pressed (Ctrl+Shift+Z = redo)
+        if event.state & 0x1:  # Shift key is pressed (state bit 0)
+            return self._handle_text_redo(event)
+        
+        if not self.paste_history or not self.url_text_widget:
+            return None  # No history or widget, allow default behavior
+        
+        # Move back in history
+        if self.paste_history_index > 0:
+            self.paste_history_index -= 1
+            previous_paste = self.paste_history[self.paste_history_index]
+            
+            # Replace current content with previous paste
+            self.url_text_widget.delete(1.0, END)
+            self.url_text_widget.insert(1.0, previous_paste)
+            self._hide_text_placeholder()
+            
+            # Trigger URL check and update count
+            self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+        
+        return "break"  # Prevent default undo behavior
+    
+    def _handle_text_redo(self, event):
+        """Handle redo (Ctrl+Shift+Z) in ScrolledText widget - cycle to next paste."""
+        if not self.paste_history or not self.url_text_widget:
+            return None  # No history or widget, allow default behavior
+        
+        # Move forward in history
+        if self.paste_history_index < len(self.paste_history) - 1:
+            self.paste_history_index += 1
+            next_paste = self.paste_history[self.paste_history_index]
+            
+            # Replace current content with next paste
+            self.url_text_widget.delete(1.0, END)
+            self.url_text_widget.insert(1.0, next_paste)
+            self._hide_text_placeholder()
+            
+            # Trigger URL check and update count
+            self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+        
+        return "break"  # Prevent default redo behavior
     
     def _on_text_key_release(self):
         """Handle key release in ScrolledText - update URL count dynamically and update placeholder visibility."""
@@ -2276,6 +2433,11 @@ class BandcampDownloaderGUI:
         if "bandcamp.com" not in url.lower() and not url.startswith(("http://", "https://")):
             return
         
+        # Reset artwork flags when URL changes to allow new artwork to be fetched
+        # This ensures artwork syncs properly when switching between URLs
+        self.current_thumbnail_url = None
+        self.album_art_fetching = False
+        
         # Fetch metadata in background thread (only for first URL for preview)
         threading.Thread(target=self.fetch_album_metadata, args=(url,), daemon=True).start()
     
@@ -2289,8 +2451,17 @@ class BandcampDownloaderGUI:
                 from urllib.parse import urlparse
                 
                 # Fetch the HTML page directly (fast, single request)
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
+                # Use better headers for restricted networks
+                user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                headers = {
+                    'User-Agent': user_agent,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Connection': 'keep-alive',
+                    'Referer': 'https://bandcamp.com/',
+                }
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as response:
                     html = response.read().decode('utf-8', errors='ignore')
                 
                 artist = None
@@ -2371,12 +2542,16 @@ class BandcampDownloaderGUI:
                     return
                 
                 # Use yt-dlp to extract info without downloading (fast mode - no track processing)
+                # Enhanced options for restricted networks
                 ydl_opts = {
                     "quiet": True,
                     "no_warnings": True,
                     "extract_flat": True,
-                    "socket_timeout": 10,
-                    "retries": 2,
+                    "socket_timeout": 30,
+                    "retries": 5,
+                    "fragment_retries": 5,
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "referer": "https://bandcamp.com/",
                 }
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2472,7 +2647,9 @@ class BandcampDownloaderGUI:
                         self.root.after(0, self.update_preview)
                     
                     # Fetch and display album art if we found a thumbnail
-                    if thumbnail_url and thumbnail_url != self.current_thumbnail_url and not self.album_art_fetching:
+                    # Reset current_thumbnail_url check to allow fetching even if URL is same (new album might have same art)
+                    # The flag reset in _check_url ensures we fetch new artwork when URL changes
+                    if thumbnail_url and not self.album_art_fetching:
                         self.current_thumbnail_url = thumbnail_url
                         self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
                     
@@ -2507,12 +2684,16 @@ class BandcampDownloaderGUI:
                                     track_url = first_entry.get("url")
                                     if track_url:
                                         # Quick format detection extraction
+                                        # Enhanced options for restricted networks
                                         format_ydl_opts = {
                                             "quiet": True,
                                             "no_warnings": True,
                                             "extract_flat": False,
-                                            "socket_timeout": 5,
-                                            "retries": 1,
+                                            "socket_timeout": 30,
+                                            "retries": 5,
+                                            "fragment_retries": 5,
+                                            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                            "referer": "https://bandcamp.com/",
                                         }
                                         with yt_dlp.YoutubeDL(format_ydl_opts) as format_ydl:
                                             track_info = format_ydl.extract_info(track_url, download=False)
@@ -2576,8 +2757,17 @@ class BandcampDownloaderGUI:
                 import re
                 
                 # Fetch the HTML page directly (fast, single request)
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response:
+                # Use better headers for restricted networks
+                user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                headers = {
+                    'User-Agent': user_agent,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Connection': 'keep-alive',
+                    'Referer': 'https://bandcamp.com/',
+                }
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as response:
                     html = response.read().decode('utf-8', errors='ignore')
                 
                 # Look for album art in various patterns Bandcamp uses
@@ -2647,12 +2837,16 @@ class BandcampDownloaderGUI:
                     return
                 
                 # Quick extraction without extract_flat to get thumbnail
+                # Enhanced options for restricted networks
                 ydl_opts = {
                     "quiet": True,
                     "no_warnings": True,
                     "extract_flat": False,  # Need full extraction to get thumbnail
-                    "socket_timeout": 10,
-                    "retries": 1,  # Just one retry for this secondary attempt
+                    "socket_timeout": 30,
+                    "retries": 5,
+                    "fragment_retries": 5,
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "referer": "https://bandcamp.com/",
                 }
                 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2693,6 +2887,40 @@ class BandcampDownloaderGUI:
         
         threading.Thread(target=fetch, daemon=True).start()
     
+    def _fetch_with_retry(self, url, max_retries=3, timeout=15):
+        """Fetch URL with retry logic and better headers for restricted networks."""
+        import urllib.request
+        import time
+        
+        # Use a more complete user agent string (mimics a real browser)
+        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        headers = {
+            'User-Agent': user_agent,
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'identity',  # Don't request compression
+            'Connection': 'keep-alive',
+            'Referer': 'https://bandcamp.com/',
+        }
+        
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    return response.read()
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    # Exponential backoff: wait 1s, 2s, 4s
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                else:
+                    # Last attempt failed
+                    raise last_error
+        
+        raise last_error
+    
     def fetch_and_display_album_art(self, thumbnail_url):
         """Fetch and display album art asynchronously (second phase - doesn't block preview)."""
         if not thumbnail_url:
@@ -2707,13 +2935,11 @@ class BandcampDownloaderGUI:
         
         def download_and_display():
             try:
-                import urllib.request
                 import io
                 from PIL import Image, ImageTk
                 
-                # Download the image
-                with urllib.request.urlopen(thumbnail_url, timeout=10) as response:
-                    image_data = response.read()
+                # Download the image with retry logic
+                image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
                 
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
@@ -2755,6 +2981,7 @@ class BandcampDownloaderGUI:
             except Exception as e:
                 # Failed to load image - clear and show placeholder
                 self.root.after(0, self.clear_album_art)
+                self.album_art_fetching = False
                 self.album_art_fetching = False
         
         # Download in background thread
@@ -3315,8 +3542,9 @@ class BandcampDownloaderGUI:
                 format_val = self.format_var.get()
                 base_format = self._extract_format(format_val)
                 skip_postprocessing = self.skip_postprocessing_var.get()
-                if skip_postprocessing:
-                    target_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
+                if skip_postprocessing or base_format == "original":
+                    # For skip_postprocessing or original format, check all possible audio formats
+                    target_exts = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
                 else:
                     target_exts = self.FORMAT_EXTENSIONS.get(base_format, [])
                 
@@ -3333,72 +3561,142 @@ class BandcampDownloaderGUI:
             if not files_to_process:
                 return
             
-            # Sort files by name to maintain order
-            files_to_process.sort(key=lambda x: x.name)
-            
-            # Process each file
+            # Group files by directory to handle mixed formats correctly
+            files_by_dir = {}
             for audio_file in files_to_process:
                 # Skip temporary files
                 if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
                     continue
                 
-                # Get track number from metadata if available
-                track_number = None
-                file_title = audio_file.stem  # filename without extension
-                track_title = file_title  # Will be updated if we find metadata
+                dir_path = audio_file.parent
+                if dir_path not in files_by_dir:
+                    files_by_dir[dir_path] = []
+                files_by_dir[dir_path].append(audio_file)
+            
+            # Process each directory separately
+            for dir_path, dir_files in files_by_dir.items():
+                # First, try to get track numbers from metadata for all files in this directory
+                files_with_track_numbers = []
+                files_without_track_numbers = []
                 
-                # Try to find track number from download_info
-                for title_key, info in self.download_info.items():
-                    # Match by comparing filename with track title
-                    if file_title.lower() in title_key or title_key in file_title.lower():
-                        track_number = info.get("track_number")
-                        track_title = info.get("title", file_title)
-                        break
-                
-                # If no track number found, try to extract from filename or use index
-                if track_number is None:
-                    # Try to extract number from filename
-                    match = re.search(r'\b(\d+)\b', file_title)
-                    if match:
-                        track_number = int(match.group(1))
+                for audio_file in dir_files:
+                    file_title = audio_file.stem
+                    track_number = None
+                    track_title = file_title
+                    
+                    # Try to find track number from download_info
+                    for title_key, info in self.download_info.items():
+                        # Match by comparing filename with track title
+                        if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
+                            track_number = info.get("track_number")
+                            track_title = info.get("title", file_title)
+                            break
+                    
+                    # If not found in download_info, try to extract from metadata in file
+                    if track_number is None:
+                        try:
+                            # Use ffprobe to get track number from file metadata
+                            ffprobe_path = self.ffmpeg_path.parent / "ffprobe.exe"
+                            if not ffprobe_path.exists():
+                                ffprobe_path = self.script_dir / "ffprobe.exe"
+                            
+                            if ffprobe_path.exists():
+                                cmd = [
+                                    str(ffprobe_path),
+                                    "-v", "quiet",
+                                    "-print_format", "json",
+                                    "-show_format",
+                                    str(audio_file)
+                                ]
+                                
+                                result = subprocess.run(
+                                    cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                                )
+                                
+                                if result.returncode == 0:
+                                    import json
+                                    data = json.loads(result.stdout.decode('utf-8', errors='ignore'))
+                                    tags = data.get("format", {}).get("tags", {})
+                                    
+                                    # Try to get track number
+                                    track_str = tags.get("track") or tags.get("TRACK") or tags.get("tracknumber") or tags.get("TRACKNUMBER")
+                                    if track_str:
+                                        # Handle formats like "1/10" or just "1"
+                                        track_match = re.search(r'(\d+)', str(track_str))
+                                        if track_match:
+                                            track_number = int(track_match.group(1))
+                                    
+                                    # Also get title if available
+                                    if not track_title or track_title == file_title:
+                                        track_title = tags.get("title") or tags.get("TITLE") or track_title
+                        except Exception:
+                            pass
+                    
+                    # If still no track number, try to extract from filename
+                    if track_number is None:
+                        match = re.search(r'\b(\d+)\b', file_title)
+                        if match:
+                            track_number = int(match.group(1))
+                    
+                    if track_number is not None:
+                        files_with_track_numbers.append((audio_file, track_number, track_title))
                     else:
-                        # Use file index as fallback (within the files we're processing)
-                        track_number = files_to_process.index(audio_file) + 1
+                        files_without_track_numbers.append((audio_file, None, track_title))
                 
-                # Use sanitized track title for the new filename
-                track_title = self.sanitize_filename(track_title)
+                # Sort files with track numbers by track number
+                files_with_track_numbers.sort(key=lambda x: x[1])
                 
-                # Format track number prefix based on style
-                if numbering_style == "01. Track":
-                    prefix = f"{track_number:02d}. "
-                elif numbering_style == "1. Track":
-                    prefix = f"{track_number}. "
-                elif numbering_style == "01 - Track":
-                    prefix = f"{track_number:02d} - "
-                elif numbering_style == "1 - Track":
-                    prefix = f"{track_number} - "
-                else:
-                    continue  # Unknown style
+                # Sort files without track numbers by filename
+                files_without_track_numbers.sort(key=lambda x: x[0].name)
                 
-                # Get original filename parts
-                parent_dir = audio_file.parent
-                extension = audio_file.suffix
+                # Combine: files with track numbers first (sorted by track number), then files without (sorted by name)
+                all_dir_files = files_with_track_numbers + files_without_track_numbers
                 
-                # Check if filename already has numbering
-                # Check if already starts with number
-                if re.match(r'^\d+[.\-]\s*', file_title):
-                    continue  # Already numbered, skip
-                new_name = prefix + track_title + extension
-                
-                new_path = parent_dir / new_name
-                
-                # Rename file if new name is different
-                if new_path != audio_file and not new_path.exists():
-                    try:
-                        audio_file.rename(new_path)
-                        self.root.after(0, lambda old=audio_file.name, new=new_name: self.log(f"Renamed: {old} → {new_name}"))
-                    except Exception as e:
-                        self.root.after(0, lambda name=audio_file.name: self.log(f"⚠ Could not rename: {name}"))
+                # Process each file in this directory
+                for idx, (audio_file, track_number, track_title) in enumerate(all_dir_files):
+                    # If no track number was found, use index within this directory
+                    if track_number is None:
+                        track_number = idx + 1
+                    
+                    file_title = audio_file.stem
+                    
+                    # Use sanitized track title for the new filename
+                    sanitized_title = self.sanitize_filename(track_title)
+                    
+                    # Format track number prefix based on style
+                    if numbering_style == "01. Track":
+                        prefix = f"{track_number:02d}. "
+                    elif numbering_style == "1. Track":
+                        prefix = f"{track_number}. "
+                    elif numbering_style == "01 - Track":
+                        prefix = f"{track_number:02d} - "
+                    elif numbering_style == "1 - Track":
+                        prefix = f"{track_number} - "
+                    else:
+                        continue  # Unknown style
+                    
+                    # Get original filename parts
+                    parent_dir = audio_file.parent
+                    extension = audio_file.suffix
+                    
+                    # Check if filename already has numbering
+                    # Check if already starts with number
+                    if re.match(r'^\d+[.\-]\s*', file_title):
+                        continue  # Already numbered, skip
+                    
+                    new_name = prefix + sanitized_title + extension
+                    new_path = parent_dir / new_name
+                    
+                    # Rename file if new name is different
+                    if new_path != audio_file and not new_path.exists():
+                        try:
+                            audio_file.rename(new_path)
+                            self.root.after(0, lambda old=audio_file.name, new=new_name: self.log(f"Renamed: {old} → {new_name}"))
+                        except Exception as e:
+                            self.root.after(0, lambda name=audio_file.name: self.log(f"⚠ Could not rename: {name}"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Error applying track numbering: {str(e)}"))
     
@@ -3786,17 +4084,16 @@ class BandcampDownloaderGUI:
                     pass
             return
         elif base_format == "original":
-            # For Original format, try to embed artwork for supported formats (M4A, MP4, AAC)
+            # For Original format, try to embed artwork for all supported formats (MP3, M4A, MP4, AAC, FLAC)
             download_cover_art = self.download_cover_art_var.get()
             
-            # Try to embed artwork for M4A/MP4/AAC files
             try:
                 base_path = Path(download_path)
                 if base_path.exists():
-                    # Find M4A, MP4, and AAC files
-                    m4a_extensions = [".m4a", ".mp4", ".aac"]
+                    # Find all audio files (MP3, M4A, MP4, AAC, FLAC, OGG, WAV)
+                    audio_extensions = [".mp3", ".m4a", ".mp4", ".aac", ".flac", ".ogg", ".oga", ".wav"]
                     audio_files = []
-                    for ext in m4a_extensions:
+                    for ext in audio_extensions:
                         audio_files.extend(base_path.rglob(f"*{ext}"))
                     
                     if audio_files:
@@ -3805,29 +4102,84 @@ class BandcampDownloaderGUI:
                         processed_dirs = set()
                         used_thumbnails = set()
                         
+                        # Group files by directory for better organization
+                        files_by_dir = {}
                         for audio_file in audio_files:
                             # Skip temporary files
                             name_lower = audio_file.name.lower()
                             if audio_file.name.startswith('.') or 'tmp' in name_lower:
                                 continue
                             
-                            processed_dirs.add(audio_file.parent)
+                            dir_path = audio_file.parent
+                            if dir_path not in files_by_dir:
+                                files_by_dir[dir_path] = []
+                            files_by_dir[dir_path].append(audio_file)
+                            processed_dirs.add(dir_path)
+                        
+                        # Process each directory
+                        for dir_path, dir_files in files_by_dir.items():
+                            # Find thumbnail for this directory
+                            thumbnail_file = None
+                            for audio_file in dir_files:
+                                thumb = self.find_thumbnail_file(str(audio_file))
+                                if thumb:
+                                    thumbnail_file = thumb
+                                    break
                             
-                            # Find thumbnail
-                            thumbnail_file = self.find_thumbnail_file(str(audio_file))
-                            audio_file_str = str(audio_file)
-                            audio_file_name = audio_file.name
+                            if not thumbnail_file:
+                                continue
                             
-                            if thumbnail_file:
-                                used_thumbnails.add(Path(thumbnail_file))
+                            used_thumbnails.add(Path(thumbnail_file))
+                            
+                            # Process each file in this directory
+                            for audio_file in dir_files:
+                                audio_file_str = str(audio_file)
+                                audio_file_name = audio_file.name
+                                audio_ext = audio_file.suffix.lower()
+                                
                                 self.root.after(0, lambda name=audio_file_name: self.log(f"Processing: {name}"))
-                                success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                                
+                                # Handle different formats
+                                success = False
+                                if audio_ext in [".m4a", ".mp4", ".aac"]:
+                                    # M4A/MP4/AAC: use embed_cover_art_ffmpeg
+                                    success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                                elif audio_ext == ".mp3":
+                                    # MP3: use re_embed_mp3_metadata
+                                    # Get metadata from download_info if available
+                                    metadata = {}
+                                    file_title = audio_file.stem
+                                    for title_key, info in self.download_info.items():
+                                        if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
+                                            metadata = info.copy()
+                                            break
+                                    
+                                    # If no metadata found, try to get from file
+                                    if not metadata:
+                                        try:
+                                            artist, album = self._get_metadata_from_directory(dir_path)
+                                            if artist or album:
+                                                metadata = {
+                                                    "artist": artist,
+                                                    "album": album,
+                                                    "title": file_title
+                                                }
+                                        except Exception:
+                                            pass
+                                    
+                                    if metadata:
+                                        success = self.re_embed_mp3_metadata(audio_file_str, metadata, thumbnail_file)
+                                    else:
+                                        # Try without metadata, just artwork
+                                        success = self.re_embed_mp3_metadata(audio_file_str, {"title": file_title}, thumbnail_file)
+                                elif audio_ext in [".flac", ".ogg", ".oga"]:
+                                    # FLAC/OGG: use embed_cover_art_ffmpeg
+                                    success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                                
                                 if success:
                                     self.root.after(0, lambda name=audio_file_name: self.log(f"✓ Embedded cover art: {name}"))
                                 else:
                                     self.root.after(0, lambda name=audio_file_name: self.log(f"⚠ Could not embed cover art: {name}"))
-                            else:
-                                self.root.after(0, lambda name=audio_file_name: self.log(f"⚠ No thumbnail found for: {name}"))
                         
                         # Handle cover art files after embedding
                         if download_cover_art:
@@ -3845,21 +4197,107 @@ class BandcampDownloaderGUI:
             except Exception as e:
                 self.root.after(0, lambda err=str(e): self.log(f"⚠ Error embedding cover art: {err}"))
             
-            # Also handle other formats that might have been downloaded (MP3, FLAC, etc.)
-            # These are handled by yt-dlp's EmbedThumbnail or the regular flow
             return
-        elif base_format in ["mp3", "ogg", "wav"]:
-            # For MP3, OGG, and WAV - handle cover art based on download_cover_art setting
+        elif base_format == "mp3":
+            # For MP3 format, yt-dlp's EmbedThumbnail should handle it, but add fallback for files that don't get artwork
             download_cover_art = self.download_cover_art_var.get()
             
-            if download_cover_art or base_format in ["ogg", "wav"]:
-                # If download cover art is enabled, or for OGG/WAV (which can't embed), deduplicate cover art files
+            # Try to embed artwork for MP3 files that might not have gotten it from yt-dlp
+            try:
+                base_path = Path(download_path)
+                if base_path.exists():
+                    # Find all MP3 files
+                    mp3_files = list(base_path.rglob("*.mp3"))
+                    
+                    if mp3_files:
+                        # Group files by directory
+                        files_by_dir = {}
+                        for mp3_file in mp3_files:
+                            # Skip temporary files
+                            name_lower = mp3_file.name.lower()
+                            if mp3_file.name.startswith('.') or 'tmp' in name_lower:
+                                continue
+                            
+                            dir_path = mp3_file.parent
+                            if dir_path not in files_by_dir:
+                                files_by_dir[dir_path] = []
+                            files_by_dir[dir_path].append(mp3_file)
+                        
+                        # Process each directory
+                        processed_count = 0
+                        for dir_path, dir_files in files_by_dir.items():
+                            # Find thumbnail for this directory
+                            thumbnail_file = None
+                            for mp3_file in dir_files:
+                                thumb = self.find_thumbnail_file(str(mp3_file))
+                                if thumb:
+                                    thumbnail_file = thumb
+                                    break
+                            
+                            if not thumbnail_file:
+                                continue
+                            
+                            # Check each MP3 file and embed artwork if needed
+                            for mp3_file in dir_files:
+                                mp3_file_str = str(mp3_file)
+                                mp3_file_name = mp3_file.name
+                                file_title = mp3_file.stem
+                                
+                                # Get metadata from download_info if available
+                                metadata = {}
+                                for title_key, info in self.download_info.items():
+                                    if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
+                                        metadata = info.copy()
+                                        break
+                                
+                                # If no metadata found, try to get from file
+                                if not metadata:
+                                    try:
+                                        artist, album = self._get_metadata_from_directory(dir_path)
+                                        if artist or album:
+                                            metadata = {
+                                                "artist": artist,
+                                                "album": album,
+                                                "title": file_title
+                                            }
+                                    except Exception:
+                                        pass
+                                
+                                # Try to embed artwork (will work for all MP3 types)
+                                if metadata:
+                                    success = self.re_embed_mp3_metadata(mp3_file_str, metadata, thumbnail_file)
+                                else:
+                                    # Try without metadata, just artwork
+                                    success = self.re_embed_mp3_metadata(mp3_file_str, {"title": file_title}, thumbnail_file)
+                                
+                                if success:
+                                    processed_count += 1
+                                    self.root.after(0, lambda name=mp3_file_name: self.log(f"✓ Embedded cover art: {name}"))
+                        
+                        if processed_count > 0:
+                            self.root.after(0, lambda count=processed_count: self.log(f"Embedded cover art for {count} MP3 file(s)"))
+                        
+                        # Handle cover art files
+                        if download_cover_art:
+                            # Deduplicate cover art files
+                            processed_dirs = set(files_by_dir.keys())
+                            if processed_dirs:
+                                self.deduplicate_cover_art(processed_dirs)
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self.log(f"⚠ Error embedding MP3 cover art: {err}"))
+            
+            return
+        elif base_format in ["ogg", "wav"]:
+            # For OGG and WAV - handle cover art based on download_cover_art setting
+            download_cover_art = self.download_cover_art_var.get()
+            
+            if download_cover_art:
+                # If download cover art is enabled, deduplicate cover art files
                 try:
                     base_path = Path(download_path)
                     if base_path.exists():
                         # Find all directories with audio files
                         extensions = {
-                            "mp3": [".mp3"],
                             "ogg": [".ogg", ".oga"],
                             "wav": [".wav"],
                         }
@@ -4401,6 +4839,7 @@ class BandcampDownloaderGUI:
                 return None  # None means accept the entry
             
             # yt-dlp options
+            # Enhanced options for restricted networks (better user agent, retries, timeouts)
             ydl_opts = {
                 "format": "bestaudio/best",
                 "outtmpl": self.get_outtmpl(),
@@ -4414,6 +4853,14 @@ class BandcampDownloaderGUI:
                 "noprogress": False,  # Keep progress enabled so hooks are called frequently
                 "progress_hooks": [self.progress_hook],
                 "match_filter": match_filter,  # Reject entries when cancelling
+                # Enhanced network options for restricted networks
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "referer": "https://bandcamp.com/",
+                "socket_timeout": 30,  # Increased timeout
+                "retries": 5,  # More retries for unstable connections
+                "fragment_retries": 5,  # Retry fragments
+                "file_access_retries": 3,  # Retry file access
+                "http_chunk_size": 10485760,  # 10MB chunks (may help with some restrictions)
             }
             
             # Store info for post-processing (maps filenames to metadata)
@@ -4666,6 +5113,7 @@ class BandcampDownloaderGUI:
                 return None  # None means accept the entry
             
             # yt-dlp options
+            # Enhanced options for restricted networks (better user agent, retries, timeouts)
             ydl_opts = {
                 "format": "bestaudio/best",
                 "outtmpl": self.get_outtmpl(),
@@ -4679,6 +5127,14 @@ class BandcampDownloaderGUI:
                 "noprogress": False,  # Keep progress enabled so hooks are called frequently
                 "progress_hooks": [self.progress_hook],
                 "match_filter": match_filter,  # Reject entries when cancelling
+                # Enhanced network options for restricted networks
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "referer": "https://bandcamp.com/",
+                "socket_timeout": 30,  # Increased timeout
+                "retries": 5,  # More retries for unstable connections
+                "fragment_retries": 5,  # Retry fragments
+                "file_access_retries": 3,  # Retry file access
+                "http_chunk_size": 10485760,  # 10MB chunks (may help with some restrictions)
             }
             
             # Store info for post-processing (maps filenames to metadata)
