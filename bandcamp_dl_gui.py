@@ -206,6 +206,9 @@ class BandcampDownloaderGUI:
         self.content_history_index = -1  # Current position in history (-1 = most recent)
         self.content_save_timer = None  # Timer for debounced content state saving
         
+        # Debug mode flag (default: False)
+        self.debug_mode = False
+        
         # Store metadata for preview
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
         self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
@@ -1336,14 +1339,33 @@ class BandcampDownloaderGUI:
         self.log_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
         self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=6, padx=0)
         
-        # Label for the frame
+        # Label for the frame and debug toggle on same row
         log_label = Label(self.log_frame, text="Status", bg='#1E1E1E', fg='#D4D4D4', font=("Segoe UI", 9))
         log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(6, 2))
         
-        # Inner frame for content
-        log_content = Frame(self.log_frame, bg='#1E1E1E')
-        log_content.grid(row=1, column=0, sticky=(W, E, N, S), padx=6, pady=(0, 6))
+        # Debug toggle checkbox (right-aligned on same row as Status label)
+        self.debug_mode_var = BooleanVar(value=False)
+        debug_toggle = Checkbutton(
+            self.log_frame,
+            text="Debug",
+            variable=self.debug_mode_var,
+            bg='#1E1E1E',
+            fg='#D4D4D4',
+            selectcolor='#252526',
+            activebackground='#1E1E1E',
+            activeforeground='#D4D4D4',
+            font=("Segoe UI", 8),
+            command=self._toggle_debug_mode
+        )
+        debug_toggle.grid(row=0, column=1, sticky=E, padx=6, pady=(6, 2))
+        
+        # Configure column weights so debug toggle stays on the right
         self.log_frame.columnconfigure(0, weight=1)
+        self.log_frame.columnconfigure(1, weight=0)
+        
+        # Inner frame for content (spans both columns to stay full width)
+        log_content = Frame(self.log_frame, bg='#1E1E1E')
+        log_content.grid(row=1, column=0, columnspan=2, sticky=(W, E, N, S), padx=6, pady=(0, 6))
         self.log_frame.rowconfigure(1, weight=1)
         log_content.columnconfigure(0, weight=1)
         log_content.rowconfigure(0, weight=1)
@@ -1712,6 +1734,8 @@ class BandcampDownloaderGUI:
                 # Check if paste contains newlines - if so, expand to multi-line
                 if '\n' in clipboard_text:
                     self._expand_to_multiline(clipboard_text)
+                    # After expansion, save state and trigger URL check (similar to single-line paste)
+                    self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
                 else:
                     # Save new state after paste, then trigger URL check
                     self.root.after(10, lambda: (self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_url_clear_button()))
@@ -1773,6 +1797,8 @@ class BandcampDownloaderGUI:
             if '\n' in content:
                 # Has newlines - expand to multi-line
                 self._expand_to_multiline(content)
+                # After expansion, trigger URL check (similar to right-click paste)
+                self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
             else:
                 # No newlines - just update count
                 self._update_url_count_and_button()
@@ -2197,15 +2223,31 @@ class BandcampDownloaderGUI:
         # Keep height at minimum (2 lines) - content is scrollable
         if self.url_text_widget:
             self.url_text_widget.config(height=2)
+            # Restore scroll position if we saved it
+            if hasattr(self, '_saved_text_scroll_position'):
+                try:
+                    # Restore to saved position
+                    self.url_text_widget.see(self._saved_text_scroll_position)
+                    delattr(self, '_saved_text_scroll_position')
+                except Exception:
+                    pass
     
     def _on_text_focus_out(self):
         """Handle focus out on ScrolledText - collapse height and update placeholder visibility."""
         if self.url_text_widget:
+            # Save current scroll position before collapsing
+            try:
+                # Get the first visible line (top of viewport)
+                top_index = self.url_text_widget.index("@0,0")
+                self._saved_text_scroll_position = top_index
+            except Exception:
+                pass
+            
             # Collapse height to 2 lines (hide extra lines but keep content)
             self.url_text_widget.config(height=2)
             
-            # Scroll to top to show first lines
-            self.url_text_widget.see(1.0)
+            # Don't scroll to top - maintain position when focus returns
+            # The scroll position will be restored when focus returns
             
             # Update placeholder visibility based on content
             self._update_text_placeholder_visibility()
@@ -2922,8 +2964,27 @@ class BandcampDownloaderGUI:
                                                     detected_format = "wav"
                                                 elif ext == "mp3" or acodec == "mp3":
                                                     detected_format = "mp3"
-                                except Exception:
-                                    pass  # Silently fail format detection
+                                except Exception as e:
+                                    # Log format detection failure for debugging (but don't show to user)
+                                    pass  # Silently fail format detection - will try again during download
+                            
+                            # Also try to get format from the album-level info if available
+                            if not detected_format and info:
+                                # Check if format info is available at album level
+                                ext = info.get("ext") or ""
+                                acodec = info.get("acodec") or ""
+                                container = info.get("container") or ""
+                                
+                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                    detected_format = "m4a"
+                                elif ext == "flac" or acodec == "flac":
+                                    detected_format = "flac"
+                                elif ext == "ogg" or acodec == "vorbis":
+                                    detected_format = "ogg"
+                                elif ext == "wav" or acodec == "pcm":
+                                    detected_format = "wav"
+                                elif ext == "mp3" or acodec == "mp3":
+                                    detected_format = "mp3"
                     
                     # Update album_info with detected format
                     if detected_format:
@@ -2933,6 +2994,67 @@ class BandcampDownloaderGUI:
                         # If format is not MP3, suggest Original format
                         if detected_format != "mp3":
                             self.root.after(0, lambda fmt=detected_format: self._suggest_format_for_detected(fmt))
+                    else:
+                        # If format still not detected, try a full extraction of the album URL as fallback
+                        # This is more reliable than extracting individual tracks
+                        try:
+                            full_extract_opts = {
+                                "quiet": True,
+                                "no_warnings": True,
+                                "extract_flat": False,  # Full extraction
+                                "socket_timeout": 30,
+                                "retries": 3,
+                                "fragment_retries": 3,
+                                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                "referer": "https://bandcamp.com/",
+                            }
+                            with yt_dlp.YoutubeDL(full_extract_opts) as full_ydl:
+                                full_info = full_ydl.extract_info(url, download=False)
+                                if full_info:
+                                    # Try to get format from first entry
+                                    if full_info.get("entries"):
+                                        entries = [e for e in full_info.get("entries", []) if e]
+                                        if entries:
+                                            first_entry = entries[0]
+                                            ext = first_entry.get("ext") or ""
+                                            acodec = first_entry.get("acodec") or ""
+                                            container = first_entry.get("container") or ""
+                                            
+                                            # Determine format
+                                            if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                                detected_format = "m4a"
+                                            elif ext == "flac" or acodec == "flac":
+                                                detected_format = "flac"
+                                            elif ext == "ogg" or acodec == "vorbis":
+                                                detected_format = "ogg"
+                                            elif ext == "wav" or acodec == "pcm":
+                                                detected_format = "wav"
+                                            elif ext == "mp3" or acodec == "mp3":
+                                                detected_format = "mp3"
+                                    
+                                    # If still not found, try album-level
+                                    if not detected_format:
+                                        ext = full_info.get("ext") or ""
+                                        acodec = full_info.get("acodec") or ""
+                                        container = full_info.get("container") or ""
+                                        
+                                        if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                            detected_format = "m4a"
+                                        elif ext == "flac" or acodec == "flac":
+                                            detected_format = "flac"
+                                        elif ext == "ogg" or acodec == "vorbis":
+                                            detected_format = "ogg"
+                                        elif ext == "wav" or acodec == "pcm":
+                                            detected_format = "wav"
+                                        elif ext == "mp3" or acodec == "mp3":
+                                            detected_format = "mp3"
+                                    
+                                    # Update if format was detected
+                                    if detected_format:
+                                        self.album_info["detected_format"] = detected_format
+                                        self.root.after(0, self.update_preview)
+                        except Exception:
+                            pass  # Silently fail - format detection is optional
             except Exception:
                 pass  # Silently fail - HTML extraction is primary method
         
@@ -3091,6 +3213,53 @@ class BandcampDownloaderGUI:
                         if thumbnail_url and not self.album_art_fetching:
                             self.current_thumbnail_url = thumbnail_url
                             self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
+                        
+                        # Also detect format from this full extraction (since we have full info here)
+                        # This is a good fallback if format wasn't detected earlier
+                        if not self.album_info.get("detected_format"):
+                            detected_format = None
+                            # Try to get format from first entry
+                            if info.get("entries"):
+                                entries = [e for e in info.get("entries", []) if e]
+                                if entries:
+                                    first_entry = entries[0]
+                                    ext = first_entry.get("ext") or ""
+                                    acodec = first_entry.get("acodec") or ""
+                                    container = first_entry.get("container") or ""
+                                    
+                                    # Determine format
+                                    if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                        detected_format = "m4a"
+                                    elif ext == "flac" or acodec == "flac":
+                                        detected_format = "flac"
+                                    elif ext == "ogg" or acodec == "vorbis":
+                                        detected_format = "ogg"
+                                    elif ext == "wav" or acodec == "pcm":
+                                        detected_format = "wav"
+                                    elif ext == "mp3" or acodec == "mp3":
+                                        detected_format = "mp3"
+                            
+                            # If not found in entries, try album-level info
+                            if not detected_format:
+                                ext = info.get("ext") or ""
+                                acodec = info.get("acodec") or ""
+                                container = info.get("container") or ""
+                                
+                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                    detected_format = "m4a"
+                                elif ext == "flac" or acodec == "flac":
+                                    detected_format = "flac"
+                                elif ext == "ogg" or acodec == "vorbis":
+                                    detected_format = "ogg"
+                                elif ext == "wav" or acodec == "pcm":
+                                    detected_format = "wav"
+                                elif ext == "mp3" or acodec == "mp3":
+                                    detected_format = "mp3"
+                            
+                            # Update album_info with detected format and refresh preview
+                            if detected_format:
+                                self.album_info["detected_format"] = detected_format
+                                self.root.after(0, self.update_preview)
             except Exception:
                 pass  # Silently fail - thumbnail is optional
         
@@ -3409,7 +3578,7 @@ class BandcampDownloaderGUI:
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
         ext_map = {
-            "original": ".???",
+            "original": ".mp3",  # Default to .mp3 instead of .??? since most Bandcamp albums are MP3
             "mp3": ".mp3",
             "flac": ".flac",
             "ogg": ".ogg",
@@ -3417,7 +3586,7 @@ class BandcampDownloaderGUI:
         }
         ext = ext_map.get(base_format, ".mp3")
         
-        # If Original format is selected and we have a detected format, use that instead of .???
+        # If Original format is selected and we have a detected format, use that instead of default .mp3
         if base_format == "original" and self.album_info.get("detected_format"):
             detected = self.album_info.get("detected_format")
             detected_ext_map = {
@@ -3536,8 +3705,15 @@ class BandcampDownloaderGUI:
             self.save_path()
             self.update_preview()
     
+    def _toggle_debug_mode(self):
+        """Toggle debug mode on/off."""
+        self.debug_mode = self.debug_mode_var.get()
+    
     def log(self, message):
-        """Add message to log."""
+        """Add message to log. Filters DEBUG messages if debug mode is disabled."""
+        # If message starts with "DEBUG:" and debug mode is off, skip it
+        if message.startswith("DEBUG:") and not self.debug_mode:
+            return
         self.log_text.insert(END, message + "\n")
         self.log_text.see(END)
         self.root.update_idletasks()
@@ -5334,6 +5510,7 @@ class BandcampDownloaderGUI:
                             
                             # Log format/bitrate info from first track (to show what yt-dlp is downloading)
                             # Always show source info so users know what quality they're getting
+                            # Also detect format for Original Format mode preview
                             if entries:
                                 first_entry = entries[0]
                                 format_info = []
@@ -5349,6 +5526,27 @@ class BandcampDownloaderGUI:
                                     format_info.append(f"Extension: {first_entry.get('ext')}")
                                 if format_info:
                                     self.root.after(0, lambda info=" | ".join(format_info): self.log(f"Source: {info}"))
+                                
+                                # Detect format for Original Format mode preview
+                                ext = first_entry.get("ext") or ""
+                                acodec = first_entry.get("acodec") or ""
+                                container = first_entry.get("container") or ""
+                                detected_format = None
+                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                    detected_format = "m4a"
+                                elif ext == "flac" or acodec == "flac":
+                                    detected_format = "flac"
+                                elif ext == "ogg" or acodec == "vorbis":
+                                    detected_format = "ogg"
+                                elif ext == "wav" or acodec == "pcm":
+                                    detected_format = "wav"
+                                elif ext == "mp3" or acodec == "mp3":
+                                    detected_format = "mp3"
+                                
+                                # Update album_info with detected format and refresh preview
+                                if detected_format:
+                                    self.album_info["detected_format"] = detected_format
+                                    self.root.after(0, self.update_preview)
                             
                             for entry in entries:
                                 # Use title as key (will match by filename later)
@@ -5367,6 +5565,35 @@ class BandcampDownloaderGUI:
                 # Ensure album_info_stored is at least initialized (will try to get from files later)
                 if not self.album_info_stored or not self.album_info_stored.get("artist") or not self.album_info_stored.get("album"):
                     self.album_info_stored = self.album_info_stored or {}
+            
+            # Check if we found any tracks - if not, retry extraction once
+            if self.total_tracks == 0:
+                self.root.after(0, lambda: self.log("DEBUG: No tracks found in initial extraction, retrying..."))
+                time.sleep(1.5)  # Brief delay before retry
+                
+                # Retry extraction
+                try:
+                    retry_opts = ydl_opts.copy()
+                    retry_opts["extract_flat"] = False
+                    retry_opts["quiet"] = True
+                    retry_opts["no_warnings"] = True
+                    retry_opts["socket_timeout"] = 15  # Longer timeout for retry
+                    retry_opts["retries"] = 5  # More retries for retry
+                    
+                    with yt_dlp.YoutubeDL(retry_opts) as retry_ydl:
+                        retry_info = retry_ydl.extract_info(album_url, download=False)
+                        if retry_info and "entries" in retry_info:
+                            entries = [e for e in retry_info.get("entries", []) if e]
+                            if entries:
+                                self.total_tracks = len(entries)
+                                self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s) (retry)"))
+                except Exception as e:
+                    self.root.after(0, lambda err=str(e): self.log(f"DEBUG: Retry extraction also failed: {err}"))
+            
+            # If still no tracks found, skip download
+            if self.total_tracks == 0:
+                self.root.after(0, lambda: self.log("⚠ No tracks found for this album. Skipping download."))
+                return False
             
             # Get download path
             download_path = self.path_var.get().strip()
@@ -5773,6 +6000,11 @@ class BandcampDownloaderGUI:
                         # Fetch metadata and artwork (will update preview and artwork)
                         self.fetch_album_metadata(album_url)
                     
+                    # Add a small delay between albums in batch mode to avoid rate limiting
+                    # (except for the first album)
+                    if idx > 0:
+                        time.sleep(1.0)  # 1 second delay between albums
+                    
                     # Download this album
                     success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_metadata))
                     
@@ -5834,6 +6066,13 @@ class BandcampDownloaderGUI:
     
     def _do_album_download_and_processing(self, album_url, ydl_opts, format_val, base_format, skip_postprocessing, download_path):
         """Helper method to perform the actual download and processing of a single album."""
+        # Initialize downloaded_files set for this album (important for batch/discography mode)
+        if not hasattr(self, 'downloaded_files'):
+            self.downloaded_files = set()
+        else:
+            # Clear for this new album download
+            self.downloaded_files = set()
+        
         # Update status before starting download
         # Check if cancellation was requested - if so, show "Cancelling..." instead
         if self.is_cancelling:
@@ -5853,33 +6092,108 @@ class BandcampDownloaderGUI:
                 existing_files_before.update(base_path.rglob(f"*{ext}"))
         
         # Download (store instance for cancellation)
+        # Track if progress hooks were called (to detect silent failures)
+        self.progress_hooks_called = False
+        self.progress_hook_call_count = 0
+        
         ydl = yt_dlp.YoutubeDL(ydl_opts)
         self.ydl_instance = ydl
         
-        try:
-            ydl.download([album_url])
-        except KeyboardInterrupt:
-            # Check if this was our cancellation or user's Ctrl+C
-            if self.is_cancelling:
-                # Our cancellation - exit gracefully
-                self.ydl_instance = None
-                return False
-            # User's Ctrl+C - re-raise
-            raise
-        except yt_dlp.utils.DownloadError as e:
-            self.ydl_instance = None
-            self.root.after(0, lambda msg=str(e): self.log(f"Download error: {msg}"))
-            return False
-        finally:
-            # Clear instance after download
-            self.ydl_instance = None
+        # Log download start for debugging
+        self.root.after(0, lambda: self.log(f"DEBUG: Starting yt-dlp download for {album_url}"))
+        self.root.after(0, lambda: self.log(f"DEBUG: downloaded_files initialized: {hasattr(self, 'downloaded_files')}, count: {len(self.downloaded_files) if hasattr(self, 'downloaded_files') and self.downloaded_files else 0}"))
+        
+        # Retry download up to 2 times if no progress hooks are called
+        max_download_retries = 2
+        download_success = False
+        
+        for download_attempt in range(max_download_retries + 1):
+            # Reset progress hook tracking for this attempt
+            self.progress_hooks_called = False
+            self.progress_hook_call_count = 0
             
-            # Check if cancelled - if so, exit early
-            if self.is_cancelling:
+            if download_attempt > 0:
+                # Wait before retry (exponential backoff)
+                retry_delay = 2.0 * download_attempt
+                self.root.after(0, lambda delay=retry_delay, attempt=download_attempt: self.log(f"DEBUG: Retrying download after {delay}s delay (attempt {attempt + 1}/{max_download_retries + 1})"))
+                time.sleep(retry_delay)
+                # Create new yt-dlp instance for retry
+                ydl = yt_dlp.YoutubeDL(ydl_opts)
+                self.ydl_instance = ydl
+            
+            try:
+                ydl.download([album_url])
+                # Log after download completes
+                self.root.after(0, lambda attempt=download_attempt: self.log(f"DEBUG: yt-dlp download() returned successfully (attempt {attempt + 1})"))
+                self.root.after(0, lambda: self.log(f"DEBUG: progress_hooks_called: {self.progress_hooks_called}, call_count: {self.progress_hook_call_count}"))
+                self.root.after(0, lambda: self.log(f"DEBUG: downloaded_files after download: {len(self.downloaded_files) if hasattr(self, 'downloaded_files') and self.downloaded_files else 0}"))
+                
+                # Check if progress hooks were called (indicates actual download activity)
+                if self.progress_hooks_called or len(self.downloaded_files) > 0:
+                    download_success = True
+                    break
+                elif download_attempt < max_download_retries:
+                    # No progress hooks called and no files downloaded - retry
+                    self.root.after(0, lambda: self.log(f"DEBUG: No progress hooks called, retrying download..."))
+                    # Clear any partial state
+                    if hasattr(self, 'downloaded_files'):
+                        self.downloaded_files = set()
+            except KeyboardInterrupt:
+                # Check if this was our cancellation or user's Ctrl+C
+                if self.is_cancelling:
+                    # Our cancellation - exit gracefully
+                    self.ydl_instance = None
+                    return False
+                # User's Ctrl+C - re-raise
+                raise
+            except yt_dlp.utils.DownloadError as e:
+                # If this is a retry attempt, try again
+                if download_attempt < max_download_retries:
+                    self.root.after(0, lambda err=str(e), attempt=download_attempt: self.log(f"DEBUG: Download error on attempt {attempt + 1}, will retry: {err[:100]}"))
+                    continue
+                # Final attempt failed
+                self.ydl_instance = None
+                error_msg = str(e)
+                self.root.after(0, lambda msg=error_msg: self.log(f"Download error: {msg}"))
+                # Log more details for debugging batch mode issues
+                if hasattr(self, 'downloaded_files'):
+                    debug_info = f" (downloaded_files count: {len(self.downloaded_files) if self.downloaded_files else 0})"
+                    self.root.after(0, lambda info=debug_info: self.log(f"DEBUG: Debug info: {info}"))
+                return False
+            except Exception as e:
+                # If this is a retry attempt, try again
+                if download_attempt < max_download_retries:
+                    self.root.after(0, lambda err=str(e), attempt=download_attempt: self.log(f"DEBUG: Unexpected error on attempt {attempt + 1}, will retry: {err[:100]}"))
+                    continue
+                # Final attempt failed
+                self.ydl_instance = None
+                error_msg = str(e)
+                self.root.after(0, lambda msg=error_msg: self.log(f"Unexpected error during download: {msg}"))
+                if hasattr(self, 'downloaded_files'):
+                    debug_info = f" (downloaded_files count: {len(self.downloaded_files) if self.downloaded_files else 0})"
+                    self.root.after(0, lambda info=debug_info: self.log(f"DEBUG: Debug info: {info}"))
                 return False
         
+        # Check if download succeeded
+        if not download_success:
+            self.ydl_instance = None
+            self.root.after(0, lambda: self.log("DEBUG: Download failed after all retry attempts (no progress hooks called)"))
+            return False
+        
+        # Check if download succeeded
+        if not download_success:
+            self.ydl_instance = None
+            self.root.after(0, lambda: self.log("DEBUG: Download failed after all retry attempts (no progress hooks called)"))
+            return False
+        
+        # Clear instance after download
+        self.ydl_instance = None
+        
+        # Check if cancelled - if so, exit early
+        if self.is_cancelling:
+            return False
+        
         # Verify that files were actually downloaded (with retry logic for batch and discography modes)
-        import time
         files_downloaded = False
         # Use more retries and longer delays for discography/batch modes (multiple albums in sequence)
         is_multi_album = hasattr(self, 'is_discography_mode') and self.is_discography_mode
@@ -6001,6 +6315,12 @@ class BandcampDownloaderGUI:
     
     def progress_hook(self, d):
         """Progress hook for yt-dlp - fresh clean implementation."""
+        # Mark that progress hooks are being called (for detecting silent failures)
+        self.progress_hooks_called = True
+        if not hasattr(self, 'progress_hook_call_count'):
+            self.progress_hook_call_count = 0
+        self.progress_hook_call_count += 1
+        
         # Check cancellation first - if cancelled, raise KeyboardInterrupt to stop current track immediately
         if self.is_cancelling:
             raise KeyboardInterrupt("Download cancelled by user")
@@ -6324,8 +6644,14 @@ class BandcampDownloaderGUI:
             elif status == 'finished':
                 # Update track counter when a track finishes
                 filename = d.get('filename', '')
-                if filename and hasattr(self, 'downloaded_files'):
+                if filename:
+                    # Ensure downloaded_files set exists (should be initialized in download_single_album)
+                    if not hasattr(self, 'downloaded_files'):
+                        self.downloaded_files = set()
                     self.downloaded_files.add(filename)
+                    # Log for debugging batch mode issues
+                    self.root.after(0, lambda f=filename: self.log(f"DEBUG: progress_hook 'finished' - added: {Path(f).name if f else 'None'}"))
+                    self.root.after(0, lambda: self.log(f"DEBUG: downloaded_files count: {len(self.downloaded_files)}"))
                 
                 # Detect album changes in discography mode (using filename path)
                 album_changed = False
@@ -6438,9 +6764,14 @@ class BandcampDownloaderGUI:
         
         except KeyboardInterrupt:
             raise
-        except Exception:
-            # Silently handle any errors in progress hook to not break download
-            pass
+        except Exception as e:
+            # Log errors in progress hook for debugging (but don't break download)
+            import traceback
+            error_msg = f"DEBUG: progress_hook exception: {str(e)}"
+            self.root.after(0, lambda msg=error_msg: self.log(msg))
+            # Log full traceback for debugging
+            tb_str = traceback.format_exc()
+            self.root.after(0, lambda tb=tb_str: self.log(f"DEBUG: progress_hook traceback: {tb}"))
     
     def _format_error_message(self, error_str, is_unexpected=False):
         """Format error messages to be more user-friendly."""
