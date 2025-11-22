@@ -1699,18 +1699,12 @@ class BandcampDownloaderGUI:
     def _handle_right_click_paste(self, event):
         """Handle right-click paste in URL field (Entry widget)."""
         try:
+            # Save current content state before pasting (so we can undo back to it)
+            self._save_content_state()
+            
             # Get clipboard content
             clipboard_text = self.root.clipboard_get()
             if clipboard_text:
-                # Save to history
-                if clipboard_text.strip():
-                    if self.paste_history_index < len(self.paste_history) - 1:
-                        self.paste_history = self.paste_history[:self.paste_history_index + 1]
-                    self.paste_history.append(clipboard_text)
-                    self.paste_history_index = len(self.paste_history) - 1
-                    if len(self.paste_history) > 20:
-                        self.paste_history = self.paste_history[-20:]
-                        self.paste_history_index = len(self.paste_history) - 1
                 # Clear current selection if any
                 url_entry = event.widget
                 url_entry.delete(0, END)
@@ -1719,10 +1713,8 @@ class BandcampDownloaderGUI:
                 if '\n' in clipboard_text:
                     self._expand_to_multiline(clipboard_text)
                 else:
-                    # Trigger URL check
-                    self.root.after(10, self._check_url)
-                    self._update_url_count_and_button()
-                    self._update_url_clear_button()
+                    # Save new state after paste, then trigger URL check
+                    self.root.after(10, lambda: (self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_url_clear_button()))
         except Exception:
             # If clipboard is empty or not text, ignore
             pass
@@ -4459,11 +4451,33 @@ class BandcampDownloaderGUI:
             try:
                 base_path = Path(download_path)
                 if base_path.exists():
-                    # Find all audio files (MP3, M4A, MP4, AAC, FLAC, OGG, WAV)
+                    # Find audio files - only process files that were just downloaded
+                    # Use downloaded_files set if available, otherwise use timestamp-based filtering
                     audio_extensions = [".mp3", ".m4a", ".mp4", ".aac", ".flac", ".ogg", ".oga", ".wav"]
                     audio_files = []
-                    for ext in audio_extensions:
-                        audio_files.extend(base_path.rglob(f"*{ext}"))
+                    
+                    if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                        # Process only files that were tracked as downloaded (most reliable)
+                        for downloaded_file in self.downloaded_files:
+                            file_path = Path(downloaded_file)
+                            if file_path.exists() and file_path.suffix.lower() in audio_extensions:
+                                audio_files.append(file_path)
+                    elif hasattr(self, 'download_start_time') and self.download_start_time:
+                        # Fallback: use timestamp-based filtering (files modified after download started)
+                        import time
+                        time_threshold = self.download_start_time - 30  # 30 second buffer
+                        for ext in audio_extensions:
+                            for audio_file in base_path.rglob(f"*{ext}"):
+                                try:
+                                    file_mtime = audio_file.stat().st_mtime
+                                    if file_mtime >= time_threshold:
+                                        audio_files.append(audio_file)
+                                except (OSError, Exception):
+                                    continue
+                    else:
+                        # Last resort: find all audio files (shouldn't happen in normal operation)
+                        for ext in audio_extensions:
+                            audio_files.extend(base_path.rglob(f"*{ext}"))
                     
                     if audio_files:
                         self.root.after(0, lambda: self.log(f"Embedding cover art for {len(audio_files)} file(s)..."))
