@@ -131,6 +131,7 @@ class ThinProgressBar:
 class BandcampDownloaderGUI:
     # Constants for better maintainability
     FORMAT_EXTENSIONS = {
+        "original": [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mpa", ".aac", ".opus"],  # Common audio formats
         "mp3": [".mp3"],
         "flac": [".flac"],
         "ogg": [".ogg", ".oga"],
@@ -150,6 +151,8 @@ class BandcampDownloaderGUI:
     
     def _extract_format(self, format_val):
         """Extract base format from display value (e.g., 'mp3 (128kbps)' -> 'mp3')."""
+        if format_val == "Original":
+            return "original"
         if format_val.startswith("mp3"):
             return "mp3"
         return format_val
@@ -180,7 +183,11 @@ class BandcampDownloaderGUI:
         # Variables
         self.url_var = StringVar()
         self.path_var = StringVar()
-        self.folder_structure_var = StringVar(value=self.get_default_preference())
+        # Initialize with numeric value, will be converted to display value in setup_ui
+        saved_choice = self.get_default_preference()
+        # Convert to display value immediately
+        display_value = self.FOLDER_STRUCTURES.get(saved_choice, self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE])
+        self.folder_structure_var = StringVar(value=display_value)
         self.format_var = StringVar(value=self.load_saved_format())
         self.numbering_var = StringVar(value=self.load_saved_numbering())
         self.skip_postprocessing_var = BooleanVar(value=self.load_saved_skip_postprocessing())
@@ -195,7 +202,8 @@ class BandcampDownloaderGUI:
         self.url_container_frame = None  # Container frame for URL widgets
         
         # Store metadata for preview
-        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None}
+        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+        self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
         self.url_check_timer = None  # For debouncing URL changes
         self.album_art_image = None  # Store reference to prevent garbage collection
         self.album_art_fetching = False  # Flag to prevent multiple simultaneous fetches
@@ -595,7 +603,7 @@ class BandcampDownloaderGUI:
         settings = self._load_settings()
         format_val = settings.get("audio_format", self.DEFAULT_FORMAT)
         # Support both old format ("mp3") and new format ("mp3 (128kbps)")
-        if format_val in ["mp3", "mp3 (128kbps)", "flac", "ogg", "wav"]:
+        if format_val in ["Original", "mp3", "mp3 (128kbps)", "flac", "ogg", "wav"]:
             # Convert old "mp3" to new format for consistency
             if format_val == "mp3":
                 return "mp3 (128kbps)"
@@ -1065,7 +1073,7 @@ class BandcampDownloaderGUI:
         format_combo = ttk.Combobox(
             self.settings_content,
             textvariable=self.format_var,
-            values=["mp3 (128kbps)", "flac", "ogg", "wav"],
+            values=["Original", "mp3 (128kbps)", "flac", "ogg", "wav"],
             state="readonly",
             width=15
         )
@@ -1516,6 +1524,9 @@ class BandcampDownloaderGUI:
         # The StringVar already contains the full display text from the combobox selection
         # No need to modify it - just update the preview
         self.update_preview()
+        # Save the preference immediately when changed
+        choice = self._extract_structure_choice(self.folder_structure_var.get())
+        self.save_default_preference(choice)
     
     def on_numbering_change(self, event=None):
         """Handle track numbering change and save preference."""
@@ -1627,7 +1638,8 @@ class BandcampDownloaderGUI:
         self._update_url_clear_button()
         
         # Reset metadata and preview
-        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None}
+        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+        self.format_suggestion_shown = False  # Reset format suggestion flag
         self.current_thumbnail_url = None
         self.album_art_fetching = False
         self.update_preview()
@@ -2252,7 +2264,8 @@ class BandcampDownloaderGUI:
         
         # Reset metadata if URL is empty
         if not url:
-            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None}
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.format_suggestion_shown = False  # Reset format suggestion flag
             self.current_thumbnail_url = None
             self.album_art_fetching = False
             self.update_preview()
@@ -2462,11 +2475,98 @@ class BandcampDownloaderGUI:
                     if thumbnail_url and thumbnail_url != self.current_thumbnail_url and not self.album_art_fetching:
                         self.current_thumbnail_url = thumbnail_url
                         self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
+                    
+                    # Try to detect format from first track (if entries available)
+                    detected_format = None
+                    if info.get("entries"):
+                        entries = [e for e in info.get("entries", []) if e]
+                        if entries:
+                            first_entry = entries[0]
+                            # With extract_flat, we might not have format info, so try to get it
+                            # Check if we have format info in the entry
+                            if first_entry.get("ext") or first_entry.get("acodec") or first_entry.get("container"):
+                                ext = first_entry.get("ext") or ""
+                                acodec = first_entry.get("acodec") or ""
+                                container = first_entry.get("container") or ""
+                                
+                                # Determine format
+                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                    detected_format = "m4a"
+                                elif ext == "flac" or acodec == "flac":
+                                    detected_format = "flac"
+                                elif ext == "ogg" or acodec == "vorbis":
+                                    detected_format = "ogg"
+                                elif ext == "wav" or acodec == "pcm":
+                                    detected_format = "wav"
+                                elif ext == "mp3" or acodec == "mp3":
+                                    detected_format = "mp3"
+                            
+                            # If we don't have format info (extract_flat mode), do a quick extraction for first track
+                            if not detected_format and first_entry.get("url"):
+                                try:
+                                    track_url = first_entry.get("url")
+                                    if track_url:
+                                        # Quick format detection extraction
+                                        format_ydl_opts = {
+                                            "quiet": True,
+                                            "no_warnings": True,
+                                            "extract_flat": False,
+                                            "socket_timeout": 5,
+                                            "retries": 1,
+                                        }
+                                        with yt_dlp.YoutubeDL(format_ydl_opts) as format_ydl:
+                                            track_info = format_ydl.extract_info(track_url, download=False)
+                                            if track_info:
+                                                ext = track_info.get("ext") or ""
+                                                acodec = track_info.get("acodec") or ""
+                                                container = track_info.get("container") or ""
+                                                
+                                                # Determine format
+                                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                                    detected_format = "m4a"
+                                                elif ext == "flac" or acodec == "flac":
+                                                    detected_format = "flac"
+                                                elif ext == "ogg" or acodec == "vorbis":
+                                                    detected_format = "ogg"
+                                                elif ext == "wav" or acodec == "pcm":
+                                                    detected_format = "wav"
+                                                elif ext == "mp3" or acodec == "mp3":
+                                                    detected_format = "mp3"
+                                except Exception:
+                                    pass  # Silently fail format detection
+                    
+                    # Update album_info with detected format
+                    if detected_format:
+                        self.album_info["detected_format"] = detected_format
+                        # Update preview to show detected format extension
+                        self.root.after(0, self.update_preview)
+                        # If format is not MP3, suggest Original format
+                        if detected_format != "mp3":
+                            self.root.after(0, lambda fmt=detected_format: self._suggest_format_for_detected(fmt))
             except Exception:
                 pass  # Silently fail - HTML extraction is primary method
         
         # Start with fast HTML extraction
         threading.Thread(target=fetch_from_html, daemon=True).start()
+    
+    def _suggest_format_for_detected(self, detected_format):
+        """Suggest Original format when a non-MP3 format is detected."""
+        # Only suggest once per URL and if current format is not already Original
+        if self.format_suggestion_shown:
+            return
+        
+        current_format = self.format_var.get()
+        if current_format != "Original":
+            # Log the detected format
+            format_names = {
+                "m4a": "M4A/ALAC",
+                "flac": "FLAC",
+                "ogg": "OGG",
+                "wav": "WAV"
+            }
+            format_name = format_names.get(detected_format, detected_format.upper())
+            self.log(f"ℹ Detected format: {format_name}. Consider using 'Original' format to download without conversion.")
+            self.format_suggestion_shown = True  # Mark as shown
     
     def fetch_thumbnail_from_html(self, url):
         """Extract thumbnail URL directly from Bandcamp HTML page (fast method)."""
@@ -2721,12 +2821,27 @@ class BandcampDownloaderGUI:
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
         ext_map = {
+            "original": ".???",
             "mp3": ".mp3",
             "flac": ".flac",
             "ogg": ".ogg",
             "wav": ".wav"
         }
         ext = ext_map.get(base_format, ".mp3")
+        
+        # If Original format is selected and we have a detected format, use that instead of .???
+        if base_format == "original" and self.album_info.get("detected_format"):
+            detected = self.album_info.get("detected_format")
+            detected_ext_map = {
+                "m4a": ".m4a",
+                "flac": ".flac",
+                "ogg": ".ogg",
+                "wav": ".wav",
+                "mp3": ".mp3"
+            }
+            detected_ext = detected_ext_map.get(detected)
+            if detected_ext:
+                ext = detected_ext
         
         # Use real metadata if available, otherwise use placeholders
         # Sanitize names to remove invalid filename characters
@@ -3096,6 +3211,28 @@ class BandcampDownloaderGUI:
                 # WAV: Cannot reliably embed cover art - return False to skip
                 # Cover art files will be kept in folder for manual embedding
                 return False
+            elif base_format == "original":
+                # For original format, check file extension to determine how to embed
+                audio_ext = Path(audio_file).suffix.lower()
+                if audio_ext in [".m4a", ".mp4", ".aac"]:
+                    # M4A/MP4/AAC: embed as video stream with attached picture
+                    # Use explicit stream mapping: map audio from first input, image from second input
+                    cmd = [
+                        str(self.ffmpeg_path),
+                        "-i", str(audio_file),
+                        "-i", str(thumbnail_file),
+                        "-c", "copy",
+                        "-map", "0:0",  # Map audio stream from first input
+                        "-map", "1:0",  # Map image stream from second input
+                        "-metadata:s:v", "title=Album cover",
+                        "-metadata:s:v", "comment=Cover (front)",
+                        "-disposition:v:0", "attached_pic",
+                        "-y",
+                        temp_output,
+                    ]
+                else:
+                    # Unknown format - cannot embed
+                    return False
             else:
                 return False
             
@@ -3336,21 +3473,48 @@ class BandcampDownloaderGUI:
             cover_art_name = f"{artist} - {album}"
             
             # Find all cover art files that were just downloaded
+            # Only search in directories that contain downloaded audio files
             cover_art_files = []
             
+            # Get directories that contain downloaded audio files
+            directories_to_search = set()
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                for downloaded_file in self.downloaded_files:
+                    try:
+                        audio_path = Path(downloaded_file)
+                        if audio_path.exists():
+                            directories_to_search.add(audio_path.parent)
+                    except Exception:
+                        pass
+            
+            # If no downloaded files found, fall back to searching base_path but only immediate subdirectories
+            if not directories_to_search:
+                # Only search immediate subdirectories, not recursively from root
+                try:
+                    for item in base_path.iterdir():
+                        if item.is_dir():
+                            directories_to_search.add(item)
+                except Exception:
+                    pass
+            
+            # Only search in directories that contain downloaded files
             if hasattr(self, 'download_start_time') and self.download_start_time:
                 # Use timestamp-based filtering to find recently downloaded cover art files
                 time_threshold = self.download_start_time - 30
-                for ext in self.THUMBNAIL_EXTENSIONS:
-                    for thumb_file in base_path.rglob(f"*{ext}"):
-                        try:
-                            file_mtime = thumb_file.stat().st_mtime
-                            if file_mtime >= time_threshold:
-                                # Skip files that already have the "artist - album" format
-                                if not re.match(r'^[^-]+ - [^-]+$', thumb_file.stem):
-                                    cover_art_files.append(thumb_file)
-                        except Exception:
-                            pass
+                for search_dir in directories_to_search:
+                    if not search_dir.exists():
+                        continue
+                    for ext in self.THUMBNAIL_EXTENSIONS:
+                        # Only search in this specific directory, not recursively
+                        for thumb_file in search_dir.glob(f"*{ext}"):
+                            try:
+                                file_mtime = thumb_file.stat().st_mtime
+                                if file_mtime >= time_threshold:
+                                    # Skip files that already have the "artist - album" format
+                                    if not re.match(r'^[^-]+ - [^-]+$', thumb_file.stem):
+                                        cover_art_files.append(thumb_file)
+                            except Exception:
+                                pass
             
             if not cover_art_files:
                 return
@@ -3471,33 +3635,55 @@ class BandcampDownloaderGUI:
             if not base_path.exists():
                 return
             
-            # Get folder structure choice
-            choice = self._extract_structure_choice(self.folder_structure_var.get())
-            
-            # Find all directories that might contain cover art
+            # Only check directories that contain downloaded audio files
             directories_to_check = set()
             
-            # For structure 4 (Artist/Album) or 5 (Album/Artist), check album-level directories
-            if choice in ["4", "5"]:
-                # Find all directories that are 2 levels deep (Artist/Album or Album/Artist)
-                for item in base_path.iterdir():
-                    if item.is_dir():
-                        for subitem in item.iterdir():
-                            if subitem.is_dir():
-                                directories_to_check.add(subitem)
-            elif choice == "2":
-                # Structure 2: Album folder - check album directories
-                for item in base_path.iterdir():
-                    if item.is_dir():
-                        directories_to_check.add(item)
-            elif choice == "3":
-                # Structure 3: Artist folder - check artist directories
-                for item in base_path.iterdir():
-                    if item.is_dir():
-                        directories_to_check.add(item)
-            else:
-                # Structure 1: Root - check base path
-                directories_to_check.add(base_path)
+            # Get directories from downloaded files
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                for downloaded_file in self.downloaded_files:
+                    try:
+                        audio_path = Path(downloaded_file)
+                        if audio_path.exists():
+                            directories_to_check.add(audio_path.parent)
+                    except Exception:
+                        pass
+            
+            # If no downloaded files found, fall back to structure-based search
+            # but only search immediate subdirectories, not recursively from root
+            if not directories_to_check:
+                # Get folder structure choice
+                choice = self._extract_structure_choice(self.folder_structure_var.get())
+                
+                # For structure 4 (Artist/Album) or 5 (Album/Artist), check album-level directories
+                if choice in ["4", "5"]:
+                    # Find all directories that are 2 levels deep (Artist/Album or Album/Artist)
+                    try:
+                        for item in base_path.iterdir():
+                            if item.is_dir():
+                                for subitem in item.iterdir():
+                                    if subitem.is_dir():
+                                        directories_to_check.add(subitem)
+                    except Exception:
+                        pass
+                elif choice == "2":
+                    # Structure 2: Album folder - check album directories
+                    try:
+                        for item in base_path.iterdir():
+                            if item.is_dir():
+                                directories_to_check.add(item)
+                    except Exception:
+                        pass
+                elif choice == "3":
+                    # Structure 3: Artist folder - check artist directories
+                    try:
+                        for item in base_path.iterdir():
+                            if item.is_dir():
+                                directories_to_check.add(item)
+                    except Exception:
+                        pass
+                else:
+                    # Structure 1: Root - check base path only (not recursively)
+                    directories_to_check.add(base_path)
             
             # Process each directory
             for directory in directories_to_check:
@@ -3566,16 +3752,21 @@ class BandcampDownloaderGUI:
         base_format = self._extract_format(format_val)
         skip_postprocessing = self.skip_postprocessing_var.get()
         
-        # If skipping post-processing, we need to check all audio formats (yt-dlp downloads original format)
-        if skip_postprocessing:
+        # If skipping post-processing, or Original format is selected, we need to check all audio formats
+        if skip_postprocessing or base_format == "original":
             # Check all possible audio formats since we don't know what yt-dlp downloaded
-            all_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav"]
-            base_format = None  # Will process based on actual file extensions found
+            all_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+            if base_format == "original":
+                # Keep base_format as "original" so we can handle it specially
+                pass
+            else:
+                base_format = None  # Will process based on actual file extensions found
         else:
             all_extensions = self.FORMAT_EXTENSIONS.get(base_format, [])
         
         # Only process FLAC (MP3 is handled by yt-dlp's EmbedThumbnail)
         # OGG and WAV cannot reliably embed cover art, so we skip embedding and keep files
+        # Original format needs special handling for M4A files
         if skip_postprocessing:
             # When skipping post-processing, handle cover art based on download_cover_art setting
             download_cover_art = self.download_cover_art_var.get()
@@ -3593,6 +3784,69 @@ class BandcampDownloaderGUI:
                             self.deduplicate_cover_art(processed_dirs)
                 except Exception:
                     pass
+            return
+        elif base_format == "original":
+            # For Original format, try to embed artwork for supported formats (M4A, MP4, AAC)
+            download_cover_art = self.download_cover_art_var.get()
+            
+            # Try to embed artwork for M4A/MP4/AAC files
+            try:
+                base_path = Path(download_path)
+                if base_path.exists():
+                    # Find M4A, MP4, and AAC files
+                    m4a_extensions = [".m4a", ".mp4", ".aac"]
+                    audio_files = []
+                    for ext in m4a_extensions:
+                        audio_files.extend(base_path.rglob(f"*{ext}"))
+                    
+                    if audio_files:
+                        self.root.after(0, lambda: self.log(f"Embedding cover art for {len(audio_files)} file(s)..."))
+                        
+                        processed_dirs = set()
+                        used_thumbnails = set()
+                        
+                        for audio_file in audio_files:
+                            # Skip temporary files
+                            name_lower = audio_file.name.lower()
+                            if audio_file.name.startswith('.') or 'tmp' in name_lower:
+                                continue
+                            
+                            processed_dirs.add(audio_file.parent)
+                            
+                            # Find thumbnail
+                            thumbnail_file = self.find_thumbnail_file(str(audio_file))
+                            audio_file_str = str(audio_file)
+                            audio_file_name = audio_file.name
+                            
+                            if thumbnail_file:
+                                used_thumbnails.add(Path(thumbnail_file))
+                                self.root.after(0, lambda name=audio_file_name: self.log(f"Processing: {name}"))
+                                success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                                if success:
+                                    self.root.after(0, lambda name=audio_file_name: self.log(f"✓ Embedded cover art: {name}"))
+                                else:
+                                    self.root.after(0, lambda name=audio_file_name: self.log(f"⚠ Could not embed cover art: {name}"))
+                            else:
+                                self.root.after(0, lambda name=audio_file_name: self.log(f"⚠ No thumbnail found for: {name}"))
+                        
+                        # Handle cover art files after embedding
+                        if download_cover_art:
+                            # Deduplicate cover art files
+                            if processed_dirs:
+                                self.deduplicate_cover_art(processed_dirs)
+                        else:
+                            # Remove used thumbnails if not keeping cover art files
+                            for thumb in used_thumbnails:
+                                try:
+                                    if thumb.exists():
+                                        thumb.unlink()
+                                except Exception:
+                                    pass
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): self.log(f"⚠ Error embedding cover art: {err}"))
+            
+            # Also handle other formats that might have been downloaded (MP3, FLAC, etc.)
+            # These are handled by yt-dlp's EmbedThumbnail or the regular flow
             return
         elif base_format in ["mp3", "ogg", "wav"]:
             # For MP3, OGG, and WAV - handle cover art based on download_cover_art setting
@@ -4069,8 +4323,8 @@ class BandcampDownloaderGUI:
             # Configure postprocessors based on format
             postprocessors = []
             
-            # If skip post-processing is enabled, only add metadata/thumbnail postprocessors (no format conversion)
-            if skip_postprocessing:
+            # If skip post-processing is enabled, or Original format is selected, only add metadata/thumbnail postprocessors (no format conversion)
+            if skip_postprocessing or base_format == "original":
                 # Only add metadata and thumbnail embedding, no format conversion
                 # This will output whatever format yt-dlp downloads (likely original format from Bandcamp)
                 postprocessors = [
@@ -4334,8 +4588,8 @@ class BandcampDownloaderGUI:
             # Configure postprocessors based on format
             postprocessors = []
             
-            # If skip post-processing is enabled, only add metadata/thumbnail postprocessors (no format conversion)
-            if skip_postprocessing:
+            # If skip post-processing is enabled, or Original format is selected, only add metadata/thumbnail postprocessors (no format conversion)
+            if skip_postprocessing or base_format == "original":
                 # Only add metadata and thumbnail embedding, no format conversion
                 # This will output whatever format yt-dlp downloads (likely original format from Bandcamp)
                 postprocessors = [
