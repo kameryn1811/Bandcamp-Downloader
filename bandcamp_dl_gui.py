@@ -1632,6 +1632,11 @@ class BandcampDownloaderGUI:
     
     def _clear_url_field(self):
         """Clear the URL field and unfocus it."""
+        # Cancel any pending URL check timer to prevent race conditions
+        if self.url_check_timer:
+            self.root.after_cancel(self.url_check_timer)
+            self.url_check_timer = None
+        
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
             # ScrolledText is visible - clear it
             self.url_text_widget.delete(1.0, END)
@@ -1648,7 +1653,7 @@ class BandcampDownloaderGUI:
         # Update clear button visibility
         self._update_url_clear_button()
         
-        # Reset metadata and preview
+        # Reset metadata and preview immediately
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
         self.format_suggestion_shown = False  # Reset format suggestion flag
         self.current_thumbnail_url = None
@@ -1658,6 +1663,9 @@ class BandcampDownloaderGUI:
         
         # Update URL count
         self._update_url_count_and_button()
+        
+        # Immediately check URL to ensure empty state is processed (this will clear preview/artwork)
+        self._check_url()
     
     def _handle_right_click_paste(self, event):
         """Handle right-click paste in URL field (Entry widget)."""
@@ -2419,8 +2427,11 @@ class BandcampDownloaderGUI:
         urls = self._get_urls_from_text()
         url = urls[0] if urls else ""
         
-        # Reset metadata if URL is empty
-        if not url:
+        # Strip whitespace and check if URL is actually empty
+        url = url.strip() if url else ""
+        
+        # Reset metadata if URL is empty or just whitespace
+        if not url or url == "Paste one URL or multiple to create a batch.":
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
             self.format_suggestion_shown = False  # Reset format suggestion flag
             self.current_thumbnail_url = None
