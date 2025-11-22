@@ -201,9 +201,10 @@ class BandcampDownloaderGUI:
         self.url_text_widget = None  # Store reference to ScrolledText widget
         self.url_container_frame = None  # Container frame for URL widgets
         
-        # Paste history for undo/redo functionality
-        self.paste_history = []  # List of pasted clipboard contents
-        self.paste_history_index = -1  # Current position in history (-1 = most recent)
+        # Content history for undo/redo functionality (tracks content state, not just pastes)
+        self.content_history = []  # List of content states (full field content at each change)
+        self.content_history_index = -1  # Current position in history (-1 = most recent)
+        self.content_save_timer = None  # Timer for debounced content state saving
         
         # Store metadata for preview
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
@@ -1010,6 +1011,7 @@ class BandcampDownloaderGUI:
         url_text.bind('<Button-1>', lambda e: self._hide_text_placeholder())  # Hide on click
         url_text.bind('<FocusIn>', lambda e: self._on_text_focus_in())
         url_text.bind('<FocusOut>', lambda e: self._on_text_focus_out())
+        url_text.bind('<Return>', self._handle_text_return)  # Enter key - save state when new line added
         url_text.bind('<Control-z>', self._handle_text_undo)  # Undo (Ctrl+Z)
         url_text.bind('<Control-Shift-Z>', self._handle_text_redo)  # Redo (Ctrl+Shift+Z)
         url_text.bind('<Control-y>', self._handle_text_redo)  # Redo (Ctrl+Y - alternative)
@@ -1560,6 +1562,31 @@ class BandcampDownloaderGUI:
     
     def on_url_change(self):
         """Handle URL changes - fetch metadata for preview with debouncing."""
+        # Get current content to check if it's empty
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            content = self.url_text_widget.get(1.0, END).strip()
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            content = self.url_var.get().strip()
+            # Skip placeholder text
+            if content == "Paste one URL or multiple to create a batch.":
+                content = ""
+        else:
+            content = ""
+        
+        # If content is empty, immediately clear preview and artwork (don't wait for debounce)
+        if not content:
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.format_suggestion_shown = False
+            self.current_thumbnail_url = None
+            self.album_art_fetching = False
+            self.update_preview()
+            self.clear_album_art()
+            # Cancel any pending timer since we've already handled the empty state
+            if self.url_check_timer:
+                self.root.after_cancel(self.url_check_timer)
+                self.url_check_timer = None
+            return
+        
         # Update URL count dynamically
         self._update_url_count_and_button()
         
@@ -1716,51 +1743,31 @@ class BandcampDownloaderGUI:
     def _handle_right_click_paste_text(self, event=None):
         """Handle right-click paste in ScrolledText widget (can be called from context menu or event)."""
         try:
+            # Save current content state before pasting (so we can undo back to it)
+            self._save_content_state()
+            
             # Hide placeholder immediately when pasting
             self._hide_text_placeholder()
             # Get clipboard content
             clipboard_text = self.root.clipboard_get()
             if clipboard_text:
-                # Save to history
-                if clipboard_text.strip():
-                    if self.paste_history_index < len(self.paste_history) - 1:
-                        self.paste_history = self.paste_history[:self.paste_history_index + 1]
-                    self.paste_history.append(clipboard_text)
-                    self.paste_history_index = len(self.paste_history) - 1
-                    if len(self.paste_history) > 20:
-                        self.paste_history = self.paste_history[-20:]
-                        self.paste_history_index = len(self.paste_history) - 1
                 # Get the text widget - from event or use stored reference
                 url_text = event.widget if event and hasattr(event, 'widget') else self.url_text_widget
                 if url_text:
                     # Insert at cursor position (Text widget)
                     url_text.insert("insert", clipboard_text)
-                    # Trigger URL check and update count
-                    self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+                    # Save new state after paste, then trigger URL check and update count
+                    self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
         except Exception:
             # If clipboard is empty or not text, ignore
             pass
     
     def _handle_entry_paste(self, event):
         """Handle paste in Entry widget - check for newlines and expand if needed."""
-        # Save clipboard content to history before pasting
-        try:
-            clipboard_text = self.root.clipboard_get()
-            if clipboard_text and clipboard_text.strip():
-                # Add to history (remove any future history if we're not at the end)
-                if self.paste_history_index < len(self.paste_history) - 1:
-                    self.paste_history = self.paste_history[:self.paste_history_index + 1]
-                # Add new paste to history
-                self.paste_history.append(clipboard_text)
-                self.paste_history_index = len(self.paste_history) - 1
-                # Limit history size to 20 items
-                if len(self.paste_history) > 20:
-                    self.paste_history = self.paste_history[-20:]
-                    self.paste_history_index = len(self.paste_history) - 1
-        except Exception:
-            pass
-        # Let the paste happen first, then check
-        self.root.after(10, self._check_entry_paste)
+        # Save current content state before pasting (so we can undo back to it)
+        self._save_content_state()
+        # Let the paste happen first, then save new state and check
+        self.root.after(10, lambda: (self._check_entry_paste(), self._save_content_state()))
     
     def _check_entry_paste(self):
         """Check if Entry content has newlines and expand if needed."""
@@ -1789,12 +1796,50 @@ class BandcampDownloaderGUI:
                 # Has newlines - expand to multi-line
                 self._expand_to_multiline(content)
     
+    def _save_content_state(self):
+        """Save current content state to history for undo/redo."""
+        try:
+            # Get current content
+            if self.url_text_widget and self.url_text_widget.winfo_viewable():
+                current_content = self.url_text_widget.get(1.0, END).rstrip('\n')
+            elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+                current_content = self.url_var.get().strip()
+                # Skip placeholder text
+                if current_content == "Paste one URL or multiple to create a batch.":
+                    current_content = ""
+            else:
+                current_content = ""
+            
+            # Only save if content is different from current history position
+            if (self.content_history_index < 0 or 
+                self.content_history_index >= len(self.content_history) or
+                self.content_history[self.content_history_index] != current_content):
+                # Remove any future history if we're not at the end
+                if self.content_history_index < len(self.content_history) - 1:
+                    self.content_history = self.content_history[:self.content_history_index + 1]
+                # Add new content state to history
+                self.content_history.append(current_content)
+                self.content_history_index = len(self.content_history) - 1
+                # Limit history size to 50 items (more than paste history since we track more states)
+                if len(self.content_history) > 50:
+                    self.content_history = self.content_history[-50:]
+                    self.content_history_index = len(self.content_history) - 1
+        except Exception:
+            pass
+    
     def _handle_entry_return(self, event):
         """Handle Enter key in Entry - expand to multi-line."""
+        # Save current content state before adding newline
+        self._save_content_state()
+        
         # Get current content
         content = self.url_var.get()
         # Expand to multi-line with current content
         self._expand_to_multiline(content + '\n')
+        
+        # Save state after expansion (with newline) - wait a bit for widget to update
+        self.root.after(50, self._save_content_state)
+        
         # Focus the text widget
         if self.url_text_widget:
             self.url_text_widget.focus_set()
@@ -1804,73 +1849,119 @@ class BandcampDownloaderGUI:
     
     def _handle_text_paste(self, event):
         """Handle paste in ScrolledText widget."""
-        # Save clipboard content to history before pasting
-        try:
-            clipboard_text = self.root.clipboard_get()
-            if clipboard_text and clipboard_text.strip():
-                # Add to history (remove any future history if we're not at the end)
-                if self.paste_history_index < len(self.paste_history) - 1:
-                    self.paste_history = self.paste_history[:self.paste_history_index + 1]
-                # Add new paste to history
-                self.paste_history.append(clipboard_text)
-                self.paste_history_index = len(self.paste_history) - 1
-                # Limit history size to 20 items
-                if len(self.paste_history) > 20:
-                    self.paste_history = self.paste_history[-20:]
-                    self.paste_history_index = len(self.paste_history) - 1
-        except Exception:
-            pass
+        # Save current content state before pasting (so we can undo back to it)
+        self._save_content_state()
+        
         # Hide placeholder immediately when pasting
         self._hide_text_placeholder()
-        # Let the paste happen first, then check
-        self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+        # Let the paste happen first, then save the new state and check
+        self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
     
     def _handle_entry_undo(self, event):
-        """Handle undo (Ctrl+Z) in Entry widget - cycle to previous paste."""
+        """Handle undo (Ctrl+Z) in Entry widget - cycle to previous content state."""
         # Check if Shift is pressed (Ctrl+Shift+Z = redo)
         if event.state & 0x1:  # Shift key is pressed (state bit 0)
             return self._handle_entry_redo(event)
         
-        if not self.paste_history:
+        if not self.content_history:
             return None  # No history, allow default behavior
         
+        # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Cancel any pending URL check timer and content save timer
+        if self.url_check_timer:
+            self.root.after_cancel(self.url_check_timer)
+            self.url_check_timer = None
+        if self.content_save_timer:
+            self.root.after_cancel(self.content_save_timer)
+            self.content_save_timer = None
+        
+        # Save current content to history before undoing (so we can redo back to it)
+        self._save_content_state()
+        
         # Move back in history
-        if self.paste_history_index > 0:
-            self.paste_history_index -= 1
-            previous_paste = self.paste_history[self.paste_history_index]
+        if self.content_history_index > 0:
+            self.content_history_index -= 1
+            previous_content = self.content_history[self.content_history_index]
             
-            # Replace current content with previous paste
-            self.url_var.set(previous_paste)
+            # Replace current content with previous state
+            self.url_var.set(previous_content)
             
-            # Check if paste contains newlines - if so, expand to multi-line
-            if '\n' in previous_paste:
-                self._expand_to_multiline(previous_paste)
+            # Check if content contains newlines - if so, expand to multi-line
+            if '\n' in previous_content:
+                self._expand_to_multiline(previous_content)
             else:
-                # Trigger URL check
+                # Handle empty content - clear preview and artwork
+                if not previous_content or not previous_content.strip() or previous_content == "Paste one URL or multiple to create a batch.":
+                    self.url_var.set("")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
+                    # Immediately clear preview and artwork
+                    self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                    self.current_thumbnail_url = None
+                    self.album_art_fetching = False
+                    self.update_preview()
+                    self.clear_album_art()
+                
+                # Trigger URL check (will handle empty content correctly)
                 self.root.after(10, self._check_url)
                 self._update_url_count_and_button()
                 self._update_url_clear_button()
+        else:
+            # At the beginning of history - clear the field
+            self.url_var.set("")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
+            # Immediately clear preview and artwork
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.current_thumbnail_url = None
+            self.album_art_fetching = False
+            self.update_preview()
+            self.clear_album_art()
+            self.root.after(10, self._check_url)
+            self._update_url_count_and_button()
+            self._update_url_clear_button()
         
         return "break"  # Prevent default undo behavior
     
     def _handle_entry_redo(self, event):
-        """Handle redo (Ctrl+Shift+Z) in Entry widget - cycle to next paste."""
-        if not self.paste_history:
+        """Handle redo (Ctrl+Shift+Z) in Entry widget - cycle to next content state."""
+        if not self.content_history:
             return None  # No history, allow default behavior
         
+        # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Cancel any pending URL check timer and content save timer
+        if self.url_check_timer:
+            self.root.after_cancel(self.url_check_timer)
+            self.url_check_timer = None
+        if self.content_save_timer:
+            self.root.after_cancel(self.content_save_timer)
+            self.content_save_timer = None
+        
+        # Save current content to history before redoing (so we can undo back to it)
+        self._save_content_state()
+        
         # Move forward in history
-        if self.paste_history_index < len(self.paste_history) - 1:
-            self.paste_history_index += 1
-            next_paste = self.paste_history[self.paste_history_index]
+        if self.content_history_index < len(self.content_history) - 1:
+            self.content_history_index += 1
+            next_content = self.content_history[self.content_history_index]
             
-            # Replace current content with next paste
-            self.url_var.set(next_paste)
+            # Replace current content with next state
+            self.url_var.set(next_content)
             
-            # Check if paste contains newlines - if so, expand to multi-line
-            if '\n' in next_paste:
-                self._expand_to_multiline(next_paste)
+            # Check if content contains newlines - if so, expand to multi-line
+            if '\n' in next_content:
+                self._expand_to_multiline(next_content)
             else:
-                # Trigger URL check
+                # Handle empty content - clear preview and artwork
+                if not next_content or not next_content.strip() or next_content == "Paste one URL or multiple to create a batch.":
+                    self.url_var.set("")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
+                    # Immediately clear preview and artwork
+                    self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                    self.current_thumbnail_url = None
+                    self.album_art_fetching = False
+                    self.update_preview()
+                    self.clear_album_art()
+                
+                # Trigger URL check (will handle empty content correctly)
                 self.root.after(10, self._check_url)
                 self._update_url_count_and_button()
                 self._update_url_clear_button()
@@ -1878,48 +1969,113 @@ class BandcampDownloaderGUI:
         return "break"  # Prevent default redo behavior
     
     def _handle_text_undo(self, event):
-        """Handle undo (Ctrl+Z) in ScrolledText widget - cycle to previous paste."""
+        """Handle undo (Ctrl+Z) in ScrolledText widget - cycle to previous content state."""
         # Check if Shift is pressed (Ctrl+Shift+Z = redo)
         if event.state & 0x1:  # Shift key is pressed (state bit 0)
             return self._handle_text_redo(event)
         
-        if not self.paste_history or not self.url_text_widget:
+        if not self.content_history or not self.url_text_widget:
             return None  # No history or widget, allow default behavior
         
+        # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Cancel any pending URL check timer and content save timer
+        if self.url_check_timer:
+            self.root.after_cancel(self.url_check_timer)
+            self.url_check_timer = None
+        if self.content_save_timer:
+            self.root.after_cancel(self.content_save_timer)
+            self.content_save_timer = None
+        
+        # Save current content to history before undoing (so we can redo back to it)
+        self._save_content_state()
+        
         # Move back in history
-        if self.paste_history_index > 0:
-            self.paste_history_index -= 1
-            previous_paste = self.paste_history[self.paste_history_index]
+        if self.content_history_index > 0:
+            self.content_history_index -= 1
+            previous_content = self.content_history[self.content_history_index]
             
-            # Replace current content with previous paste
+            # Replace current content with previous state (preserve newlines)
             self.url_text_widget.delete(1.0, END)
-            self.url_text_widget.insert(1.0, previous_paste)
-            self._hide_text_placeholder()
+            self.url_text_widget.insert(1.0, previous_content)
             
-            # Trigger URL check and update count
+            # Handle empty content - clear preview and artwork
+            if not previous_content or not previous_content.strip():
+                self._update_text_placeholder_visibility()
+                # Immediately clear preview and artwork
+                self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                self.current_thumbnail_url = None
+                self.album_art_fetching = False
+                self.update_preview()
+                self.clear_album_art()
+            else:
+                self._hide_text_placeholder()
+            
+            # Trigger URL check and update count (will handle empty content correctly)
+            self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+        else:
+            # At the beginning of history - clear the field
+            self.url_text_widget.delete(1.0, END)
+            self._update_text_placeholder_visibility()
+            # Immediately clear preview and artwork
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.current_thumbnail_url = None
+            self.album_art_fetching = False
+            self.update_preview()
+            self.clear_album_art()
             self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
         
         return "break"  # Prevent default undo behavior
     
     def _handle_text_redo(self, event):
-        """Handle redo (Ctrl+Shift+Z) in ScrolledText widget - cycle to next paste."""
-        if not self.paste_history or not self.url_text_widget:
+        """Handle redo (Ctrl+Shift+Z) in ScrolledText widget - cycle to next content state."""
+        if not self.content_history or not self.url_text_widget:
             return None  # No history or widget, allow default behavior
         
+        # Cancel any pending artwork fetches and clear artwork if field will be empty
+        # Cancel any pending URL check timer and content save timer
+        if self.url_check_timer:
+            self.root.after_cancel(self.url_check_timer)
+            self.url_check_timer = None
+        if self.content_save_timer:
+            self.root.after_cancel(self.content_save_timer)
+            self.content_save_timer = None
+        
+        # Save current content to history before redoing (so we can undo back to it)
+        self._save_content_state()
+        
         # Move forward in history
-        if self.paste_history_index < len(self.paste_history) - 1:
-            self.paste_history_index += 1
-            next_paste = self.paste_history[self.paste_history_index]
+        if self.content_history_index < len(self.content_history) - 1:
+            self.content_history_index += 1
+            next_content = self.content_history[self.content_history_index]
             
-            # Replace current content with next paste
+            # Replace current content with next state (preserve newlines)
             self.url_text_widget.delete(1.0, END)
-            self.url_text_widget.insert(1.0, next_paste)
-            self._hide_text_placeholder()
+            self.url_text_widget.insert(1.0, next_content)
             
-            # Trigger URL check and update count
+            # Handle empty content - clear preview and artwork
+            if not next_content or not next_content.strip():
+                self._update_text_placeholder_visibility()
+                # Immediately clear preview and artwork
+                self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                self.current_thumbnail_url = None
+                self.album_art_fetching = False
+                self.update_preview()
+                self.clear_album_art()
+            else:
+                self._hide_text_placeholder()
+            
+            # Trigger URL check and update count (will handle empty content correctly)
             self.root.after(10, lambda: (self._ensure_trailing_newline(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
         
         return "break"  # Prevent default redo behavior
+    
+    def _handle_text_return(self, event):
+        """Handle Enter key in ScrolledText - save content state when new line is added."""
+        # Save current content state before Enter adds newline
+        self._save_content_state()
+        # Allow default Enter behavior (adds newline), then save state again after
+        self.root.after(10, self._save_content_state)
+        return None  # Allow default behavior
     
     def _on_text_key_release(self):
         """Handle key release in ScrolledText - update URL count dynamically and update placeholder visibility."""
@@ -1932,6 +2088,13 @@ class BandcampDownloaderGUI:
         self._update_url_count_and_button()
         # Also trigger URL check with debounce
         self.on_url_change()
+        
+        # Save content state with debounce for undo/redo (only for typing, not for special keys)
+        # Cancel any pending save timer
+        if self.content_save_timer:
+            self.root.after_cancel(self.content_save_timer)
+        # Debounce: save state 500ms after last keystroke (allows typing without saving every keystroke)
+        self.content_save_timer = self.root.after(500, self._save_content_state)
     
     def _ensure_trailing_newline(self):
         """Ensure ScrolledText always ends with an empty line for easy editing."""
@@ -2932,9 +3095,30 @@ class BandcampDownloaderGUI:
         
         raise last_error
     
+    def _is_url_field_empty(self):
+        """Check if the URL field is currently empty."""
+        try:
+            if self.url_text_widget and self.url_text_widget.winfo_viewable():
+                content = self.url_text_widget.get(1.0, END).strip()
+            elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+                content = self.url_var.get().strip()
+                # Skip placeholder text
+                if content == "Paste one URL or multiple to create a batch.":
+                    content = ""
+            else:
+                content = ""
+            return not content or not content.strip()
+        except Exception:
+            return True  # If we can't check, assume empty to be safe
+    
     def fetch_and_display_album_art(self, thumbnail_url):
         """Fetch and display album art asynchronously (second phase - doesn't block preview)."""
         if not thumbnail_url:
+            self.clear_album_art()
+            return
+        
+        # Check if URL field is empty - if so, don't fetch/display artwork
+        if self._is_url_field_empty():
             self.clear_album_art()
             return
         
@@ -2946,11 +3130,23 @@ class BandcampDownloaderGUI:
         
         def download_and_display():
             try:
+                # Check again before downloading (field might have been cleared)
+                if self._is_url_field_empty():
+                    self.root.after(0, self.clear_album_art)
+                    self.album_art_fetching = False
+                    return
+                
                 import io
                 from PIL import Image, ImageTk
                 
                 # Download the image with retry logic
                 image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
+                
+                # Check again after download (field might have been cleared during download)
+                if self._is_url_field_empty():
+                    self.root.after(0, self.clear_album_art)
+                    self.album_art_fetching = False
+                    return
                 
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
@@ -2963,6 +3159,11 @@ class BandcampDownloaderGUI:
                 
                 # Update UI on main thread
                 def update_ui():
+                    # Final check before displaying - field might have been cleared
+                    if self._is_url_field_empty():
+                        self.clear_album_art()
+                        return
+                    
                     # Clear canvas
                     self.album_art_canvas.delete("all")
                     
@@ -3004,7 +3205,7 @@ class BandcampDownloaderGUI:
             self.album_art_canvas.delete("all")
             self.album_art_canvas.create_text(
                 75, 75,
-                text="No album art",
+                text="Album Art",
                 fill='#808080',
                 font=("Segoe UI", 8)
             )
