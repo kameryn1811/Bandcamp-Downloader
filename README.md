@@ -24,7 +24,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 * **Automated-Setup** - Checks dependencies and guides you through installation
 * **Simple GUI** - No command-line knowledge required
-* **Flexible Interface** - Adjust window and URL field height as needed
+* **Flexible Interface** - Adjust window size and expand/resize URL field height as needed
 * **Batch Downloads** - Download multiple albums at once by pasting multiple URLs
 * **Discography Support** - Download entire artist discographies with a single click
 * **Organization** - Choose from several folder structure (e.g. Artist/Album) and file Numbering options
