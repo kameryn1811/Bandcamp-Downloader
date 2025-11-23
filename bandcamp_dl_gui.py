@@ -37,7 +37,7 @@ import json
 from pathlib import Path
 from tkinter import (
     Tk, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, END, WORD, BOTH,
-    Frame, Label, Canvas, Checkbutton, Menu
+    Frame, Label, Canvas, Checkbutton, Menu, Entry, Button
 )
 
 # yt-dlp will be imported after checking if it's installed
@@ -167,13 +167,18 @@ class BandcampDownloaderGUI:
         # Center the window on screen
         window_width = 520
         window_height = 580
+        self.default_window_height = window_height  # Store default height for expand/collapse
+        self.expand_amount = 150  # Amount to expand by
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         center_x = int(screen_width / 2 - window_width / 2)
         center_y = int(screen_height / 2 - window_height / 2)
         self.root.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
         
-        self.root.resizable(False, False)
+        # Allow vertical resizing only (width fixed, height resizable)
+        # Set minimum height to current height
+        self.root.resizable(False, True)
+        self.root.minsize(window_width, window_height)
         
         # Get script directory first (needed for icon path)
         self.script_dir = Path(__file__).resolve().parent
@@ -220,10 +225,25 @@ class BandcampDownloaderGUI:
         self.current_url_being_processed = None  # Track URL currently being processed to avoid cancelling valid fetches
         self.album_art_visible = True  # Track album art panel visibility
         
+        # URL text widget resize state
+        self.url_text_height = 2  # Default height in lines
+        self.url_text_max_height_px = 250  # Maximum height in pixels
+        self.url_text_resizing = False  # Track if currently resizing
+        self.url_text_resize_start_y = 0  # Starting Y position for resize
+        self.url_text_resize_start_height = 0  # Starting height for resize
+        
         # Download control
         self.download_thread = None
         self.is_cancelling = False
         self.ydl_instance = None  # Store yt-dlp instance for cancellation
+        
+        # Search/find functionality for log
+        self.search_frame = None  # Search bar frame
+        self.search_entry = None  # Search input field
+        self.search_matches = []  # List of match positions
+        self.current_match_index = -1  # Current match position
+        self.search_tag_name = "search_match"  # Tag name for all matches (yellow)
+        self.current_match_tag_name = "current_search_match"  # Tag name for current match (green)
         
         # Check dependencies first
         if not self.check_dependencies():
@@ -259,6 +279,9 @@ class BandcampDownloaderGUI:
         
         # Close console when GUI closes
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Bind to window resize events to update expand/collapse button state
+        self.root.bind('<Configure>', self._on_window_configure)
     
     def setup_dark_mode(self):
         """Configure dark mode theme."""
@@ -333,11 +356,13 @@ class BandcampDownloaderGUI:
                  indicatorcolor=[('selected', accent_color)])
         style.configure('TCombobox', fieldbackground=entry_bg, foreground=entry_fg,
                         borderwidth=1, bordercolor=border_color, relief='flat',
-                        arrowcolor=fg_color)
+                        arrowcolor='#808080',  # Gray arrows matching expand/collapse button
+                        background=select_bg)  # Button area matches browse button
         style.map('TCombobox',
                  fieldbackground=[('readonly', entry_bg)],
                  bordercolor=[('focus', accent_color), ('!focus', border_color)],
-                 arrowcolor=[('active', accent_color), ('!active', fg_color)])
+                 arrowcolor=[('active', '#808080'), ('!active', '#808080')],  # Always gray, always visible
+                 background=[('active', select_bg), ('!active', select_bg)])  # Button area always dark
         # Progress bar uses Bandcamp blue for a friendly, success-oriented feel
         style.configure('TProgressbar', background=success_color, troughcolor=bg_color,
                         borderwidth=0, lightcolor=success_color, darkcolor=success_color)
@@ -913,7 +938,7 @@ class BandcampDownloaderGUI:
         self.url_clear_btn.bind("<Button-1>", lambda e: self._clear_url_field())
         self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(fg='#D4D4D4'))
         self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(fg='#808080'))
-        self.url_clear_btn.grid_remove()  # Hidden initially (preserves space)
+        # Always visible - no grid_remove()
         
         # Expand/Collapse button - toggles between Entry and ScrolledText modes
         # Shows expand icon (⤢) in Entry mode, collapse icon (⤡) in ScrolledText mode
@@ -934,7 +959,7 @@ class BandcampDownloaderGUI:
         self.url_expand_btn.bind("<Button-1>", lambda e: self._toggle_url_field_mode())
         self.url_expand_btn.bind("<Enter>", lambda e: self.url_expand_btn.config(fg='#D4D4D4'))
         self.url_expand_btn.bind("<Leave>", lambda e: self.url_expand_btn.config(fg='#808080'))
-        self.url_expand_btn.grid_remove()  # Hidden initially (preserves space)
+        # Always visible - no grid_remove()
         
         # Bind events for Entry
         url_entry.bind('<Control-v>', self._handle_entry_paste)
@@ -972,6 +997,34 @@ class BandcampDownloaderGUI:
         )
         url_text.grid(row=0, column=0, sticky=(W, E, N, S))
         self.url_text_widget = url_text
+        
+        # Create resize handle at the bottom of the text widget (thin, minimal space)
+        self.url_text_resize_handle = Label(
+            url_text_frame,
+            text="━\n━\n━",  # Three stacked lines for grip icon to indicate draggable
+            bg='#252526',  # Match text widget background to blend in
+            fg='#A0A0A0',  # Lighter gray for better visibility
+            cursor='sb_v_double_arrow',  # Vertical resize cursor
+            height=3,  # Allow space for 3 lines
+            relief='flat',
+            borderwidth=0,
+            font=("Segoe UI", 7),  # Slightly larger font for better visibility
+            anchor='center',  # Center the text
+            justify='center',  # Center the lines
+            wraplength=50  # Allow text wrapping if needed
+        )
+        # Use place() to position it just above the bottom edge, centered and narrower
+        # This way it doesn't take up grid space, doesn't cover borders or scrollbar
+        # Position it centered with some padding from edges
+        # Height matches user's adjustment (10px) to accommodate 3 stacked lines
+        self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=10, y=-1)
+        self.url_text_resize_handle.lower()  # Place behind text widget initially
+        self.url_text_resize_handle.place_forget()  # Hidden initially, shown when text widget is visible
+        
+        # Bind resize handle events
+        self.url_text_resize_handle.bind("<Button-1>", self._start_url_text_resize)
+        self.url_text_resize_handle.bind("<B1-Motion>", self._on_url_text_resize)
+        self.url_text_resize_handle.bind("<ButtonRelease-1>", self._end_url_text_resize)
         
         # Create placeholder label overlay (ghost text that doesn't interfere with content)
         # This will be positioned over the ScrolledText but won't interfere with editing
@@ -1028,6 +1081,12 @@ class BandcampDownloaderGUI:
         path_entry = ttk.Entry(main_frame, textvariable=self.path_var, width=35, font=("Segoe UI", 9), state='normal')
         path_entry.grid(row=1, column=1, sticky=(W, E), pady=2, padx=(8, 0))
         self.path_entry = path_entry  # Store reference for unfocus handling
+        
+        # Bind focus out event to deselect text when path entry loses focus
+        def on_path_focus_out(event):
+            path_entry.selection_clear()
+        path_entry.bind('<FocusOut>', on_path_focus_out)
+        
         browse_btn = ttk.Button(main_frame, text="Browse", command=self.browse_folder)
         browse_btn.grid(row=1, column=2, padx=(4, 0), pady=2)
         self.browse_btn = browse_btn  # Store reference for unfocus handling
@@ -1336,8 +1395,9 @@ class BandcampDownloaderGUI:
         self.overall_progress_bar.grid_remove()
         
         # Status log - compact (using regular Frame for full control)
+        # Reduced bottom padding slightly to make room for expand button
         self.log_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
-        self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=6, padx=0)
+        self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(6, 4), padx=0)
         
         # Label for the frame and debug toggle on same row
         log_label = Label(self.log_frame, text="Status", bg='#1E1E1E', fg='#D4D4D4', font=("Segoe UI", 9))
@@ -1364,9 +1424,10 @@ class BandcampDownloaderGUI:
         self.log_frame.columnconfigure(1, weight=0)
         
         # Inner frame for content (spans both columns to stay full width)
+        # Search bar will be at the bottom (row=2), log_content at row=1
         log_content = Frame(self.log_frame, bg='#1E1E1E')
         log_content.grid(row=1, column=0, columnspan=2, sticky=(W, E, N, S), padx=6, pady=(0, 6))
-        self.log_frame.rowconfigure(1, weight=1)
+        self.log_frame.rowconfigure(1, weight=1)  # Log content row expands
         log_content.columnconfigure(0, weight=1)
         log_content.rowconfigure(0, weight=1)
         
@@ -1383,9 +1444,21 @@ class BandcampDownloaderGUI:
             selectforeground='#FFFFFF',
             borderwidth=0,
             highlightthickness=0,
-            relief='flat'
+            relief='flat',
+            state='disabled'  # Make read-only to prevent user editing
         )
         self.log_text.grid(row=0, column=0, sticky=(W, E, N, S))
+        
+        # Configure search tags for highlighting matches
+        # Yellow for all matches
+        self.log_text.tag_config(self.search_tag_name, background='#FFD700', foreground='#000000')
+        # Green for current/selected match
+        self.log_text.tag_config(self.current_match_tag_name, background='#00FF00', foreground='#000000')
+        
+        # Bind Ctrl+F globally to show search (works anywhere in the app)
+        self.log_text.bind('<Button-1>', lambda e: self._on_log_click())  # Enable focus when clicking log
+        # Use bind_all to ensure Ctrl+F works regardless of which widget has focus
+        self.root.bind_all('<Control-f>', lambda e: self._show_search_bar())  # Global Ctrl+F hotkey
         
         # Configure scrollbar after packing
         self.root.after(100, self.configure_scrollbar)
@@ -1397,13 +1470,48 @@ class BandcampDownloaderGUI:
         main_frame.columnconfigure(2, weight=0)  # Album art column doesn't expand
         main_frame.rowconfigure(10, weight=1)  # Status log row expands
         
+        # Expand/Collapse button at the bottom (centered, fits in log_frame bottom padding, no extra space)
+        # Place it in log_frame at the very bottom, centered
+        self.expand_collapse_btn = Label(
+            self.log_frame,  # Place in log_frame so it's at the bottom
+            text="▼",  # Down triangle (like > rotated down)
+            font=("Segoe UI", 7),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=1,
+            height=1,
+            padx=0,
+            pady=0
+        )
+        # Use place() to position at bottom center, overlaying without adding grid space
+        # This positions it absolutely at the bottom center of log_frame
+        def position_button():
+            if hasattr(self, 'expand_collapse_btn') and self.expand_collapse_btn.winfo_exists():
+                frame_width = self.log_frame.winfo_width()
+                if frame_width > 1:  # Only position if frame is visible
+                    # Center horizontally, position at bottom (2px from bottom)
+                    self.expand_collapse_btn.place(relx=0.5, rely=1.0, anchor='s', y=-2)
+        
+        # Position after frame is rendered
+        self.root.after(100, position_button)
+        # Also reposition on resize
+        self.log_frame.bind('<Configure>', lambda e: position_button())
+        
+        self.expand_collapse_btn.bind("<Button-1>", lambda e: self._toggle_window_height())
+        self.expand_collapse_btn.bind("<Enter>", lambda e: self.expand_collapse_btn.config(fg='#D4D4D4'))
+        self.expand_collapse_btn.bind("<Leave>", lambda e: self.expand_collapse_btn.config(fg='#808080'))
+        
+        # Track if window is expanded
+        self.is_expanded = False
+        
         # Bind click events to main frame and root to unfocus URL field when clicking elsewhere
         def unfocus_url_field(event):
             """Unfocus URL field when clicking on empty areas or non-interactive widgets."""
             # Get the widget that was clicked
             widget_clicked = event.widget
             
-            # Check if click is on URL field, path entry, browse button, clear button, expand button, log text, or any of their parent containers
+            # Check if click is on URL field, path entry, browse button, clear button, expand button, log text, search bar, or any of their parent containers
             current = widget_clicked
             is_interactive_widget = False
             while current:
@@ -1415,7 +1523,8 @@ class BandcampDownloaderGUI:
                     current == self.browse_btn or
                     (hasattr(self, 'log_text') and current == self.log_text) or
                     (hasattr(self, 'url_clear_btn') and current == self.url_clear_btn) or
-                    (hasattr(self, 'url_expand_btn') and current == self.url_expand_btn)):
+                    (hasattr(self, 'url_expand_btn') and current == self.url_expand_btn) or
+                    (hasattr(self, 'search_frame') and self.search_frame and (current == self.search_frame or self._is_widget_in_search_frame(current)))):
                     is_interactive_widget = True
                     break
                 try:
@@ -1625,47 +1734,31 @@ class BandcampDownloaderGUI:
         self.url_check_timer = self.root.after(200, self._check_url)
     
     def _update_url_clear_button(self):
-        """Show or hide the clear button and expand button based on URL field content and mode."""
+        """Update the expand/collapse button icon based on current mode. Buttons are always visible."""
         if not hasattr(self, 'url_clear_btn'):
             return
         
-        # Get content from current visible widget
-        has_content = False
+        # Ensure buttons are always visible
+        self.url_clear_btn.grid()
+        
+        # Determine current mode and update expand/collapse button icon
         is_entry_mode = False
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
             # ScrolledText is visible (multi-line mode)
-            content = self.url_text_widget.get(1.0, END).strip()
-            # Skip placeholder text
-            if content and content != "Paste one URL or multiple to create a batch.":
-                has_content = True
             is_entry_mode = False
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             # Entry is visible (single-line mode)
-            content = self.url_var.get().strip()
-            # Skip placeholder text
-            if content and content != "Paste one URL or multiple to create a batch.":
-                has_content = True
             is_entry_mode = True
         
-        # Show or hide clear button (whenever there's content)
-        if has_content:
-            self.url_clear_btn.grid()
-        else:
-            self.url_clear_btn.grid_remove()
-        
-        # Show or hide expand/collapse button (in both Entry and ScrolledText modes when there's content)
+        # Always show expand/collapse button and update icon based on current mode
         if hasattr(self, 'url_expand_btn'):
-            if has_content:
-                # Show button and update icon based on current mode
-                self.url_expand_btn.grid()
-                if is_entry_mode:
-                    # Entry mode - show expand icon (⤢)
-                    self.url_expand_btn.config(text="⤢")
-                else:
-                    # ScrolledText mode - show collapse icon (⤡)
-                    self.url_expand_btn.config(text="⤡")
+            self.url_expand_btn.grid()
+            if is_entry_mode:
+                # Entry mode - show expand icon (⤢)
+                self.url_expand_btn.config(text="⤢")
             else:
-                self.url_expand_btn.grid_remove()
+                # ScrolledText mode - show collapse icon (⤡)
+                self.url_expand_btn.config(text="⤡")
     
     def _toggle_url_field_mode(self):
         """Toggle between Entry (single-line) and ScrolledText (multi-line) modes."""
@@ -2219,10 +2312,13 @@ class BandcampDownloaderGUI:
                 self._hide_text_placeholder()
     
     def _on_text_focus_in(self):
-        """Handle focus in on ScrolledText - keep at minimum height (content is scrollable)."""
-        # Keep height at minimum (2 lines) - content is scrollable
+        """Handle focus in on ScrolledText - restore saved height if available."""
         if self.url_text_widget:
-            self.url_text_widget.config(height=2)
+            # Restore saved height if available, otherwise keep at minimum
+            if hasattr(self, 'url_text_height') and self.url_text_height > 2:
+                self.url_text_widget.config(height=self.url_text_height)
+            else:
+                self.url_text_widget.config(height=2)
             # Restore scroll position if we saved it
             if hasattr(self, '_saved_text_scroll_position'):
                 try:
@@ -2235,6 +2331,12 @@ class BandcampDownloaderGUI:
     def _on_text_focus_out(self):
         """Handle focus out on ScrolledText - collapse height and update placeholder visibility."""
         if self.url_text_widget:
+            # Deselect any selected text when losing focus
+            try:
+                self.url_text_widget.tag_remove("sel", "1.0", "end")
+            except Exception:
+                pass
+            
             # Save current scroll position before collapsing
             try:
                 # Get the first visible line (top of viewport)
@@ -2242,6 +2344,15 @@ class BandcampDownloaderGUI:
                 self._saved_text_scroll_position = top_index
             except Exception:
                 pass
+            
+            # Save current height before collapsing (if user resized it)
+            if hasattr(self, 'url_text_widget'):
+                try:
+                    current_height = self.url_text_widget.cget('height')
+                    if current_height > 2:
+                        self.url_text_height = current_height
+                except Exception:
+                    pass
             
             # Collapse height to 2 lines (hide extra lines but keep content)
             self.url_text_widget.config(height=2)
@@ -2317,15 +2428,24 @@ class BandcampDownloaderGUI:
         # Update placeholder visibility based on content
         self._update_text_placeholder_visibility()
         
-        # Set height based on content (min 2, max 8)
-        content = formatted_content.strip() if formatted_content else ""
-        if content:
-            lines = content.split('\n')
-            line_count = len([line for line in lines if line.strip()])
-            height = max(2, min(line_count + 1, 8))
+        # Set height based on content (min 2, max 8) or use saved height
+        if hasattr(self, 'url_text_height') and self.url_text_height > 2:
+            height = self.url_text_height
         else:
-            height = 2
+            content = formatted_content.strip() if formatted_content else ""
+            if content:
+                lines = content.split('\n')
+                line_count = len([line for line in lines if line.strip()])
+                height = max(2, min(line_count + 1, 8))
+            else:
+                height = 2
+            self.url_text_height = height
         self.url_text_widget.config(height=height)
+        
+        # Show resize handle when text widget is visible (place it just above bottom edge, centered)
+        if hasattr(self, 'url_text_resize_handle'):
+            self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=10, y=-1)
+            self.url_text_resize_handle.lift()  # Bring to front so it's draggable
         
         # Make sure the widget is actually visible
         self.url_text_widget.update_idletasks()
@@ -2365,10 +2485,22 @@ class BandcampDownloaderGUI:
             # Set placeholder
             self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
         
+        # Save current height before hiding
+        if hasattr(self, 'url_text_widget'):
+            try:
+                current_height = self.url_text_widget.cget('height')
+                if current_height > 2:
+                    self.url_text_height = current_height
+            except Exception:
+                pass
+        
         # Hide ScrolledText, show Entry
         text_frame = getattr(self, 'url_text_frame', None) or self.url_text_widget.master
         if text_frame:
             text_frame.grid_remove()  # Hide but preserve space
+            # Also hide resize handle
+            if hasattr(self, 'url_text_resize_handle'):
+                self.url_text_resize_handle.place_forget()
         
         # Re-grid the Entry widget with original padding
         if self.url_entry_widget:
@@ -2646,6 +2778,8 @@ class BandcampDownloaderGUI:
                 entry.config(foreground='#CCCCCC')  # Normal text color
         
         def on_focus_out(event):
+            # Deselect any selected text when losing focus
+            entry.selection_clear()
             if not entry.get():
                 entry.insert(0, placeholder_text)
                 entry.config(foreground='#808080')
@@ -2656,9 +2790,19 @@ class BandcampDownloaderGUI:
     
     def _check_url(self):
         """Actually check the URL and fetch metadata."""
-        # Get first URL from either Entry or ScrolledText
-        urls = self._get_urls_from_text()
-        url = urls[0] if urls else ""
+        # Get content from either Entry or ScrolledText
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            content = self.url_text_widget.get(1.0, END)
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            content = self.url_var.get()
+        else:
+            content = ""
+        
+        # Extract URLs using the proper method that handles space-separated URLs
+        urls = self._extract_urls_from_content(content)
+        # Remove duplicates to match button counting behavior
+        unique_urls = self._remove_duplicate_urls(urls)
+        url = unique_urls[0] if unique_urls else ""
         
         # Strip whitespace and check if URL is actually empty
         url = url.strip() if url else ""
@@ -3714,9 +3858,415 @@ class BandcampDownloaderGUI:
         # If message starts with "DEBUG:" and debug mode is off, skip it
         if message.startswith("DEBUG:") and not self.debug_mode:
             return
+        # Temporarily enable widget to insert text, then disable again (read-only)
+        self.log_text.config(state='normal')
         self.log_text.insert(END, message + "\n")
         self.log_text.see(END)
+        self.log_text.config(state='disabled')
         self.root.update_idletasks()
+    
+    def _on_log_click(self):
+        """Handle click on log text to enable Ctrl+F."""
+        # Give focus to log_text so Ctrl+F works
+        self.log_text.focus_set()
+        return "break"  # Prevent default behavior
+    
+    def _show_search_bar_if_log_focused(self):
+        """Show search bar if log text has focus."""
+        try:
+            focused = self.root.focus_get()
+            if focused == self.log_text or (hasattr(focused, 'master') and focused.master == self.log_text.master):
+                self._show_search_bar()
+        except:
+            pass
+    
+    def _show_search_bar(self):
+        """Show the search bar for finding text in the log. If already visible, hide it (toggle behavior)."""
+        if self.search_frame and self.search_frame.winfo_viewable():
+            # Already visible - call _hide_search_bar directly (same as close button)
+            self._hide_search_bar()
+            return
+        
+        # Create search frame if it doesn't exist
+        if not self.search_frame:
+            self._create_search_bar()
+        
+        # Show the search frame at the bottom (after log_content)
+        self.search_frame.grid(row=2, column=0, columnspan=2, sticky=(W, E), padx=6, pady=(4, 6))
+        if self.search_entry:
+            self.search_entry.focus_set()
+            self.search_entry.select_range(0, END)
+    
+    def _create_search_bar(self):
+        """Create the search bar UI."""
+        self.search_frame = Frame(self.log_frame, bg='#252526', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        
+        # Search label
+        search_label = Label(self.search_frame, text="Find:", bg='#252526', fg='#D4D4D4', font=("Segoe UI", 8))
+        search_label.grid(row=0, column=0, sticky=W, padx=(6, 4), pady=4)
+        
+        # Search entry
+        self.search_var = StringVar()
+        self.search_entry = Entry(self.search_frame, textvariable=self.search_var, width=25, 
+                                 font=("Segoe UI", 8), bg='#1E1E1E', fg='#CCCCCC', 
+                                 insertbackground='#CCCCCC', relief='flat', borderwidth=1, 
+                                 highlightthickness=1, highlightbackground='#3E3E42',
+                                 highlightcolor='#007ACC')
+        self.search_entry.grid(row=0, column=1, sticky=(W, E), padx=(0, 4), pady=4)
+        
+        # Match count label (shows "X of Y" or "No matches") - between search field and buttons
+        self.search_count_label = Label(self.search_frame, text="", bg='#252526', fg='#808080',
+                                       font=("Segoe UI", 8))
+        self.search_count_label.grid(row=0, column=2, sticky=W, padx=(0, 4), pady=4)
+        
+        # Next button
+        next_btn = Button(self.search_frame, text="Next", command=self._find_next,
+                         bg='#252526', fg='#D4D4D4', font=("Segoe UI", 8),
+                         relief='flat', borderwidth=1, highlightthickness=0,
+                         activebackground='#3E3E42', activeforeground='#FFFFFF',
+                         padx=8, pady=2, cursor='hand2')
+        next_btn.grid(row=0, column=3, sticky=W, padx=(0, 2), pady=4)
+        
+        # Previous button
+        prev_btn = Button(self.search_frame, text="Previous", command=self._find_previous,
+                         bg='#252526', fg='#D4D4D4', font=("Segoe UI", 8),
+                         relief='flat', borderwidth=1, highlightthickness=0,
+                         activebackground='#3E3E42', activeforeground='#FFFFFF',
+                         padx=8, pady=2, cursor='hand2')
+        prev_btn.grid(row=0, column=4, sticky=W, padx=(0, 2), pady=4)
+        
+        # Close button (X)
+        self.search_close_btn = Label(self.search_frame, text="✕", bg='#252526', fg='#808080',
+                                     font=("Segoe UI", 9), cursor='hand2', width=1, height=1)
+        self.search_close_btn.grid(row=0, column=5, sticky=E, padx=(4, 6), pady=4)
+        
+        # Store close button reference and bind properly
+        def on_close_click(event):
+            self._hide_search_bar()
+            return "break"  # Prevent event propagation
+        
+        self.search_close_btn.bind("<Button-1>", on_close_click)
+        self.search_close_btn.bind("<Enter>", lambda e: self.search_close_btn.config(fg='#D4D4D4'))
+        self.search_close_btn.bind("<Leave>", lambda e: self.search_close_btn.config(fg='#808080'))
+        
+        # Configure column weights
+        self.search_frame.columnconfigure(1, weight=1)
+        
+        # Bind events
+        # Use KeyRelease for search-as-you-type, but skip Enter key to avoid double-triggering
+        def on_key_release(event):
+            if event.keysym != 'Return':
+                self._on_search_change()
+        
+        self.search_entry.bind('<KeyRelease>', on_key_release)
+        
+        # Enter key - find next match (only if search has been performed)
+        def on_enter(event):
+            search_text = self.search_var.get()
+            if search_text:
+                # If no matches yet, perform search first (will go to first match)
+                if not self.search_matches:
+                    self._perform_search(search_text, reset_index=True)
+                else:
+                    # Otherwise, just go to next match (don't reset)
+                    self._find_next()
+            return "break"  # Prevent default behavior
+        
+        self.search_entry.bind('<Return>', on_enter)
+        self.search_entry.bind('<Shift-Return>', lambda e: (self._find_previous() if self.search_matches else None) or "break")
+        # ESC and Ctrl+F call the exact same handler as the close button
+        self.search_entry.bind('<Escape>', on_close_click)
+        self.search_entry.bind('<Control-f>', on_close_click)
+        
+        # Make search frame and all its children clickable/interactive
+        # This prevents the unfocus handler from stealing focus
+        def on_search_frame_click(event):
+            # Allow clicking on search frame to work normally
+            return None  # Don't prevent default
+        
+        self.search_frame.bind('<Button-1>', on_search_frame_click)
+        
+        # Also bind to all children to ensure they're interactive
+        # But skip the close button since it has its own handler
+        for child in self.search_frame.winfo_children():
+            if child != self.search_close_btn:
+                child.bind('<Button-1>', lambda e: None)  # Allow clicks
+    
+    def _hide_search_bar(self):
+        """Hide the search bar and clear highlights."""
+        # Clear the search field first - this will trigger _on_search_change() which clears highlights
+        if hasattr(self, 'search_var') and self.search_var:
+            self.search_var.set("")
+        
+        if self.search_frame:
+            self.search_frame.grid_remove()
+        
+        # Also explicitly clear highlights as backup
+        self._clear_search_highlights()
+        
+        # Ensure root window can receive keyboard events (for Ctrl+F to work)
+        # Use after_idle to ensure this happens after the search frame is removed
+        self.root.after_idle(lambda: self.root.focus_set())
+    
+    def _toggle_window_height(self):
+        """Toggle window height between default and expanded (default + 150px)."""
+        current_height = self.root.winfo_height()
+        current_width = self.root.winfo_width()
+        
+        # Determine if we should expand or collapse
+        # If current height is greater than default, collapse to default
+        # Otherwise, expand to default + expand_amount
+        if current_height > self.default_window_height:
+            # Collapse to default height
+            new_height = self.default_window_height
+            self.is_expanded = False
+            self.expand_collapse_btn.config(text="▼")  # Down triangle (like > rotated down)
+        else:
+            # Expand by expand_amount
+            new_height = self.default_window_height + self.expand_amount
+            self.is_expanded = True
+            self.expand_collapse_btn.config(text="▲")  # Up triangle (like > rotated up)
+        
+        # Get current window position
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        
+        # Update window geometry
+        self.root.geometry(f"{current_width}x{new_height}+{x}+{y}")
+        
+        # Update button state based on new height
+        self.root.after(100, self._update_expand_button_state)
+    
+    def _update_expand_button_state(self):
+        """Update expand/collapse button arrow based on current window height."""
+        if not hasattr(self, 'expand_collapse_btn'):
+            return
+        
+        current_height = self.root.winfo_height()
+        if current_height > self.default_window_height:
+            self.expand_collapse_btn.config(text="▲")  # Up triangle (like > rotated up)
+            self.is_expanded = True
+        else:
+            self.expand_collapse_btn.config(text="▼")  # Down triangle (like > rotated down)
+            self.is_expanded = False
+    
+    def _on_window_configure(self, event):
+        """Handle window resize events to update expand/collapse button state."""
+        # Only update if this is a window resize (not widget resize)
+        if event.widget == self.root:
+            # Update button state immediately when window is resized
+            # Use a small delay to ensure height is updated
+            self.root.after(10, self._update_expand_button_state)
+    
+    def _start_url_text_resize(self, event):
+        """Start resizing the URL text widget."""
+        if not self.url_text_widget:
+            return
+        self.url_text_resizing = True
+        self.url_text_resize_start_y = event.y_root
+        # Get current widget height in pixels
+        self.url_text_resize_start_height = self.url_text_widget.winfo_height()
+    
+    def _on_url_text_resize(self, event):
+        """Handle dragging to resize the URL text widget."""
+        if not self.url_text_resizing or not self.url_text_widget:
+            return
+        
+        # Calculate the change in Y position
+        delta_y = event.y_root - self.url_text_resize_start_y
+        
+        # Calculate new height in pixels
+        new_height_px = self.url_text_resize_start_height + delta_y
+        
+        # Enforce maximum height (250px)
+        new_height_px = min(new_height_px, self.url_text_max_height_px)
+        
+        # Convert pixels to lines (approximate: each line is about 20px with Segoe UI 9pt)
+        # Get actual line height from the widget
+        try:
+            line_height = self.url_text_widget.dlineinfo("1.0")
+            if line_height:
+                pixels_per_line = line_height[3]  # Height of line
+                if pixels_per_line > 0:
+                    new_height_lines = max(2, int(new_height_px / pixels_per_line))
+                else:
+                    # Fallback: assume ~20px per line
+                    new_height_lines = max(2, int(new_height_px / 20))
+            else:
+                # Fallback: assume ~20px per line
+                new_height_lines = max(2, int(new_height_px / 20))
+        except Exception:
+            # Fallback: assume ~20px per line
+            new_height_lines = max(2, int(new_height_px / 20))
+        
+        # Update widget height
+        self.url_text_widget.config(height=new_height_lines)
+        self.url_text_height = new_height_lines
+    
+    def _end_url_text_resize(self, event):
+        """End resizing the URL text widget."""
+        self.url_text_resizing = False
+    
+    def _is_widget_in_search_frame(self, widget):
+        """Check if widget is part of the search frame."""
+        if not self.search_frame:
+            return False
+        current = widget
+        while current:
+            if current == self.search_frame:
+                return True
+            try:
+                current = current.master
+            except:
+                break
+        return False
+    
+    def _on_search_change(self):
+        """Handle search text change."""
+        search_text = self.search_var.get()
+        if not search_text:
+            self._clear_search_highlights()
+            return
+        self._perform_search(search_text)
+    
+    def _perform_search(self, search_text, reset_index=True):
+        """Search for text in log and highlight matches.
+        
+        Args:
+            search_text: Text to search for
+            reset_index: If True, reset to first match. If False, preserve current index if valid.
+        """
+        if not search_text:
+            return
+        
+        # Clear previous highlights
+        self._clear_search_highlights()
+        
+        # Get all text from log
+        self.log_text.config(state='normal')
+        content = self.log_text.get(1.0, END)
+        self.log_text.config(state='disabled')
+        
+        if not content:
+            return
+        
+        # Find all matches (case-insensitive)
+        import re
+        pattern = re.escape(search_text)
+        matches = list(re.finditer(pattern, content, re.IGNORECASE))
+        
+        if not matches:
+            return
+        
+        # Store match positions
+        self.search_matches = []
+        for match in matches:
+            start_char = match.start()
+            end_char = match.end()
+            
+            # Convert character position to line.column format
+            # Count lines up to start position
+            lines_before_start = content[:start_char].split('\n')
+            line_start = len(lines_before_start)
+            col_start = len(lines_before_start[-1])
+            
+            # Count lines up to end position
+            lines_before_end = content[:end_char].split('\n')
+            line_end = len(lines_before_end)
+            col_end = len(lines_before_end[-1])
+            
+            start_index = f"{line_start}.{col_start}"
+            end_index = f"{line_end}.{col_end}"
+            self.search_matches.append((start_index, end_index))
+        
+        # Highlight all matches
+        for start, end in self.search_matches:
+            self.log_text.tag_add(self.search_tag_name, start, end)
+        
+        # Update match count display
+        self._update_search_count()
+        
+        # Go to first match (or preserve current if reset_index is False)
+        if self.search_matches:
+            if reset_index or self.current_match_index < 0 or self.current_match_index >= len(self.search_matches):
+                self.current_match_index = 0
+            self._scroll_to_match(self.current_match_index)
+    
+    def _clear_search_highlights(self):
+        """Clear all search highlights."""
+        self.log_text.tag_remove(self.search_tag_name, 1.0, END)
+        self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
+        self.search_matches = []
+        self.current_match_index = -1
+        # Clear match count display
+        if hasattr(self, 'search_count_label') and self.search_count_label:
+            self.search_count_label.config(text="")
+    
+    def _update_search_count(self):
+        """Update the match count display."""
+        if not hasattr(self, 'search_count_label') or not self.search_count_label:
+            return
+        
+        match_count = len(self.search_matches)
+        if match_count == 0:
+            self.search_count_label.config(text="No matches", fg='#808080')
+        else:
+            current = self.current_match_index + 1 if self.current_match_index >= 0 else 1
+            self.search_count_label.config(text=f"{current} of {match_count}", fg='#D4D4D4')
+    
+    def _find_next(self):
+        """Find next match."""
+        if not self.search_matches:
+            search_text = self.search_var.get()
+            if search_text:
+                self._perform_search(search_text)
+            return
+        
+        if self.current_match_index < len(self.search_matches) - 1:
+            self.current_match_index += 1
+        else:
+            self.current_match_index = 0  # Wrap around
+        
+        self._update_search_count()
+        self._scroll_to_match(self.current_match_index)
+    
+    def _find_previous(self):
+        """Find previous match."""
+        if not self.search_matches:
+            search_text = self.search_var.get()
+            if search_text:
+                self._perform_search(search_text)
+            return
+        
+        if self.current_match_index > 0:
+            self.current_match_index -= 1
+        else:
+            self.current_match_index = len(self.search_matches) - 1  # Wrap around
+        
+        self._update_search_count()
+        self._scroll_to_match(self.current_match_index)
+    
+    def _scroll_to_match(self, match_index):
+        """Scroll to the specified match and highlight it in green."""
+        if not self.search_matches or match_index < 0 or match_index >= len(self.search_matches):
+            return
+        
+        # Remove green highlight from previous current match
+        self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
+        
+        start_pos, end_pos = self.search_matches[match_index]
+        
+        # Temporarily enable to scroll
+        self.log_text.config(state='normal')
+        # Remove previous selection
+        self.log_text.tag_remove("sel", 1.0, END)
+        # Add green highlight to current match (on top of yellow)
+        self.log_text.tag_add(self.current_match_tag_name, start_pos, end_pos)
+        # Select the current match (for text selection)
+        self.log_text.tag_add("sel", start_pos, end_pos)
+        # Scroll to make it visible
+        self.log_text.see(start_pos)
+        self.log_text.config(state='disabled')
     
     def get_outtmpl(self):
         """Get output template based on folder structure."""
@@ -3917,7 +4467,10 @@ class BandcampDownloaderGUI:
             except:
                 pass
         self.progress_var.set("Starting download...")
+        # Temporarily enable widget to clear it, then disable again (read-only)
+        self.log_text.config(state='normal')
         self.log_text.delete(1.0, END)
+        self.log_text.config(state='disabled')
         self.log("Starting download...")
         if len(valid_urls) > 1:
             self.log(f"Found {len(valid_urls)} album URL(s) to download")
