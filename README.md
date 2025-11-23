@@ -31,7 +31,6 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 * **Metadata** - Automatically tags files with artist, album, track number, and date
 * **Cover Art** - Embeds artwork into files and optionally includes a copy in dowloaded files
 * **Format Flexibility** - Output files provided by Bandcamp (very fast) or re-encode files as: MP3, FLAC, OGG, or WAV (note: converted formats use 128 kbps source)
-* **Track Numbering** - Optional automatic track number prefixes in filename
 * **Playlist Generation** - Create .m3u playlists automatically
 * **Status Log** - Searchable status log with Ctrl+F, word wrap toggle, and clear with undo
 * **Debug Mode** - Toggle visibility of debug information to troubleshoot issues 
