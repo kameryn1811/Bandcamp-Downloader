@@ -1089,7 +1089,7 @@ class BandcampDownloaderGUI:
             path_entry.selection_clear()
         path_entry.bind('<FocusOut>', on_path_focus_out)
         
-        browse_btn = ttk.Button(main_frame, text="Browse", command=self.browse_folder)
+        browse_btn = ttk.Button(main_frame, text="Browse", command=self.browse_folder, cursor='hand2')
         browse_btn.grid(row=1, column=2, padx=(4, 0), pady=2)
         self.browse_btn = browse_btn  # Store reference for unfocus handling
         
@@ -1350,7 +1350,8 @@ class BandcampDownloaderGUI:
             main_frame,
             text="Download Album",
             command=self.start_download,
-            style='Download.TButton'
+            style='Download.TButton',
+            cursor='hand2'
         )
         self.download_btn.grid(row=6, column=0, columnspan=3, pady=15)
         
@@ -1361,7 +1362,8 @@ class BandcampDownloaderGUI:
             text="Cancel Download",
             command=self.cancel_download,
             state='disabled',
-            style='Cancel.TButton'
+            style='Cancel.TButton',
+            cursor='hand2'
         )
         self.cancel_btn.grid(row=6, column=0, columnspan=3, pady=15)
         self.cancel_btn.grid_remove()  # Hidden by default
@@ -2339,6 +2341,35 @@ class BandcampDownloaderGUI:
             except Exception:
                 pass
             
+            # Check if the app is losing focus (focus going outside the app)
+            # If so, don't collapse - keep the current height
+            try:
+                new_focus = self.root.focus_get()
+                # If focus is None or not a widget in our app, the app is losing focus
+                if new_focus is None:
+                    # App is losing focus - don't collapse, just return
+                    return
+                
+                # Check if the new focus widget is within our root window
+                current = new_focus
+                is_in_app = False
+                while current:
+                    if current == self.root:
+                        is_in_app = True
+                        break
+                    try:
+                        current = current.master
+                    except:
+                        break
+                
+                # If focus is going outside the app, don't collapse
+                if not is_in_app:
+                    return
+            except Exception:
+                # If we can't determine focus, default to collapsing (safe behavior)
+                pass
+            
+            # Focus is going to another widget in the app - collapse as normal
             # Save current scroll position before collapsing
             try:
                 # Get the first visible line (top of viewport)
@@ -2446,7 +2477,7 @@ class BandcampDownloaderGUI:
         
         # Show resize handle when text widget is visible (place it just above bottom edge, centered)
         if hasattr(self, 'url_text_resize_handle'):
-            self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=10, y=-1)
+            self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=5, y=-1)
             self.url_text_resize_handle.lift()  # Bring to front so it's draggable
         
         # Make sure the widget is actually visible
