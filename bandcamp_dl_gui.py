@@ -231,6 +231,7 @@ class BandcampDownloaderGUI:
         self.url_text_resizing = False  # Track if currently resizing
         self.url_text_resize_start_y = 0  # Starting Y position for resize
         self.url_text_resize_start_height = 0  # Starting height for resize
+        self.url_text_resize_drag_started = False  # Track if drag has actually started
         
         # Download control
         self.download_thread = None
@@ -1025,6 +1026,7 @@ class BandcampDownloaderGUI:
         self.url_text_resize_handle.bind("<Button-1>", self._start_url_text_resize)
         self.url_text_resize_handle.bind("<B1-Motion>", self._on_url_text_resize)
         self.url_text_resize_handle.bind("<ButtonRelease-1>", self._end_url_text_resize)
+        self.url_text_resize_handle.bind("<Double-Button-1>", self._toggle_url_text_height)
         
         # Create placeholder label overlay (ghost text that doesn't interfere with content)
         # This will be positioned over the ScrolledText but won't interfere with editing
@@ -4062,10 +4064,19 @@ class BandcampDownloaderGUI:
         """Start resizing the URL text widget."""
         if not self.url_text_widget:
             return
-        self.url_text_resizing = True
+        # Use a small delay to allow double-click detection
+        self.url_text_resize_drag_started = False
         self.url_text_resize_start_y = event.y_root
         # Get current widget height in pixels
         self.url_text_resize_start_height = self.url_text_widget.winfo_height()
+        # Start drag after a small delay (allows double-click to cancel it)
+        self.root.after(150, lambda: self._actually_start_url_text_resize())
+    
+    def _actually_start_url_text_resize(self):
+        """Actually start the resize drag operation (called after delay to allow double-click detection)."""
+        if not self.url_text_resize_drag_started:
+            self.url_text_resizing = True
+            self.url_text_resize_drag_started = True
     
     def _on_url_text_resize(self, event):
         """Handle dragging to resize the URL text widget."""
@@ -4106,6 +4117,46 @@ class BandcampDownloaderGUI:
     def _end_url_text_resize(self, event):
         """End resizing the URL text widget."""
         self.url_text_resizing = False
+    
+    def _toggle_url_text_height(self, event):
+        """Toggle URL text widget between minimum and maximum height on double-click."""
+        if not self.url_text_widget:
+            return
+        
+        # Cancel any ongoing drag operation
+        self.url_text_resizing = False
+        
+        try:
+            current_height = self.url_text_widget.cget('height')
+            
+            # If at minimum height (2 lines), maximize it
+            if current_height <= 2:
+                # Calculate maximum height in lines based on pixel limit
+                try:
+                    line_height = self.url_text_widget.dlineinfo("1.0")
+                    if line_height:
+                        pixels_per_line = line_height[3]  # Height of line
+                        if pixels_per_line > 0:
+                            max_height_lines = int(self.url_text_max_height_px / pixels_per_line)
+                        else:
+                            # Fallback: assume ~20px per line
+                            max_height_lines = int(self.url_text_max_height_px / 20)
+                    else:
+                        # Fallback: assume ~20px per line
+                        max_height_lines = int(self.url_text_max_height_px / 20)
+                except Exception:
+                    # Fallback: assume ~20px per line
+                    max_height_lines = int(self.url_text_max_height_px / 20)
+                
+                # Set to maximum height
+                self.url_text_widget.config(height=max_height_lines)
+                self.url_text_height = max_height_lines
+            else:
+                # If taller than minimum, minimize it
+                self.url_text_widget.config(height=2)
+                self.url_text_height = 2
+        except Exception:
+            pass  # Silently fail if there's an issue
     
     def _is_widget_in_search_frame(self, widget):
         """Check if widget is part of the search frame."""
