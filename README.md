@@ -83,8 +83,9 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 - The app will prompt to install it automatically
   
 **Album art and path previews slow to load or not showing at all**
-- Using a VPN, proxy, or any kind of network tunneling (including ISP privacy features) can slow down or block the requests needed to fetch artwork and metadata. These calls work best with a direct, low-latency connection, so the extra routing and encryption from a VPN can cause delays.
-- If previews load slowly or not at all, try turning off the VPN temporarily or switching to a different server/location in your VPN that feels faster.
+- VPNs, proxies, or ISP “secure connection” features can block or slow the CDN requests used to fetch artwork. Try turning these off or switching to a faster VPN location.
+- Antivirus software with HTTPS/SSL scanning (Kaspersky, ESET, Dr.Web, etc.) may interfere with image requests — temporarily disable these features to test.
+- Bad DNS routing can also cause slow or missing images. Switching to 1.1.1.1, 8.8.8.8, or 9.9.9.9 may help.
 
 ## Audio Quality & Artist Support
 
