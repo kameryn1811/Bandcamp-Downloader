@@ -1403,9 +1403,34 @@ class BandcampDownloaderGUI:
         self.log_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
         self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(6, 4), padx=0)
         
-        # Label for the frame and debug toggle on same row
+        # Label for the frame and controls on same row
         log_label = Label(self.log_frame, text="Status", bg='#1E1E1E', fg='#D4D4D4', font=("Segoe UI", 9))
         log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(6, 2))
+        
+        # Clear log button (between Status label and Debug toggle) - styled like Browse button
+        # Use same font size as Debug toggle (8) for consistency in header
+        # Create a custom style for the small button (based on TButton but with smaller padding and font)
+        style = ttk.Style()
+        style.configure('Small.TButton', 
+                       background='#252526',  # select_bg
+                       foreground='#D4D4D4',  # fg_color
+                       borderwidth=1,
+                       bordercolor='#3E3E42',  # border_color
+                       relief='flat',
+                       padding=(6, 2),
+                       font=("Segoe UI", 8))
+        style.map('Small.TButton',
+                 background=[('active', '#3E3E42'), ('pressed', '#1E1E1E')],  # hover_bg, bg_color
+                 bordercolor=[('active', '#3E3E42'), ('pressed', '#3E3E42')])  # border_color
+        
+        clear_log_btn = ttk.Button(
+            self.log_frame,
+            text="Clear Log",
+            command=self._clear_log,
+            cursor='hand2',
+            style='Small.TButton'
+        )
+        clear_log_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(6, 2))
         
         # Debug toggle checkbox (right-aligned on same row as Status label)
         self.debug_mode_var = BooleanVar(value=False)
@@ -1421,16 +1446,17 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=self._toggle_debug_mode
         )
-        debug_toggle.grid(row=0, column=1, sticky=E, padx=6, pady=(6, 2))
+        debug_toggle.grid(row=0, column=2, sticky=E, padx=6, pady=(6, 2))
         
-        # Configure column weights so debug toggle stays on the right
+        # Configure column weights so controls stay on the right
         self.log_frame.columnconfigure(0, weight=1)
         self.log_frame.columnconfigure(1, weight=0)
+        self.log_frame.columnconfigure(2, weight=0)
         
-        # Inner frame for content (spans both columns to stay full width)
+        # Inner frame for content (spans all columns to stay full width)
         # Search bar will be at the bottom (row=2), log_content at row=1
         log_content = Frame(self.log_frame, bg='#1E1E1E')
-        log_content.grid(row=1, column=0, columnspan=2, sticky=(W, E, N, S), padx=6, pady=(0, 6))
+        log_content.grid(row=1, column=0, columnspan=3, sticky=(W, E, N, S), padx=6, pady=(0, 6))
         self.log_frame.rowconfigure(1, weight=1)  # Log content row expands
         log_content.columnconfigure(0, weight=1)
         log_content.rowconfigure(0, weight=1)
@@ -3882,6 +3908,17 @@ class BandcampDownloaderGUI:
             self.save_path()
             self.update_preview()
     
+    def _clear_log(self):
+        """Clear the status log."""
+        self.log_text.config(state='normal')
+        self.log_text.delete(1.0, END)
+        self.log_text.config(state='disabled')
+        # Clear any search highlights
+        if hasattr(self, 'search_tag_name'):
+            self.log_text.tag_remove(self.search_tag_name, 1.0, END)
+        if hasattr(self, 'current_match_tag_name'):
+            self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
+    
     def _toggle_debug_mode(self):
         """Toggle debug mode on/off."""
         self.debug_mode = self.debug_mode_var.get()
@@ -3952,20 +3989,14 @@ class BandcampDownloaderGUI:
                                        font=("Segoe UI", 8))
         self.search_count_label.grid(row=0, column=2, sticky=W, padx=(0, 4), pady=4)
         
-        # Next button
-        next_btn = Button(self.search_frame, text="Next", command=self._find_next,
-                         bg='#252526', fg='#D4D4D4', font=("Segoe UI", 8),
-                         relief='flat', borderwidth=1, highlightthickness=0,
-                         activebackground='#3E3E42', activeforeground='#FFFFFF',
-                         padx=8, pady=2, cursor='hand2')
+        # Next button - styled like Clear Log button
+        next_btn = ttk.Button(self.search_frame, text="Next", command=self._find_next,
+                              cursor='hand2', style='Small.TButton')
         next_btn.grid(row=0, column=3, sticky=W, padx=(0, 2), pady=4)
         
-        # Previous button
-        prev_btn = Button(self.search_frame, text="Previous", command=self._find_previous,
-                         bg='#252526', fg='#D4D4D4', font=("Segoe UI", 8),
-                         relief='flat', borderwidth=1, highlightthickness=0,
-                         activebackground='#3E3E42', activeforeground='#FFFFFF',
-                         padx=8, pady=2, cursor='hand2')
+        # Previous button - styled like Clear Log button
+        prev_btn = ttk.Button(self.search_frame, text="Previous", command=self._find_previous,
+                             cursor='hand2', style='Small.TButton')
         prev_btn.grid(row=0, column=4, sticky=W, padx=(0, 2), pady=4)
         
         # Close button (X)
@@ -6535,7 +6566,37 @@ class BandcampDownloaderGUI:
                             info = extract_ydl.extract_info(url, download=False)
                             if info:
                                 album_name = info.get("album") or info.get("title") or url
-                                artist_name = info.get("artist") or info.get("uploader") or info.get("creator") or "Unknown"
+                                
+                                # Try to get artist from various sources
+                                artist_name = (info.get("artist") or 
+                                             info.get("uploader") or 
+                                             info.get("creator") or 
+                                             None)
+                                
+                                # If not found, try getting from first track entry
+                                if not artist_name and "entries" in info and info["entries"]:
+                                    first_entry = info["entries"][0]
+                                    artist_name = (first_entry.get("artist") or 
+                                                 first_entry.get("uploader") or 
+                                                 first_entry.get("creator") or 
+                                                 None)
+                                
+                                # If still not found, try extracting from URL subdomain
+                                if not artist_name and "bandcamp.com" in url.lower():
+                                    try:
+                                        from urllib.parse import urlparse
+                                        parsed = urlparse(url)
+                                        hostname = parsed.hostname or ""
+                                        if ".bandcamp.com" in hostname:
+                                            subdomain = hostname.replace(".bandcamp.com", "")
+                                            artist_name = " ".join(word.capitalize() for word in subdomain.split("-"))
+                                    except Exception:
+                                        pass
+                                
+                                # Final fallback
+                                if not artist_name:
+                                    artist_name = "Unknown"
+                                
                                 track_count = len(info.get("entries", [])) if "entries" in info else 0
                                 album_metadata.append({
                                     "url": url,
