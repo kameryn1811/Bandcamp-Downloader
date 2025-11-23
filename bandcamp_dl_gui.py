@@ -214,6 +214,10 @@ class BandcampDownloaderGUI:
         # Debug mode flag (default: False)
         self.debug_mode = False
         
+        # Store all log messages for debug toggle functionality
+        self.log_messages = []  # List of tuples: (message, is_debug)
+        self.log_snapshot = None  # Store snapshot before clearing: (log_messages_copy, debug_mode_state, scroll_position)
+        
         # Store metadata for preview
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
         self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
@@ -245,6 +249,7 @@ class BandcampDownloaderGUI:
         self.current_match_index = -1  # Current match position
         self.search_tag_name = "search_match"  # Tag name for all matches (yellow)
         self.current_match_tag_name = "current_search_match"  # Tag name for current match (green)
+        self.debug_tag_name = "debug_message"  # Tag name for debug messages (for show/hide)
         
         # Check dependencies first
         if not self.check_dependencies():
@@ -600,7 +605,8 @@ class BandcampDownloaderGUI:
                 "create_playlist": self.create_playlist_var.get(),
                 "download_cover_art": self.download_cover_art_var.get(),
                 # download_discography is intentionally not saved - always defaults to off
-                "album_art_visible": self.album_art_visible
+                "album_art_visible": self.album_art_visible,
+                "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False
             }
         
         settings_file = self._get_settings_file()
@@ -1363,7 +1369,7 @@ class BandcampDownloaderGUI:
             command=self.cancel_download,
             state='disabled',
             style='Cancel.TButton',
-            cursor='hand2'
+            cursor='arrow'  # Regular cursor when disabled
         )
         self.cancel_btn.grid(row=6, column=0, columnspan=3, pady=15)
         self.cancel_btn.grid_remove()  # Hidden by default
@@ -1423,14 +1429,33 @@ class BandcampDownloaderGUI:
                  background=[('active', '#3E3E42'), ('pressed', '#1E1E1E')],  # hover_bg, bg_color
                  bordercolor=[('active', '#3E3E42'), ('pressed', '#3E3E42')])  # border_color
         
-        clear_log_btn = ttk.Button(
+        self.clear_log_btn = ttk.Button(
             self.log_frame,
             text="Clear Log",
             command=self._clear_log,
-            cursor='hand2',
-            style='Small.TButton'
+            cursor='arrow',  # Regular cursor when disabled
+            style='Small.TButton',
+            state='disabled'  # Disabled initially when log is empty
         )
-        clear_log_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(6, 2))
+        self.clear_log_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(6, 2))
+        
+        # Word wrap toggle checkbox (between Clear Log and Debug)
+        settings = self._load_settings()
+        word_wrap_default = settings.get("word_wrap", False)
+        self.word_wrap_var = BooleanVar(value=word_wrap_default)
+        word_wrap_toggle = Checkbutton(
+            self.log_frame,
+            text="Word wrap",
+            variable=self.word_wrap_var,
+            bg='#1E1E1E',
+            fg='#D4D4D4',
+            selectcolor='#252526',
+            activebackground='#1E1E1E',
+            activeforeground='#D4D4D4',
+            font=("Segoe UI", 8),
+            command=self._toggle_word_wrap
+        )
+        word_wrap_toggle.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(6, 2))
         
         # Debug toggle checkbox (right-aligned on same row as Status label)
         self.debug_mode_var = BooleanVar(value=False)
@@ -1446,27 +1471,31 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=self._toggle_debug_mode
         )
-        debug_toggle.grid(row=0, column=2, sticky=E, padx=6, pady=(6, 2))
+        debug_toggle.grid(row=0, column=3, sticky=E, padx=6, pady=(6, 2))
         
         # Configure column weights so controls stay on the right
         self.log_frame.columnconfigure(0, weight=1)
         self.log_frame.columnconfigure(1, weight=0)
         self.log_frame.columnconfigure(2, weight=0)
+        self.log_frame.columnconfigure(3, weight=0)
         
         # Inner frame for content (spans all columns to stay full width)
         # Search bar will be at the bottom (row=2), log_content at row=1
         log_content = Frame(self.log_frame, bg='#1E1E1E')
-        log_content.grid(row=1, column=0, columnspan=3, sticky=(W, E, N, S), padx=6, pady=(0, 6))
+        log_content.grid(row=1, column=0, columnspan=4, sticky=(W, E, N, S), padx=6, pady=(0, 6))
         self.log_frame.rowconfigure(1, weight=1)  # Log content row expands
         log_content.columnconfigure(0, weight=1)
         log_content.rowconfigure(0, weight=1)
+        
+        # Apply word wrap setting to log text widget
+        wrap_mode = WORD if word_wrap_default else 'none'
         
         self.log_text = scrolledtext.ScrolledText(
             log_content,
             height=6,
             width=55,
             font=("Consolas", 8),
-            wrap=WORD,
+            wrap=wrap_mode,
             bg='#1E1E1E',
             fg='#D4D4D4',
             insertbackground='#D4D4D4',
@@ -1484,6 +1513,9 @@ class BandcampDownloaderGUI:
         self.log_text.tag_config(self.search_tag_name, background='#FFD700', foreground='#000000')
         # Green for current/selected match
         self.log_text.tag_config(self.current_match_tag_name, background='#00FF00', foreground='#000000')
+        # Configure debug tag for hiding/showing debug messages (initially hidden since debug mode is off by default)
+        # Use color matching to hide text (more compatible than elide)
+        self.log_text.tag_config(self.debug_tag_name, foreground='#1E1E1E', background='#1E1E1E')  # Hidden by default (matches background)
         
         # Bind Ctrl+F globally to show search (works anywhere in the app)
         self.log_text.bind('<Button-1>', lambda e: self._on_log_click())  # Enable focus when clicking log
@@ -1615,7 +1647,7 @@ class BandcampDownloaderGUI:
         if not self.is_cancelling:
             self.is_cancelling = True
             self.log("Cancelling download...")
-            self.cancel_btn.config(state='disabled')
+            self.cancel_btn.config(state='disabled', cursor='arrow')  # Regular cursor when disabled
             
             # Stop progress bar animation immediately
             try:
@@ -3910,30 +3942,185 @@ class BandcampDownloaderGUI:
     
     def _clear_log(self):
         """Clear the status log."""
+        # Save snapshot before clearing (only if there's content to save)
+        if hasattr(self, 'log_messages') and self.log_messages:
+            # Save scroll position (get first visible line)
+            try:
+                scroll_position = self.log_text.index("@0,0")
+            except:
+                scroll_position = "1.0"
+            
+            # Save snapshot: (log_messages_copy, debug_mode_state, scroll_position)
+            self.log_snapshot = (self.log_messages.copy(), self.debug_mode, scroll_position)
+        else:
+            # Nothing to save, no undo available
+            self.log_snapshot = None
+        
         self.log_text.config(state='normal')
         self.log_text.delete(1.0, END)
         self.log_text.config(state='disabled')
+        
+        # Clear stored log messages
+        if hasattr(self, 'log_messages'):
+            self.log_messages = []
+        
         # Clear any search highlights
         if hasattr(self, 'search_tag_name'):
             self.log_text.tag_remove(self.search_tag_name, 1.0, END)
         if hasattr(self, 'current_match_tag_name'):
             self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
+        
+        # Change button to "Undo Clear" if snapshot was saved
+        if self.log_snapshot:
+            self.clear_log_btn.config(text="Undo Clear", command=self._undo_clear_log, state='normal', cursor='hand2')
+        else:
+            # No content to undo, keep button disabled
+            self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='disabled', cursor='arrow')
+    
+    def _undo_clear_log(self):
+        """Restore the log from snapshot after clearing."""
+        if not self.log_snapshot:
+            return
+        
+        log_messages_copy, saved_debug_mode, scroll_position = self.log_snapshot
+        
+        # Restore log_messages
+        self.log_messages = log_messages_copy
+        
+        # Rebuild log display (respecting current debug mode, not saved one)
+        self.log_text.config(state='normal')
+        try:
+            # Clear current content
+            self.log_text.delete(1.0, END)
+            
+            # Rebuild with filtered messages (using current debug mode)
+            for message, is_debug in self.log_messages:
+                if not is_debug or self.debug_mode:
+                    self.log_text.insert(END, message + "\n")
+            
+            # Restore scroll position
+            try:
+                self.log_text.see(scroll_position)
+            except:
+                # If exact position doesn't exist, try to scroll to end or approximate position
+                try:
+                    # Try to find a similar line number
+                    line_num = int(scroll_position.split('.')[0])
+                    if line_num <= len(self.log_messages):
+                        # Count visible lines up to that position
+                        visible_count = 0
+                        for i, (msg, is_debug) in enumerate(self.log_messages[:line_num], 1):
+                            if not is_debug or self.debug_mode:
+                                visible_count += 1
+                        if visible_count > 0:
+                            target_line = f"{visible_count}.0"
+                            self.log_text.see(target_line)
+                except:
+                    # Fallback: scroll to end
+                    self.log_text.see(END)
+        except Exception:
+            pass
+        self.log_text.config(state='disabled')
+        
+        # Reset button back to "Clear Log"
+        self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='normal', cursor='hand2')
+        
+        # Clear snapshot
+        self.log_snapshot = None
+    
+    def _toggle_word_wrap(self):
+        """Toggle word wrap for the status log."""
+        word_wrap_enabled = self.word_wrap_var.get()
+        
+        # Update the log text widget wrap setting
+        if word_wrap_enabled:
+            self.log_text.config(wrap=WORD)
+        else:
+            self.log_text.config(wrap='none')
+        
+        # Save the setting
+        settings = self._load_settings()
+        settings["word_wrap"] = word_wrap_enabled
+        self._save_settings(settings)
     
     def _toggle_debug_mode(self):
-        """Toggle debug mode on/off."""
+        """Toggle debug mode on/off and rebuild log to show/hide existing debug messages."""
         self.debug_mode = self.debug_mode_var.get()
+        
+        # Rebuild the log content based on debug mode
+        if hasattr(self, 'log_text') and hasattr(self, 'log_messages'):
+            self.log_text.config(state='normal')
+            try:
+                # Save current scroll position (get first visible line)
+                first_visible = self.log_text.index("@0,0")
+                
+                # Clear current content
+                self.log_text.delete(1.0, END)
+                
+                # Rebuild with filtered messages
+                for message, is_debug in self.log_messages:
+                    if not is_debug or self.debug_mode:
+                        self.log_text.insert(END, message + "\n")
+                
+                # Restore scroll position to the same line (if it still exists)
+                try:
+                    # Try to scroll to the same line index
+                    self.log_text.see(first_visible)
+                except:
+                    # If that line doesn't exist anymore (e.g., it was a debug line), 
+                    # try to maintain approximate position
+                    try:
+                        # Get approximate line number from saved position
+                        line_num = int(first_visible.split('.')[0])
+                        # Count visible lines before that position
+                        visible_count = 0
+                        for i, (msg, is_debug) in enumerate(self.log_messages[:line_num], 1):
+                            if not is_debug or self.debug_mode:
+                                visible_count += 1
+                        # Scroll to approximately the same position
+                        if visible_count > 0:
+                            target_line = f"{visible_count}.0"
+                            self.log_text.see(target_line)
+                    except:
+                        pass
+            except Exception:
+                pass
+            self.log_text.config(state='disabled')
     
     def log(self, message):
-        """Add message to log. Filters DEBUG messages if debug mode is disabled."""
-        # If message starts with "DEBUG:" and debug mode is off, skip it
-        if message.startswith("DEBUG:") and not self.debug_mode:
-            return
-        # Temporarily enable widget to insert text, then disable again (read-only)
-        self.log_text.config(state='normal')
-        self.log_text.insert(END, message + "\n")
-        self.log_text.see(END)
-        self.log_text.config(state='disabled')
-        self.root.update_idletasks()
+        """Add message to log. Stores messages for debug toggle functionality."""
+        # If undo is available, expire it (new log entry means user's chance to undo has passed)
+        if hasattr(self, 'log_snapshot') and self.log_snapshot:
+            self.log_snapshot = None
+            # Reset button back to "Clear Log" (only if button is enabled)
+            if hasattr(self, 'clear_log_btn'):
+                current_state = self.clear_log_btn.cget('state')
+                if current_state == 'normal':
+                    self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='normal', cursor='hand2')
+                else:
+                    # Button is disabled, just update text/command but keep disabled state and arrow cursor
+                    self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='disabled', cursor='arrow')
+        
+        # Check if message is a debug message
+        is_debug = message.startswith("DEBUG:")
+        
+        # Store the message
+        if not hasattr(self, 'log_messages'):
+            self.log_messages = []
+        self.log_messages.append((message, is_debug))
+        
+        # Enable clear button if it was disabled (first message added or after operations complete)
+        if hasattr(self, 'clear_log_btn') and self.clear_log_btn.cget('state') == 'disabled':
+            self.clear_log_btn.config(state='normal', cursor='hand2')
+        
+        # Only display if it's not a debug message, or if debug mode is on
+        if not is_debug or self.debug_mode:
+            # Temporarily enable widget to insert text, then disable again (read-only)
+            self.log_text.config(state='normal')
+            self.log_text.insert(END, message + "\n")
+            self.log_text.see(END)
+            self.log_text.config(state='disabled')
+            self.root.update_idletasks()
     
     def _on_log_click(self):
         """Handle click on log text to enable Ctrl+F."""
@@ -4565,9 +4752,19 @@ class BandcampDownloaderGUI:
         # Disable download button, show cancel button, and start progress
         self.download_btn.config(state='disabled')
         self.download_btn.grid_remove()
-        self.cancel_btn.config(state='normal')
+        self.cancel_btn.config(state='normal', cursor='hand2')  # Hand cursor when enabled
         self.cancel_btn.grid()
         self.is_cancelling = False
+        
+        # Disable clear log button during download operations
+        # Reset to "Clear Log" mode and ensure cursor is arrow when disabled
+        if hasattr(self, 'clear_log_btn'):
+            self.clear_log_btn.config(
+                text="Clear Log",
+                command=self._clear_log,
+                state='disabled',
+                cursor='arrow'
+            )
         
         # Start with indeterminate mode (will switch to determinate when we get progress)
         self.progress_bar.config(mode='indeterminate', maximum=100, value=0)
@@ -6804,15 +7001,31 @@ class BandcampDownloaderGUI:
         download_success = False
         
         for download_attempt in range(max_download_retries + 1):
+            # Check for cancellation before each attempt
+            if self.is_cancelling:
+                self.ydl_instance = None
+                return False
+            
             # Reset progress hook tracking for this attempt
             self.progress_hooks_called = False
             self.progress_hook_call_count = 0
             
             if download_attempt > 0:
+                # Check for cancellation before retry delay
+                if self.is_cancelling:
+                    self.ydl_instance = None
+                    return False
+                
                 # Wait before retry (exponential backoff)
                 retry_delay = 2.0 * download_attempt
                 self.root.after(0, lambda delay=retry_delay, attempt=download_attempt: self.log(f"DEBUG: Retrying download after {delay}s delay (attempt {attempt + 1}/{max_download_retries + 1})"))
                 time.sleep(retry_delay)
+                
+                # Check for cancellation after delay (user might have cancelled during wait)
+                if self.is_cancelling:
+                    self.ydl_instance = None
+                    return False
+                
                 # Create new yt-dlp instance for retry
                 ydl = yt_dlp.YoutubeDL(ydl_opts)
                 self.ydl_instance = ydl
@@ -6824,11 +7037,21 @@ class BandcampDownloaderGUI:
                 self.root.after(0, lambda: self.log(f"DEBUG: progress_hooks_called: {self.progress_hooks_called}, call_count: {self.progress_hook_call_count}"))
                 self.root.after(0, lambda: self.log(f"DEBUG: downloaded_files after download: {len(self.downloaded_files) if hasattr(self, 'downloaded_files') and self.downloaded_files else 0}"))
                 
+                # Check for cancellation after download attempt
+                if self.is_cancelling:
+                    self.ydl_instance = None
+                    return False
+                
                 # Check if progress hooks were called (indicates actual download activity)
                 if self.progress_hooks_called or len(self.downloaded_files) > 0:
                     download_success = True
                     break
                 elif download_attempt < max_download_retries:
+                    # Check for cancellation before retrying
+                    if self.is_cancelling:
+                        self.ydl_instance = None
+                        return False
+                    
                     # No progress hooks called and no files downloaded - retry
                     self.root.after(0, lambda: self.log(f"DEBUG: No progress hooks called, retrying download..."))
                     # Clear any partial state
@@ -6843,6 +7066,11 @@ class BandcampDownloaderGUI:
                 # User's Ctrl+C - re-raise
                 raise
             except yt_dlp.utils.DownloadError as e:
+                # Check for cancellation before retrying on error
+                if self.is_cancelling:
+                    self.ydl_instance = None
+                    return False
+                
                 # If this is a retry attempt, try again
                 if download_attempt < max_download_retries:
                     self.root.after(0, lambda err=str(e), attempt=download_attempt: self.log(f"DEBUG: Download error on attempt {attempt + 1}, will retry: {err[:100]}"))
@@ -7514,11 +7742,15 @@ class BandcampDownloaderGUI:
         # Restore buttons
         try:
             self.cancel_btn.grid_remove()
-            self.cancel_btn.config(state='disabled')
+            self.cancel_btn.config(state='disabled', cursor='arrow')  # Regular cursor when disabled
         except:
             pass
         self.download_btn.config(state='normal')
         self.download_btn.grid()
+        
+        # Enable clear log button after download/cancel operations complete (if there are log messages)
+        if hasattr(self, 'clear_log_btn') and hasattr(self, 'log_messages') and self.log_messages:
+            self.clear_log_btn.config(state='normal', cursor='hand2')  # Hand cursor when enabled
         
         if success:
             # Show 100% completion for main progress bar
