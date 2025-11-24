@@ -7866,7 +7866,7 @@ class BandcampDownloaderGUI:
         self.check_for_updates(show_if_no_update=False)
     
     def check_for_updates(self, show_if_no_update=True):
-        """Check for updates from GitHub releases.
+        """Check for updates by reading version directly from main branch.
         
         Args:
             show_if_no_update: If True, show message even if no update is available (for manual check)
@@ -7875,6 +7875,7 @@ class BandcampDownloaderGUI:
             try:
                 try:
                     import requests
+                    import re
                 except ImportError:
                     if show_if_no_update:
                         self.root.after(0, lambda: messagebox.showerror(
@@ -7889,72 +7890,45 @@ class BandcampDownloaderGUI:
                 repo_owner = "kameryn1811"
                 repo_name = "Bandcamp-Downloader"
                 
-                # Get all releases and filter for latest non-pre-release, non-draft
-                # This is more reliable than /releases/latest which might have edge cases
-                api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases"
-                response = requests.get(api_url, timeout=10)
+                # Get version directly from main branch file (not from releases)
+                # This way we don't depend on releases being created/updated
+                download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/bandcamp_dl_gui.py"
+                response = requests.get(download_url, timeout=10)
                 response.raise_for_status()
-                releases = response.json()
+                file_content = response.text
                 
-                # Find the latest non-pre-release, non-draft release with a valid version tag
-                # We need to compare all valid releases to find the highest version number,
-                # not just take the first one (which might not be the highest version)
-                valid_releases = []
-                for release in releases:
-                    # Skip pre-releases and drafts
-                    if release.get("prerelease", False) or release.get("draft", False):
-                        continue
-                    
-                    tag_name = release.get("tag_name", "")
-                    # Extract version from tag (e.g., "v1.1.3" -> "1.1.3")
-                    # Remove leading 'v' if present
-                    version_str = tag_name[1:] if tag_name.startswith("v") else tag_name
-                    
-                    # Validate it looks like a version number (contains at least one dot and digits)
-                    if version_str and '.' in version_str and any(c.isdigit() for c in version_str):
-                        valid_releases.append((version_str, release))
-                
-                if not valid_releases:
+                # Extract version from the file
+                version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', file_content)
+                if not version_match:
                     if show_if_no_update:
                         self.root.after(0, lambda: messagebox.showerror(
                             "Update Check Failed",
-                            "Could not find a valid release to check for updates."
+                            "Could not find version number in main branch file."
                         ))
                     return
                 
-                # Find the release with the highest version number
-                # Compare all valid releases to find the one with the maximum version
-                latest_version_str = valid_releases[0][0]
-                latest_release = valid_releases[0][1]
-                for version_str, release in valid_releases[1:]:
-                    if self._compare_versions(version_str, latest_version_str) > 0:
-                        latest_version_str = version_str
-                        latest_release = release
-                
-                # Extract version from tag for display
-                latest_tag = latest_release.get("tag_name", "")
-                latest_version = latest_version_str
-                
+                latest_version = version_match.group(1)
                 current_version = self.get_version()
+                
+                # Compare versions
+                comparison_result = self._compare_versions(latest_version, current_version)
                 
                 # Log what we found for debugging
                 if hasattr(self, 'log'):
                     self.root.after(0, lambda: self.log(
-                        f"Update check: Found latest release v{latest_version} (tag: {latest_tag}), "
-                        f"current version: v{current_version}"
+                        f"Update check: Found version v{latest_version} in main branch, "
+                        f"current version: v{current_version}, comparison result: {comparison_result} "
+                        f"({'newer' if comparison_result > 0 else 'same' if comparison_result == 0 else 'older'})"
                     ))
                 
-                # Compare versions
-                if self._compare_versions(latest_version, current_version) > 0:
+                if comparison_result > 0:
                     # Update available - show popup
-                    # Download from main branch instead of tag to ensure we get the latest code
-                    # Tags can point to old commits with outdated version numbers
-                    download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/bandcamp_dl_gui.py"
-                    release_notes = latest_release.get("body", "") if latest_release else ""
-                    
                     # Log the download URL for debugging
                     if hasattr(self, 'log'):
                         self.root.after(0, lambda: self.log(f"Update: Will download from: {download_url}"))
+                    
+                    # No release notes when getting from main branch, but that's okay
+                    release_notes = ""
                     
                     # Capture variables in lambda to avoid closure issues
                     self.root.after(0, lambda cv=current_version, lv=latest_version, du=download_url, rn=release_notes: 
