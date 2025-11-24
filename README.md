@@ -52,6 +52,12 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
    - Self-contained - No Python installation needed
    - Comes with ffmpeg.exe bundled
    - Single executable file
+
+**Supported URLs**
+
+* Album pages: `https://[artist].bandcamp.com/album/[album]`
+* Track pages: `https://[artist].bandcamp.com/track/[track]`
+* Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
    
 **Windows SmartScreen Warning**
 
