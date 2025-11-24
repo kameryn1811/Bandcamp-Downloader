@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.4.9"
+__version__ = "v1.1.5"
 
 import sys
 import subprocess
@@ -7806,47 +7806,25 @@ class BandcampDownloaderGUI:
                 # GitHub repository info
                 repo_owner = "kameryn1811"
                 repo_name = "Bandcamp-Downloader"
+                api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
                 
-                # Get version from main branch (more flexible than releases)
-                script_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/bandcamp_dl_gui.py"
-                response = requests.get(script_url, timeout=10)
+                # Get latest release from GitHub
+                response = requests.get(api_url, timeout=10)
                 response.raise_for_status()
-                script_content = response.text
+                release_data = response.json()
                 
-                # Extract version from script content
-                latest_version = None
-                for line in script_content.split('\n'):
-                    if '__version__' in line and '=' in line:
-                        # Extract version string (handles both "1.1.4" and __version__ = "1.1.4")
-                        version_str = line.split('=')[1].strip().strip('"').strip("'")
-                        latest_version = version_str
-                        break
-                
-                if not latest_version:
-                    raise ValueError("Could not find version in script")
+                # Extract version from tag (e.g., "v1.1.3" -> "1.1.3")
+                latest_tag = release_data.get("tag_name", "")
+                latest_version = latest_tag.lstrip("v") if latest_tag.startswith("v") else latest_tag
                 
                 current_version = self.get_version()
                 
                 # Compare versions (simple string comparison works for semantic versioning)
                 if self._compare_versions(latest_version, current_version) > 0:
                     # Update available - show popup
-                    # Try to get release notes from latest release if available
-                    release_notes = ""
-                    try:
-                        releases_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
-                        releases_response = requests.get(releases_url, timeout=5)
-                        if releases_response.status_code == 200:
-                            release_data = releases_response.json()
-                            # Check if this release matches our version
-                            release_tag = release_data.get("tag_name", "").lstrip("v")
-                            if release_tag == latest_version:
-                                release_notes = release_data.get("body", "")
-                    except:
-                        pass  # If we can't get release notes, continue without them
-                    
-                    download_url = script_url
+                    download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{latest_tag}/bandcamp_dl_gui.py"
                     self.root.after(0, lambda: self._show_update_popup(
-                        current_version, latest_version, download_url, release_notes
+                        current_version, latest_version, download_url, release_data.get("body", "")
                     ))
                 elif show_if_no_update:
                     # User manually checked, show "up to date" message
@@ -8067,11 +8045,17 @@ class BandcampDownloaderGUI:
     
     def _download_and_apply_update(self, download_url, new_version):
         """Download and apply the update."""
+        if self.is_launcher_mode:
+            # In launcher mode, don't try to update ourselves
+            # Just notify user to restart launcher
+            self._update_complete(new_version)
+            return
+        
         def download():
             try:
                 import requests
                 
-                # Show downloading message in log
+                # Show downloading message
                 self.root.after(0, lambda: self.log(f"Downloading update (v{new_version})..."))
                 
                 # Download new version
@@ -8111,18 +8095,29 @@ class BandcampDownloaderGUI:
         threading.Thread(target=download, daemon=True).start()
     
     def _update_complete(self, new_version):
-        """Handle update completion and restart the application."""
-        # Show brief success message
-        messagebox.showinfo(
-            "Update Complete",
-            f"Successfully updated to v{new_version}!\n\n"
-            f"The application will now restart."
-        )
-        
-        # Restart the application
-        python = sys.executable
-        script = Path(__file__).resolve()
-        os.execl(python, python, str(script))
+        """Handle update completion."""
+        if self.is_launcher_mode:
+            # Launcher mode: Just notify user to restart launcher
+            # Don't try to update ourselves - launcher handles that
+            messagebox.showinfo(
+                "Update Available",
+                f"Version v{new_version} is available!\n\n"
+                f"Please close this application and restart the launcher to get the update.\n\n"
+                f"The launcher will automatically download the latest version on next launch."
+            )
+            # Don't restart - let launcher handle updates
+        else:
+            # Standalone mode: Update and restart as normal
+            messagebox.showinfo(
+                "Update Complete",
+                f"Successfully updated to v{new_version}!\n\n"
+                f"The application will now restart."
+            )
+            
+            # Restart the application
+            python = sys.executable
+            script = Path(__file__).resolve()
+            os.execl(python, python, str(script))
     
     def _show_settings_menu(self, event):
         """Show settings menu when cog icon is clicked."""
