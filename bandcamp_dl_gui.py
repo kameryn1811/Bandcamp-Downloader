@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.4.1"
+__version__ = "1.1.4.2"
 
 import sys
 import subprocess
@@ -8045,17 +8045,11 @@ class BandcampDownloaderGUI:
     
     def _download_and_apply_update(self, download_url, new_version):
         """Download and apply the update."""
-        if self.is_launcher_mode:
-            # In launcher mode, don't try to update ourselves
-            # Just notify user to restart launcher
-            self._update_complete(new_version)
-            return
-        
         def download():
             try:
                 import requests
                 
-                # Show downloading message
+                # Show downloading message in log
                 self.root.after(0, lambda: self.log(f"Downloading update (v{new_version})..."))
                 
                 # Download new version
@@ -8095,29 +8089,18 @@ class BandcampDownloaderGUI:
         threading.Thread(target=download, daemon=True).start()
     
     def _update_complete(self, new_version):
-        """Handle update completion."""
-        if self.is_launcher_mode:
-            # Launcher mode: Just notify user to restart launcher
-            # Don't try to update ourselves - launcher handles that
-            messagebox.showinfo(
-                "Update Available",
-                f"Version v{new_version} is available!\n\n"
-                f"Please close this application and restart the launcher to get the update.\n\n"
-                f"The launcher will automatically download the latest version on next launch."
-            )
-            # Don't restart - let launcher handle updates
-        else:
-            # Standalone mode: Update and restart as normal
-            messagebox.showinfo(
-                "Update Complete",
-                f"Successfully updated to v{new_version}!\n\n"
-                f"The application will now restart."
-            )
-            
-            # Restart the application
-            python = sys.executable
-            script = Path(__file__).resolve()
-            os.execl(python, python, str(script))
+        """Handle update completion and restart the application."""
+        # Show brief success message
+        messagebox.showinfo(
+            "Update Complete",
+            f"Successfully updated to v{new_version}!\n\n"
+            f"The application will now restart."
+        )
+        
+        # Restart the application
+        python = sys.executable
+        script = Path(__file__).resolve()
+        os.execl(python, python, str(script))
     
     def _show_settings_menu(self, event):
         """Show settings menu when cog icon is clicked."""
