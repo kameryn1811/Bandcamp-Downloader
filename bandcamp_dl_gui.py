@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.4.9"
+__version__ = "1.1.5"
 
 import sys
 import subprocess
@@ -5563,15 +5563,33 @@ class BandcampDownloaderGUI:
             try:
                 base_path = Path(download_path)
                 if base_path.exists():
-                    # Find audio files - scan directory directly since files may have been renamed
-                    # (apply_track_numbering is called before this, so downloaded_files paths are stale)
+                    # Find audio files - only process files that were just downloaded
+                    # Use downloaded_files set if available, otherwise use timestamp-based filtering
                     audio_extensions = [".mp3", ".m4a", ".mp4", ".aac", ".flac", ".ogg", ".oga", ".wav"]
                     audio_files = []
                     
-                    # Always scan directory for original format (files may have been renamed)
-                    # This matches the behavior of MP3 format which also scans directly
-                    for ext in audio_extensions:
-                        audio_files.extend(base_path.rglob(f"*{ext}"))
+                    if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                        # Process only files that were tracked as downloaded (most reliable)
+                        for downloaded_file in self.downloaded_files:
+                            file_path = Path(downloaded_file)
+                            if file_path.exists() and file_path.suffix.lower() in audio_extensions:
+                                audio_files.append(file_path)
+                    elif hasattr(self, 'download_start_time') and self.download_start_time:
+                        # Fallback: use timestamp-based filtering (files modified after download started)
+                        import time
+                        time_threshold = self.download_start_time - 30  # 30 second buffer
+                        for ext in audio_extensions:
+                            for audio_file in base_path.rglob(f"*{ext}"):
+                                try:
+                                    file_mtime = audio_file.stat().st_mtime
+                                    if file_mtime >= time_threshold:
+                                        audio_files.append(audio_file)
+                                except (OSError, Exception):
+                                    continue
+                    else:
+                        # Last resort: find all audio files (shouldn't happen in normal operation)
+                        for ext in audio_extensions:
+                            audio_files.extend(base_path.rglob(f"*{ext}"))
                     
                     if audio_files:
                         self.root.after(0, lambda: self.log(f"Embedding cover art for {len(audio_files)} file(s)..."))
@@ -7159,6 +7177,12 @@ class BandcampDownloaderGUI:
             self.root.after(0, lambda: self.log("DEBUG: Download failed after all retry attempts (no progress hooks called)"))
             return False
         
+        # Check if download succeeded
+        if not download_success:
+            self.ydl_instance = None
+            self.root.after(0, lambda: self.log("DEBUG: Download failed after all retry attempts (no progress hooks called)"))
+            return False
+        
         # Clear instance after download
         self.ydl_instance = None
         
@@ -7807,46 +7831,62 @@ class BandcampDownloaderGUI:
                 repo_owner = "kameryn1811"
                 repo_name = "Bandcamp-Downloader"
                 
-                # Get version from main branch (more flexible than releases)
-                script_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/bandcamp_dl_gui.py"
-                response = requests.get(script_url, timeout=10)
+                # Get all releases and filter for latest non-pre-release, non-draft
+                # This is more reliable than /releases/latest which might have edge cases
+                api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases"
+                response = requests.get(api_url, timeout=10)
                 response.raise_for_status()
-                script_content = response.text
+                releases = response.json()
                 
-                # Extract version from script content
-                latest_version = None
-                for line in script_content.split('\n'):
-                    if '__version__' in line and '=' in line:
-                        # Extract version string (handles both "1.1.4" and __version__ = "1.1.4")
-                        version_str = line.split('=')[1].strip().strip('"').strip("'")
-                        latest_version = version_str
-                        break
+                # Find the latest non-pre-release, non-draft release with a valid version tag
+                # We need to compare all valid releases to find the highest version number,
+                # not just take the first one (which might not be the highest version)
+                valid_releases = []
+                for release in releases:
+                    # Skip pre-releases and drafts
+                    if release.get("prerelease", False) or release.get("draft", False):
+                        continue
+                    
+                    tag_name = release.get("tag_name", "")
+                    # Extract version from tag (e.g., "v1.1.3" -> "1.1.3")
+                    # Remove leading 'v' if present
+                    version_str = tag_name[1:] if tag_name.startswith("v") else tag_name
+                    
+                    # Validate it looks like a version number (contains at least one dot and digits)
+                    if version_str and '.' in version_str and any(c.isdigit() for c in version_str):
+                        valid_releases.append((version_str, release))
                 
-                if not latest_version:
-                    raise ValueError("Could not find version in script")
+                if not valid_releases:
+                    if show_if_no_update:
+                        self.root.after(0, lambda: messagebox.showerror(
+                            "Update Check Failed",
+                            "Could not find a valid release to check for updates."
+                        ))
+                    return
+                
+                # Find the release with the highest version number
+                # Compare all valid releases to find the one with the maximum version
+                latest_version_str = valid_releases[0][0]
+                latest_release = valid_releases[0][1]
+                for version_str, release in valid_releases[1:]:
+                    if self._compare_versions(version_str, latest_version_str) > 0:
+                        latest_version_str = version_str
+                        latest_release = release
+                
+                # Extract version from tag for display
+                latest_tag = latest_release.get("tag_name", "")
+                latest_version = latest_version_str
                 
                 current_version = self.get_version()
                 
-                # Compare versions (simple string comparison works for semantic versioning)
+                current_version = self.get_version()
+                
+                # Compare versions
                 if self._compare_versions(latest_version, current_version) > 0:
                     # Update available - show popup
-                    # Try to get release notes from latest release if available
-                    release_notes = ""
-                    try:
-                        releases_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
-                        releases_response = requests.get(releases_url, timeout=5)
-                        if releases_response.status_code == 200:
-                            release_data = releases_response.json()
-                            # Check if this release matches our version
-                            release_tag = release_data.get("tag_name", "").lstrip("v")
-                            if release_tag == latest_version:
-                                release_notes = release_data.get("body", "")
-                    except:
-                        pass  # If we can't get release notes, continue without them
-                    
-                    download_url = script_url
+                    download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{latest_tag}/bandcamp_dl_gui.py"
                     self.root.after(0, lambda: self._show_update_popup(
-                        current_version, latest_version, download_url, release_notes
+                        current_version, latest_version, download_url, latest_release.get("body", "")
                     ))
                 elif show_if_no_update:
                     # User manually checked, show "up to date" message
@@ -7904,174 +7944,41 @@ class BandcampDownloaderGUI:
             return 0
     
     def _show_update_popup(self, current_version, latest_version, download_url, release_notes=""):
-        """Show update available popup with full release notes."""
-        # Create custom dialog window
-        popup = Tk()
-        popup.title("Update Available")
-        popup.resizable(True, True)
-        popup.minsize(500, 400)
+        """Show update available popup."""
+        # Format release notes (first few lines)
+        notes_preview = ""
+        if release_notes:
+            lines = release_notes.split('\n')[:5]  # First 5 lines
+            notes_preview = "\n\n" + "\n".join(lines)
+            if len(release_notes.split('\n')) > 5:
+                notes_preview += "\n..."
         
-        # Center the window
-        popup.update_idletasks()
-        width = popup.winfo_width()
-        height = popup.winfo_height()
-        x = (popup.winfo_screenwidth() // 2) - (width // 2)
-        y = (popup.winfo_screenheight() // 2) - (height // 2)
-        popup.geometry(f"{width}x{height}+{x}+{y}")
-        
-        # Make it modal (blocks interaction with main window)
-        popup.transient(self.root)
-        popup.grab_set()
-        
-        # Apply dark mode styling
-        popup.configure(bg='#1E1E1E')
-        
-        # Main container
-        main_frame = Frame(popup, bg='#1E1E1E')
-        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
-        
-        # Header
-        header_frame = Frame(main_frame, bg='#1E1E1E')
-        header_frame.pack(fill=X, pady=(0, 10))
-        
-        title_label = Label(
-            header_frame,
-            text="Update Available!",
-            font=('Segoe UI', 14, 'bold'),
-            fg='#CCCCCC',
-            bg='#1E1E1E'
+        response = messagebox.askyesno(
+            "Update Available",
+            f"A new version is available!\n\n"
+            f"Current version: v{current_version}\n"
+            f"Latest version: v{latest_version}\n"
+            f"{notes_preview}\n\n"
+            f"Would you like to update now?\n\n"
+            f"(The app will download the update and restart)"
         )
-        title_label.pack(anchor=W)
         
-        version_label = Label(
-            header_frame,
-            text=f"Current: v{current_version} → Latest: v{latest_version}",
-            font=('Segoe UI', 10),
-            fg='#888888',
-            bg='#1E1E1E'
-        )
-        version_label.pack(anchor=W, pady=(5, 0))
-        
-        # Release notes section
-        notes_frame = Frame(main_frame, bg='#1E1E1E')
-        notes_frame.pack(fill=BOTH, expand=True, pady=(0, 10))
-        
-        notes_label = Label(
-            notes_frame,
-            text="Release Notes / Changelog:",
-            font=('Segoe UI', 10, 'bold'),
-            fg='#CCCCCC',
-            bg='#1E1E1E'
-        )
-        notes_label.pack(anchor=W, pady=(0, 5))
-        
-        # Scrollable text widget for release notes
-        notes_text_frame = Frame(notes_frame, bg='#2D2D2D', relief='flat', borderwidth=1)
-        notes_text_frame.pack(fill=BOTH, expand=True)
-        
-        notes_text = scrolledtext.ScrolledText(
-            notes_text_frame,
-            wrap=WORD,
-            font=('Segoe UI', 9),
-            bg='#2D2D2D',
-            fg='#CCCCCC',
-            insertbackground='#CCCCCC',
-            selectbackground='#3D3D3D',
-            selectforeground='#CCCCCC',
-            relief='flat',
-            borderwidth=0,
-            padx=10,
-            pady=10,
-            state='normal'
-        )
-        notes_text.pack(fill=BOTH, expand=True)
-        
-        # Insert release notes
-        if release_notes and release_notes.strip():
-            notes_text.insert(1.0, release_notes.strip())
-        else:
-            notes_text.insert(1.0, "No release notes available for this version.")
-        
-        # Make read-only
-        notes_text.config(state='disabled')
-        
-        # Buttons frame
-        buttons_frame = Frame(main_frame, bg='#1E1E1E')
-        buttons_frame.pack(fill=X, pady=(10, 0))
-        
-        # Info label
-        info_label = Label(
-            buttons_frame,
-            text="(The app will download the update and restart)",
-            font=('Segoe UI', 8),
-            fg='#666666',
-            bg='#1E1E1E'
-        )
-        info_label.pack(side=LEFT)
-        
-        # Buttons
-        button_frame = Frame(buttons_frame, bg='#1E1E1E')
-        button_frame.pack(side=RIGHT)
-        
-        def on_update():
-            popup.destroy()
+        if response:
             self._download_and_apply_update(download_url, latest_version)
-        
-        def on_cancel():
-            popup.destroy()
-        
-        update_btn = Button(
-            button_frame,
-            text="Update Now",
-            command=on_update,
-            font=('Segoe UI', 9),
-            bg='#2dacd5',
-            fg='#FFFFFF',
-            activebackground='#2599b8',
-            activeforeground='#FFFFFF',
-            relief='flat',
-            padx=20,
-            pady=5,
-            cursor='hand2'
-        )
-        update_btn.pack(side=LEFT, padx=(0, 10))
-        
-        cancel_btn = Button(
-            button_frame,
-            text="Later",
-            command=on_cancel,
-            font=('Segoe UI', 9),
-            bg='#3D3D3D',
-            fg='#CCCCCC',
-            activebackground='#4D4D4D',
-            activeforeground='#CCCCCC',
-            relief='flat',
-            padx=20,
-            pady=5,
-            cursor='hand2'
-        )
-        cancel_btn.pack(side=LEFT)
-        
-        # Focus on update button
-        popup.focus_set()
-        update_btn.focus_set()
-        
-        # Handle window close
-        def on_close():
-            popup.destroy()
-        popup.protocol("WM_DELETE_WINDOW", on_close)
-        
-        # Center and show
-        popup.update_idletasks()
-        popup.deiconify()
     
     def _download_and_apply_update(self, download_url, new_version):
         """Download and apply the update."""
+        if self.is_launcher_mode:
+            # In launcher mode, don't try to update ourselves
+            # Just notify user to restart launcher
+            self._update_complete(new_version)
+            return
+        
         def download():
             try:
                 import requests
                 
-                # Show downloading message in log
+                # Show downloading message
                 self.root.after(0, lambda: self.log(f"Downloading update (v{new_version})..."))
                 
                 # Download new version
@@ -8111,18 +8018,29 @@ class BandcampDownloaderGUI:
         threading.Thread(target=download, daemon=True).start()
     
     def _update_complete(self, new_version):
-        """Handle update completion and restart the application."""
-        # Show brief success message
-        messagebox.showinfo(
-            "Update Complete",
-            f"Successfully updated to v{new_version}!\n\n"
-            f"The application will now restart."
-        )
-        
-        # Restart the application
-        python = sys.executable
-        script = Path(__file__).resolve()
-        os.execl(python, python, str(script))
+        """Handle update completion."""
+        if self.is_launcher_mode:
+            # Launcher mode: Just notify user to restart launcher
+            # Don't try to update ourselves - launcher handles that
+            messagebox.showinfo(
+                "Update Available",
+                f"Version v{new_version} is available!\n\n"
+                f"Please close this application and restart the launcher to get the update.\n\n"
+                f"The launcher will automatically download the latest version on next launch."
+            )
+            # Don't restart - let launcher handle updates
+        else:
+            # Standalone mode: Update and restart as normal
+            messagebox.showinfo(
+                "Update Complete",
+                f"Successfully updated to v{new_version}!\n\n"
+                f"The application will now restart."
+            )
+            
+            # Restart the application
+            python = sys.executable
+            script = Path(__file__).resolve()
+            os.execl(python, python, str(script))
     
     def _show_settings_menu(self, event):
         """Show settings menu when cog icon is clicked."""
