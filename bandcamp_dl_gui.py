@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.4.4"
+__version__ = "1.1.4.9"
 
 import sys
 import subprocess
@@ -8119,56 +8119,10 @@ class BandcampDownloaderGUI:
             f"The application will now restart."
         )
         
-        # Get script path
+        # Restart the application
+        python = sys.executable
         script = Path(__file__).resolve()
-        
-        # Determine how to restart
-        # If running from launcher, sys.executable might be launcher.exe
-        # If running standalone, sys.executable is Python
-        python_exe = sys.executable
-        
-        # Check if we're running as a script (not frozen/launcher)
-        if not hasattr(sys, 'frozen') and python_exe.endswith('python.exe') or python_exe.endswith('pythonw.exe') or 'python' in python_exe.lower():
-            # Standalone Python mode - restart with Python
-            restart_cmd = [python_exe, str(script)]
-        else:
-            # Launcher mode or frozen - try to find Python or use current executable
-            # Try to find Python in PATH
-            try:
-                python_cmd = subprocess.check_output(['where', 'python'], shell=True, stderr=subprocess.DEVNULL).decode().strip().split('\n')[0]
-                restart_cmd = [python_cmd, str(script)]
-            except:
-                # Fallback: use current executable (launcher will handle it)
-                restart_cmd = [python_exe, str(script)]
-        
-        # Close the main window
-        self.root.quit()
-        self.root.destroy()
-        
-        # Small delay to ensure window closes and file handles are released
-        import time
-        time.sleep(0.3)
-        
-        # Restart using subprocess (more reliable than os.execl)
-        try:
-            # Use CREATE_NEW_CONSOLE on Windows to start in new process
-            creation_flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0
-            subprocess.Popen(restart_cmd, creationflags=creation_flags)
-            # Exit current process
-            sys.exit(0)
-        except Exception as e:
-            # Fallback to os.execl if subprocess fails
-            try:
-                os.execl(restart_cmd[0], *restart_cmd)
-            except:
-                # Last resort: just exit and let user restart manually
-                messagebox.showerror(
-                    "Restart Failed",
-                    f"Update completed, but automatic restart failed.\n\n"
-                    f"Please manually restart the application.\n\n"
-                    f"Error: {str(e)}"
-                )
-                sys.exit(0)
+        os.execl(python, python, str(script))
     
     def _show_settings_menu(self, event):
         """Show settings menu when cog icon is clicked."""
