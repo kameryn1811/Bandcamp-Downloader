@@ -5563,33 +5563,15 @@ class BandcampDownloaderGUI:
             try:
                 base_path = Path(download_path)
                 if base_path.exists():
-                    # Find audio files - only process files that were just downloaded
-                    # Use downloaded_files set if available, otherwise use timestamp-based filtering
+                    # Find audio files - scan directory directly since files may have been renamed
+                    # (apply_track_numbering is called before this, so downloaded_files paths are stale)
                     audio_extensions = [".mp3", ".m4a", ".mp4", ".aac", ".flac", ".ogg", ".oga", ".wav"]
                     audio_files = []
                     
-                    if hasattr(self, 'downloaded_files') and self.downloaded_files:
-                        # Process only files that were tracked as downloaded (most reliable)
-                        for downloaded_file in self.downloaded_files:
-                            file_path = Path(downloaded_file)
-                            if file_path.exists() and file_path.suffix.lower() in audio_extensions:
-                                audio_files.append(file_path)
-                    elif hasattr(self, 'download_start_time') and self.download_start_time:
-                        # Fallback: use timestamp-based filtering (files modified after download started)
-                        import time
-                        time_threshold = self.download_start_time - 30  # 30 second buffer
-                        for ext in audio_extensions:
-                            for audio_file in base_path.rglob(f"*{ext}"):
-                                try:
-                                    file_mtime = audio_file.stat().st_mtime
-                                    if file_mtime >= time_threshold:
-                                        audio_files.append(audio_file)
-                                except (OSError, Exception):
-                                    continue
-                    else:
-                        # Last resort: find all audio files (shouldn't happen in normal operation)
-                        for ext in audio_extensions:
-                            audio_files.extend(base_path.rglob(f"*{ext}"))
+                    # Always scan directory for original format (files may have been renamed)
+                    # This matches the behavior of MP3 format which also scans directly
+                    for ext in audio_extensions:
+                        audio_files.extend(base_path.rglob(f"*{ext}"))
                     
                     if audio_files:
                         self.root.after(0, lambda: self.log(f"Embedding cover art for {len(audio_files)} file(s)..."))
@@ -7177,12 +7159,6 @@ class BandcampDownloaderGUI:
             self.root.after(0, lambda: self.log("DEBUG: Download failed after all retry attempts (no progress hooks called)"))
             return False
         
-        # Check if download succeeded
-        if not download_success:
-            self.ydl_instance = None
-            self.root.after(0, lambda: self.log("DEBUG: Download failed after all retry attempts (no progress hooks called)"))
-            return False
-        
         # Clear instance after download
         self.ydl_instance = None
         
@@ -7906,27 +7882,166 @@ class BandcampDownloaderGUI:
             return 0
     
     def _show_update_popup(self, current_version, latest_version, download_url, release_notes=""):
-        """Show update available popup."""
-        # Format release notes (first few lines)
-        notes_preview = ""
-        if release_notes:
-            lines = release_notes.split('\n')[:5]  # First 5 lines
-            notes_preview = "\n\n" + "\n".join(lines)
-            if len(release_notes.split('\n')) > 5:
-                notes_preview += "\n..."
+        """Show update available popup with full release notes."""
+        # Create custom dialog window
+        popup = Tk()
+        popup.title("Update Available")
+        popup.resizable(True, True)
+        popup.minsize(500, 400)
         
-        response = messagebox.askyesno(
-            "Update Available",
-            f"A new version is available!\n\n"
-            f"Current version: v{current_version}\n"
-            f"Latest version: v{latest_version}\n"
-            f"{notes_preview}\n\n"
-            f"Would you like to update now?\n\n"
-            f"(The app will download the update and restart)"
+        # Center the window
+        popup.update_idletasks()
+        width = popup.winfo_width()
+        height = popup.winfo_height()
+        x = (popup.winfo_screenwidth() // 2) - (width // 2)
+        y = (popup.winfo_screenheight() // 2) - (height // 2)
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+        
+        # Make it modal (blocks interaction with main window)
+        popup.transient(self.root)
+        popup.grab_set()
+        
+        # Apply dark mode styling
+        popup.configure(bg='#1E1E1E')
+        
+        # Main container
+        main_frame = Frame(popup, bg='#1E1E1E')
+        main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        
+        # Header
+        header_frame = Frame(main_frame, bg='#1E1E1E')
+        header_frame.pack(fill=X, pady=(0, 10))
+        
+        title_label = Label(
+            header_frame,
+            text="Update Available!",
+            font=('Segoe UI', 14, 'bold'),
+            fg='#CCCCCC',
+            bg='#1E1E1E'
         )
+        title_label.pack(anchor=W)
         
-        if response:
+        version_label = Label(
+            header_frame,
+            text=f"Current: v{current_version} → Latest: v{latest_version}",
+            font=('Segoe UI', 10),
+            fg='#888888',
+            bg='#1E1E1E'
+        )
+        version_label.pack(anchor=W, pady=(5, 0))
+        
+        # Release notes section
+        notes_frame = Frame(main_frame, bg='#1E1E1E')
+        notes_frame.pack(fill=BOTH, expand=True, pady=(0, 10))
+        
+        notes_label = Label(
+            notes_frame,
+            text="Release Notes / Changelog:",
+            font=('Segoe UI', 10, 'bold'),
+            fg='#CCCCCC',
+            bg='#1E1E1E'
+        )
+        notes_label.pack(anchor=W, pady=(0, 5))
+        
+        # Scrollable text widget for release notes
+        notes_text_frame = Frame(notes_frame, bg='#2D2D2D', relief='flat', borderwidth=1)
+        notes_text_frame.pack(fill=BOTH, expand=True)
+        
+        notes_text = scrolledtext.ScrolledText(
+            notes_text_frame,
+            wrap=WORD,
+            font=('Segoe UI', 9),
+            bg='#2D2D2D',
+            fg='#CCCCCC',
+            insertbackground='#CCCCCC',
+            selectbackground='#3D3D3D',
+            selectforeground='#CCCCCC',
+            relief='flat',
+            borderwidth=0,
+            padx=10,
+            pady=10,
+            state='normal'
+        )
+        notes_text.pack(fill=BOTH, expand=True)
+        
+        # Insert release notes
+        if release_notes and release_notes.strip():
+            notes_text.insert(1.0, release_notes.strip())
+        else:
+            notes_text.insert(1.0, "No release notes available for this version.")
+        
+        # Make read-only
+        notes_text.config(state='disabled')
+        
+        # Buttons frame
+        buttons_frame = Frame(main_frame, bg='#1E1E1E')
+        buttons_frame.pack(fill=X, pady=(10, 0))
+        
+        # Info label
+        info_label = Label(
+            buttons_frame,
+            text="(The app will download the update and restart)",
+            font=('Segoe UI', 8),
+            fg='#666666',
+            bg='#1E1E1E'
+        )
+        info_label.pack(side=LEFT)
+        
+        # Buttons
+        button_frame = Frame(buttons_frame, bg='#1E1E1E')
+        button_frame.pack(side=RIGHT)
+        
+        def on_update():
+            popup.destroy()
             self._download_and_apply_update(download_url, latest_version)
+        
+        def on_cancel():
+            popup.destroy()
+        
+        update_btn = Button(
+            button_frame,
+            text="Update Now",
+            command=on_update,
+            font=('Segoe UI', 9),
+            bg='#2dacd5',
+            fg='#FFFFFF',
+            activebackground='#2599b8',
+            activeforeground='#FFFFFF',
+            relief='flat',
+            padx=20,
+            pady=5,
+            cursor='hand2'
+        )
+        update_btn.pack(side=LEFT, padx=(0, 10))
+        
+        cancel_btn = Button(
+            button_frame,
+            text="Later",
+            command=on_cancel,
+            font=('Segoe UI', 9),
+            bg='#3D3D3D',
+            fg='#CCCCCC',
+            activebackground='#4D4D4D',
+            activeforeground='#CCCCCC',
+            relief='flat',
+            padx=20,
+            pady=5,
+            cursor='hand2'
+        )
+        cancel_btn.pack(side=LEFT)
+        
+        # Focus on update button
+        popup.focus_set()
+        update_btn.focus_set()
+        
+        # Handle window close
+        def on_close():
+            popup.destroy()
+        popup.protocol("WM_DELETE_WINDOW", on_close)
+        
+        # Center and show
+        popup.update_idletasks()
+        popup.deiconify()
     
     def _download_and_apply_update(self, download_url, new_version):
         """Download and apply the update."""
