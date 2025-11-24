@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 
 import sys
 import subprocess
@@ -206,6 +206,9 @@ class BandcampDownloaderGUI:
         # Detect if running from launcher.exe
         self.is_launcher_mode = self._is_launcher_mode()
         
+        # Check for launcher update status (will log after UI is set up)
+        self.pending_update_status = self._check_launcher_update_status()
+        
         # Variables
         self.url_var = StringVar()
         self.path_var = StringVar()
@@ -310,6 +313,10 @@ class BandcampDownloaderGUI:
         
         # Bind to window resize events to update expand/collapse button state
         self.root.bind('<Configure>', self._on_window_configure)
+        
+        # Check for launcher update status and log it (after UI is ready)
+        if self.pending_update_status:
+            self.root.after(100, lambda: self._log_launcher_update_status())
         
         # Check for updates in background after UI is ready (non-blocking) - only if auto-check is enabled
         if self.auto_check_updates_var.get():
@@ -7803,6 +7810,57 @@ class BandcampDownloaderGUI:
         
         return False
     
+    def _check_launcher_update_status(self):
+        """Check for launcher update status file.
+        
+        Returns:
+            List of status messages if found, None otherwise
+        """
+        if not self.is_launcher_mode:
+            return None
+        
+        try:
+            update_status_file = self.script_dir / "update_status.json"
+            if update_status_file.exists():
+                with open(update_status_file, 'r', encoding='utf-8') as f:
+                    status = json.load(f)
+                    return status
+        except Exception:
+            pass
+        
+        return None
+    
+    def _log_launcher_update_status(self):
+        """Log launcher update status to the GUI log."""
+        if not self.pending_update_status:
+            return
+        
+        try:
+            status = self.pending_update_status
+            messages = status.get("messages", [])
+            
+            if messages:
+                # Log all messages
+                for msg_data in messages:
+                    message = msg_data.get("message", "")
+                    version = msg_data.get("version")
+                    
+                    if message:
+                        if version:
+                            self.log(f"{message} (v{version})")
+                        else:
+                            self.log(message)
+            
+            # Clear the status file after logging
+            update_status_file = self.script_dir / "update_status.json"
+            if update_status_file.exists():
+                update_status_file.unlink()
+            
+            # Clear pending status
+            self.pending_update_status = None
+        except Exception:
+            pass
+    
     def _check_for_updates_background(self):
         """Check for updates in background (non-blocking, no popup if up to date)."""
         self.check_for_updates(show_if_no_update=False)
@@ -7879,15 +7937,28 @@ class BandcampDownloaderGUI:
                 
                 current_version = self.get_version()
                 
-                current_version = self.get_version()
+                # Log what we found for debugging
+                if hasattr(self, 'log'):
+                    self.root.after(0, lambda: self.log(
+                        f"Update check: Found latest release v{latest_version} (tag: {latest_tag}), "
+                        f"current version: v{current_version}"
+                    ))
                 
                 # Compare versions
                 if self._compare_versions(latest_version, current_version) > 0:
                     # Update available - show popup
-                    download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{latest_tag}/bandcamp_dl_gui.py"
-                    self.root.after(0, lambda: self._show_update_popup(
-                        current_version, latest_version, download_url, latest_release.get("body", "")
-                    ))
+                    # Download from main branch instead of tag to ensure we get the latest code
+                    # Tags can point to old commits with outdated version numbers
+                    download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/bandcamp_dl_gui.py"
+                    release_notes = latest_release.get("body", "") if latest_release else ""
+                    
+                    # Log the download URL for debugging
+                    if hasattr(self, 'log'):
+                        self.root.after(0, lambda: self.log(f"Update: Will download from: {download_url}"))
+                    
+                    # Capture variables in lambda to avoid closure issues
+                    self.root.after(0, lambda cv=current_version, lv=latest_version, du=download_url, rn=release_notes: 
+                        self._show_update_popup(cv, lv, du, rn))
                 elif show_if_no_update:
                     # User manually checked, show "up to date" message
                     self.root.after(0, lambda: messagebox.showinfo(
@@ -7945,26 +8016,56 @@ class BandcampDownloaderGUI:
     
     def _show_update_popup(self, current_version, latest_version, download_url, release_notes=""):
         """Show update available popup."""
+        # Validate inputs
+        if not current_version or not latest_version:
+            self.log(f"ERROR: Invalid version info - current: {current_version}, latest: {latest_version}")
+            messagebox.showerror(
+                "Update Error",
+                f"Invalid version information detected.\n\n"
+                f"Current: {current_version}\n"
+                f"Latest: {latest_version}\n\n"
+                f"Please check for updates manually."
+            )
+            return
+        
+        if not download_url:
+            self.log(f"ERROR: No download URL provided")
+            messagebox.showerror(
+                "Update Error",
+                "No download URL available. Please download manually from GitHub."
+            )
+            return
+        
         # Format release notes (first few lines)
         notes_preview = ""
-        if release_notes:
-            lines = release_notes.split('\n')[:5]  # First 5 lines
+        if release_notes and release_notes.strip():
+            lines = release_notes.strip().split('\n')[:5]  # First 5 lines
             notes_preview = "\n\n" + "\n".join(lines)
-            if len(release_notes.split('\n')) > 5:
+            if len(release_notes.strip().split('\n')) > 5:
                 notes_preview += "\n..."
         
-        response = messagebox.askyesno(
-            "Update Available",
+        # Build message
+        message = (
             f"A new version is available!\n\n"
             f"Current version: v{current_version}\n"
-            f"Latest version: v{latest_version}\n"
-            f"{notes_preview}\n\n"
-            f"Would you like to update now?\n\n"
-            f"(The app will download the update and restart)"
+            f"Latest version: v{latest_version}"
         )
+        
+        if notes_preview:
+            message += notes_preview
+        
+        message += (
+            f"\n\nWould you like to update now?\n\n"
+        )
+        
+        response = messagebox.askyesno("Update Available", message)
         
         if response:
             self._download_and_apply_update(download_url, latest_version)
+        elif self.is_launcher_mode:
+            # In launcher mode, update was already applied by launcher before GUI started
+            # If user says "No", restore from backup
+            self._restore_from_backup_if_exists(current_version, latest_version)
     
     def _download_and_apply_update(self, download_url, new_version):
         """Download and apply the update."""
@@ -7979,7 +8080,7 @@ class BandcampDownloaderGUI:
                 import requests
                 
                 # Show downloading message
-                self.root.after(0, lambda: self.log(f"Downloading update (v{new_version})..."))
+                self.root.after(0, lambda: self.log(f"Downloading update (v{new_version}) from: {download_url}"))
                 
                 # Download new version
                 response = requests.get(download_url, timeout=30)
@@ -7989,6 +8090,36 @@ class BandcampDownloaderGUI:
                 # Verify it's a valid Python script (basic check)
                 if "BandcampDownloaderGUI" not in new_script_content:
                     raise ValueError("Downloaded file doesn't appear to be a valid script")
+                
+                # Verify the downloaded file's version matches or exceeds what we expect
+                import re
+                version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', new_script_content)
+                if version_match:
+                    downloaded_version = version_match.group(1)
+                    # Log what we found
+                    self.root.after(0, lambda: self.log(f"Downloaded file version: {downloaded_version}, Expected: {new_version}"))
+                    # The downloaded version should be >= the latest version we detected
+                    if self._compare_versions(downloaded_version, new_version) < 0:
+                        error_msg = (
+                            f"Downloaded file version ({downloaded_version}) is older than expected ({new_version}). "
+                            f"This may indicate the file hasn't been updated yet. Please try again later or download manually."
+                        )
+                        self.root.after(0, lambda: self.log(f"ERROR: {error_msg}"))
+                        raise ValueError(error_msg)
+                    # Also check if it's the same as current (which would be weird but possible)
+                    current_ver = self.get_version()
+                    if downloaded_version == current_ver and self._compare_versions(downloaded_version, new_version) < 0:
+                        error_msg = (
+                            f"Downloaded version ({downloaded_version}) matches current version, but we expected {new_version}. "
+                            f"Please check the download URL or try again later."
+                        )
+                        self.root.after(0, lambda: self.log(f"ERROR: {error_msg}"))
+                        raise ValueError(error_msg)
+                else:
+                    # If we can't find version, this is a problem - don't proceed
+                    error_msg = "Could not find version number in downloaded file. This may not be the correct file."
+                    self.root.after(0, lambda: self.log(f"ERROR: {error_msg}"))
+                    raise ValueError(error_msg)
                 
                 # Get current script path
                 current_script_path = Path(__file__).resolve()
@@ -8000,8 +8131,33 @@ class BandcampDownloaderGUI:
                     shutil.copy2(current_script_path, backup_path)
                 
                 # Write new version
-                with open(current_script_path, 'w', encoding='utf-8') as f:
+                # Use a temporary file first, then rename to ensure atomic write
+                temp_file = current_script_path.with_suffix('.py.tmp')
+                with open(temp_file, 'w', encoding='utf-8') as f:
                     f.write(new_script_content)
+                
+                # Verify the temp file has the correct version before replacing
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    temp_content = f.read()
+                    temp_version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', temp_content)
+                    if temp_version_match:
+                        temp_version = temp_version_match.group(1)
+                        if temp_version != downloaded_version:
+                            raise ValueError(f"Temp file version mismatch: expected {downloaded_version}, got {temp_version}")
+                
+                # Now replace the original file atomically
+                if current_script_path.exists():
+                    current_script_path.unlink()  # Delete old file
+                temp_file.replace(current_script_path)  # Rename temp to final
+                
+                # Verify the final file one more time
+                with open(current_script_path, 'r', encoding='utf-8') as f:
+                    final_content = f.read()
+                    final_version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', final_content)
+                    if final_version_match:
+                        final_version = final_version_match.group(1)
+                        if final_version != downloaded_version:
+                            raise ValueError(f"Final file version mismatch: expected {downloaded_version}, got {final_version}")
                 
                 # Success - show message and restart
                 self.root.after(0, lambda: self._update_complete(new_version))
@@ -8017,30 +8173,87 @@ class BandcampDownloaderGUI:
         # Run download in background thread
         threading.Thread(target=download, daemon=True).start()
     
+    def _restore_from_backup_if_exists(self, current_version, latest_version):
+        """Restore from backup if user declined update in launcher mode.
+        
+        In launcher mode, the launcher updates the script before launching the GUI.
+        If the user declines the update, we restore the previous version from backup.
+        """
+        if not self.is_launcher_mode:
+            return
+        
+        try:
+            current_script_path = Path(__file__).resolve()
+            backup_path = current_script_path.with_suffix('.py.backup')
+            
+            if not backup_path.exists():
+                # No backup found, can't restore
+                self.log("No backup file found to restore from.")
+                return
+            
+            # Verify backup file and restore it
+            # In launcher mode, the file on disk was already updated by launcher
+            # But we're still running the old code, so current_version is what we're running (old version)
+            # The backup contains the version that was on disk before launcher updated it
+            # We want to restore the backup to revert the launcher's update
+            import re
+            with open(backup_path, 'r', encoding='utf-8') as f:
+                backup_content = f.read()
+                backup_version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', backup_content)
+                
+                if backup_version_match:
+                    backup_version = backup_version_match.group(1)
+                    # Check what version is actually in the current file on disk
+                    with open(current_script_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        file_version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', file_content)
+                        file_version = file_version_match.group(1) if file_version_match else None
+                    
+                    # If file on disk has newer version than backup, we can safely restore
+                    # Or if versions match (backup = what we're running), that's also safe to restore
+                    if file_version and self._compare_versions(file_version, backup_version) > 0:
+                        # File on disk is newer than backup - safe to restore
+                        import shutil
+                        shutil.copy2(backup_path, current_script_path)
+                        self.log(f"Restored previous version v{backup_version} from backup (update declined).")
+                    elif backup_version == current_version:
+                        # Backup matches what we're running - safe to restore (ensures file matches running code)
+                        import shutil
+                        shutil.copy2(backup_path, current_script_path)
+                        self.log(f"Restored version v{backup_version} from backup to match running version (update declined).")
+                    else:
+                        # File version is same or older than backup - something unexpected, don't restore
+                        self.log(f"Cannot restore: File version ({file_version}) is not newer than backup ({backup_version}).")
+                else:
+                    self.log("Could not verify backup file version. Cannot restore safely.")
+        except Exception as e:
+            self.log(f"Error restoring from backup: {e}")
+            messagebox.showerror(
+                "Restore Failed",
+                f"Failed to restore previous version from backup.\n\n"
+                f"Error: {str(e)}\n\n"
+                f"You may need to manually restore or reinstall the previous version."
+            )
+    
     def _update_complete(self, new_version):
         """Handle update completion."""
         if self.is_launcher_mode:
             # Launcher mode: Just notify user to restart launcher
             # Don't try to update ourselves - launcher handles that
             messagebox.showinfo(
-                "Update Available",
-                f"Version v{new_version} is available!\n\n"
-                f"Please close this application and restart the launcher to get the update.\n\n"
-                f"The launcher will automatically download the latest version on next launch."
+                "Update Installed",
+                f"Version v{new_version} has been installed!\n\n"
+                f"Please close this application and reopen it to launch version v{new_version}.\n\n"
             )
             # Don't restart - let launcher handle updates
         else:
-            # Standalone mode: Update and restart as normal
+            # Standalone mode: Update complete, ask user to restart
             messagebox.showinfo(
                 "Update Complete",
                 f"Successfully updated to v{new_version}!\n\n"
-                f"The application will now restart."
+                f"Please close this application and restart it to use the new version."
             )
-            
-            # Restart the application
-            python = sys.executable
-            script = Path(__file__).resolve()
-            os.execl(python, python, str(script))
+            # Don't auto-restart - let user restart manually (same behavior as launcher)
     
     def _show_settings_menu(self, event):
         """Show settings menu when cog icon is clicked."""
