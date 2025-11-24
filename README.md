@@ -2,7 +2,7 @@
 
 # <img src="images/icon-title.png" width="32" height="32" alt="Icon"> Bandcamp Downloader GUI
 
-[![Download](images/download-button.png)](https://github.com/kameryn1811/Bandcamp-Downloader/releases/latest)
+[![Download](images/download-button.png)](https://github.com/kameryn1811/Bandcamp-Downloader/releases/download/Launcher/BandcampDownloader.exe)
 
 </div>
 
@@ -43,7 +43,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 **Installation**
 
-1. Download [BandcampDownloader.exe]([https://github.com/kameryn1811/Bandcamp-Downloader/releases/latest](https://github.com/kameryn1811/Bandcamp-Downloader/releases/download/Launcher/BandcampDownloader.exe)) and run it! (comes with everything you need bundled in)
+1. Download [BandcampDownloader.exe]([https://github.com/kameryn1811/Bandcamp-Downloader/releases/download/Launcher/BandcampDownloader.exe)) and run it! (comes with everything you need bundled in)
 2. Profit!
 3. Running the launcher automatically:
    - Downloads the latest `bandcamp_dl_gui.py` script from GitHub
