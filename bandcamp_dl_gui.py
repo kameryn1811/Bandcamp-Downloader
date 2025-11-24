@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 
 import sys
 import subprocess
@@ -39,7 +39,7 @@ import time
 import json
 from pathlib import Path
 from tkinter import (
-    Tk, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, END, WORD, BOTH,
+    Tk, Toplevel, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, LEFT, RIGHT, X, Y, END, WORD, BOTH,
     Frame, Label, Canvas, Checkbutton, Menu, Entry, Button
 )
 
@@ -212,10 +212,16 @@ class BandcampDownloaderGUI:
         # Variables
         self.url_var = StringVar()
         self.path_var = StringVar()
-        # Initialize with numeric value, will be converted to display value in setup_ui
-        saved_choice = self.get_default_preference()
-        # Convert to display value immediately
-        display_value = self.FOLDER_STRUCTURES.get(saved_choice, self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE])
+        # Initialize with saved preference (may be standard or custom)
+        settings = self._load_settings()
+        saved_structure = settings.get("folder_structure", self.DEFAULT_STRUCTURE)
+        # Check if it's a standard structure
+        if saved_structure in ["1", "2", "3", "4", "5"]:
+            display_value = self.FOLDER_STRUCTURES.get(saved_structure, self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE])
+        else:
+            # It's a custom structure (formatted string)
+            # Try to find it in custom_structures (will be loaded later, but check if it exists)
+            display_value = saved_structure  # Use the formatted string directly
         self.folder_structure_var = StringVar(value=display_value)
         self.format_var = StringVar(value=self.load_saved_format())
         self.numbering_var = StringVar(value=self.load_saved_numbering())
@@ -230,6 +236,9 @@ class BandcampDownloaderGUI:
         self.url_entry_widget = None  # Store reference to Entry widget
         self.url_text_widget = None  # Store reference to ScrolledText widget
         self.url_container_frame = None  # Container frame for URL widgets
+        
+        # Custom folder structures
+        self.custom_structures = self._load_custom_structures()  # List of lists: [["Artist", "Year", "Album"], ...]
         
         # Content history for undo/redo functionality (tracks content state, not just pastes)
         self.content_history = []  # List of content states (full field content at each change)
@@ -282,9 +291,10 @@ class BandcampDownloaderGUI:
             return
         
         self.setup_dark_mode()
+        # Load album art state before setting up UI so eye icon can be positioned correctly
+        self.load_saved_album_art_state()
         self.setup_ui()
         self.load_saved_path()
-        self.load_saved_album_art_state()
         self.update_preview()
         # Initialize URL count and button text
         self.root.after(100, self._update_url_count_and_button)
@@ -637,8 +647,14 @@ class BandcampDownloaderGUI:
         """Save all settings to settings.json file."""
         if settings is None:
             # Get current settings from UI
+            structure_choice = self._extract_structure_choice(self.folder_structure_var.get()) or self.DEFAULT_STRUCTURE
+            # Format custom structures as string, keep standard as key
+            if isinstance(structure_choice, list):
+                folder_structure = self._format_custom_structure(structure_choice)
+            else:
+                folder_structure = structure_choice
             settings = {
-                "folder_structure": self._extract_structure_choice(self.folder_structure_var.get()) or self.DEFAULT_STRUCTURE,
+                "folder_structure": folder_structure,
                 "download_path": self.path_var.get(),
                 "audio_format": self.format_var.get(),
                 "track_numbering": self.numbering_var.get(),
@@ -648,7 +664,8 @@ class BandcampDownloaderGUI:
                 # download_discography is intentionally not saved - always defaults to off
                 "album_art_visible": self.album_art_visible,
                 "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False,
-                "auto_check_updates": self.auto_check_updates_var.get() if hasattr(self, 'auto_check_updates_var') else True
+                "auto_check_updates": self.auto_check_updates_var.get() if hasattr(self, 'auto_check_updates_var') else True,
+                "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else [])
             }
         
         settings_file = self._get_settings_file()
@@ -664,12 +681,101 @@ class BandcampDownloaderGUI:
         folder_structure = settings.get("folder_structure", self.DEFAULT_STRUCTURE)
         if folder_structure in ["1", "2", "3", "4", "5"]:
             return folder_structure
+        # Check if it's a custom structure (saved as formatted string)
+        # We'll handle this in update_structure_display
         return self.DEFAULT_STRUCTURE
     
     def save_default_preference(self, choice):
         """Save folder structure preference."""
-        self._save_settings()
+        # If choice is a list (custom structure), save as formatted string
+        # Otherwise save as key
+        if isinstance(choice, list):
+            # Save the formatted string
+            formatted = self._format_custom_structure(choice)
+            settings = self._load_settings()
+            settings["folder_structure"] = formatted
+            self._save_settings(settings)
+        else:
+            # Standard structure - save the key
+            self._save_settings()
         return True
+    
+    def _load_custom_structures(self):
+        """Load saved custom folder structures from settings."""
+        settings = self._load_settings()
+        custom_structures = settings.get("custom_structures", [])
+        # Validate: ensure it's a list of lists
+        if isinstance(custom_structures, list):
+            # Filter out invalid entries
+            valid_structures = []
+            for structure in custom_structures:
+                if isinstance(structure, list) and len(structure) > 0:
+                    # Validate each item is a valid option
+                    valid = True
+                    for item in structure:
+                        if item not in ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]:
+                            valid = False
+                            break
+                    if valid:
+                        valid_structures.append(structure)
+            return valid_structures
+        return []
+    
+    def _save_custom_structures(self):
+        """Save custom folder structures to settings."""
+        self._save_settings()
+    
+    def _format_custom_structure(self, structure):
+        """Format a custom structure list as display string (e.g., ["Artist", "Year", "Album"] -> "Artist / Year / Album")."""
+        if not structure:
+            return ""
+        # Filter out "None..." entries
+        filtered = [item for item in structure if item and item != "None..."]
+        if not filtered:
+            return ""
+        return " / ".join(filtered)
+    
+    def _get_all_structure_options(self):
+        """Get all folder structure options including custom structures."""
+        # Start with standard options
+        options = list(self.FOLDER_STRUCTURES.values())
+        # Add custom structures (if they exist)
+        if hasattr(self, 'custom_structures') and self.custom_structures:
+            for structure in self.custom_structures:
+                formatted = self._format_custom_structure(structure)
+                if formatted and formatted not in options:
+                    options.append(formatted)
+        return options
+    
+    def _update_structure_dropdown(self):
+        """Update the structure dropdown with current custom structures."""
+        if not hasattr(self, 'structure_combo'):
+            return
+        new_options = self._get_all_structure_options()
+        self.structure_combo['values'] = new_options
+        self.structure_display_values = new_options
+        # Update manage button state
+        if hasattr(self, 'manage_btn'):
+            has_custom = hasattr(self, 'custom_structures') and self.custom_structures
+            if has_custom:
+                self.manage_btn.config(fg='#808080', cursor='hand2')
+                # Rebind events if they don't exist
+                if not hasattr(self.manage_btn, '_bound'):
+                    self.manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog())
+                    self.manage_btn.bind("<Enter>", lambda e: self.manage_btn.config(fg='#D4D4D4'))
+                    self.manage_btn.bind("<Leave>", lambda e: self.manage_btn.config(fg='#808080'))
+                    self.manage_btn._bound = True
+            else:
+                self.manage_btn.config(fg='#404040', cursor='arrow')
+                # Unbind events when disabled
+                try:
+                    self.manage_btn.unbind("<Button-1>")
+                    self.manage_btn.unbind("<Enter>")
+                    self.manage_btn.unbind("<Leave>")
+                    if hasattr(self.manage_btn, '_bound'):
+                        delattr(self.manage_btn, '_bound')
+                except:
+                    pass
     
     def load_saved_path(self):
         """Load last used download path."""
@@ -714,8 +820,13 @@ class BandcampDownloaderGUI:
             if hasattr(self, 'settings_frame'):
                 self.settings_frame.grid_configure(columnspan=3)
             if hasattr(self, 'show_album_art_btn'):
-                # Show the button by making it visible (it's always in grid, just invisible)
+                # Show the button by adding it back to grid
+                self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
                 self.show_album_art_btn.config(fg='#808080', cursor='hand2')
+        else:
+            # Album art is visible, ensure eye icon is removed from grid
+            if hasattr(self, 'show_album_art_btn'):
+                self.show_album_art_btn.grid_remove()
     
     def save_album_art_state(self):
         """Save album art visibility state."""
@@ -1256,12 +1367,15 @@ class BandcampDownloaderGUI:
             cursor='hand2',
             width=2
         )
-        self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
-        self.show_album_art_btn.bind("<Button-1>", lambda e: self.toggle_album_art() if self.show_album_art_btn.cget('fg') != '#1E1E1E' else None)
-        self.show_album_art_btn.bind("<Enter>", lambda e: self.show_album_art_btn.config(fg='#D4D4D4') if self.show_album_art_btn.cget('fg') != '#1E1E1E' else None)
-        self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg='#808080') if self.show_album_art_btn.cget('fg') != '#1E1E1E' else None)
-        # Make invisible by default (only visible when album art is hidden)
-        self.show_album_art_btn.config(fg='#1E1E1E')  # Match background to make invisible
+        # Only add to grid if album art is hidden (will be shown/hidden by toggle_album_art)
+        # If album art is visible by default, don't add to grid initially to save space
+        if not self.album_art_visible:
+            self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
+            self.show_album_art_btn.config(fg='#808080', cursor='hand2')
+        # Always bind events (they'll work when the button is in grid)
+        self.show_album_art_btn.bind("<Button-1>", lambda e: self.toggle_album_art())
+        self.show_album_art_btn.bind("<Enter>", lambda e: self.show_album_art_btn.config(fg='#D4D4D4'))
+        self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg='#808080'))
         
         # Numbering (second, below Audio Format)
         ttk.Label(self.settings_content, text="Numbering:", font=("Segoe UI", 8)).grid(row=1, column=0, padx=4, sticky=W, pady=1)
@@ -1280,21 +1394,65 @@ class BandcampDownloaderGUI:
         
         # Create a separate display variable for the combobox using class constants
         structure_display_values = list(self.FOLDER_STRUCTURES.values())
+        # Add custom structures to dropdown
+        structure_display_values = self._get_all_structure_options()
+        
+        # Create frame for dropdown and buttons
+        structure_frame = Frame(self.settings_content, bg='#1E1E1E')
+        structure_frame.grid(row=2, column=1, padx=4, sticky=W, pady=1, columnspan=1)  # Don't expand to avoid overlap with column 2
+        
         structure_combo = ttk.Combobox(
-            self.settings_content,
+            structure_frame,
             textvariable=self.folder_structure_var,
             values=structure_display_values,
             state="readonly",
-            width=25
+            width=17  # Slightly reduced width to make more room for buttons
         )
-        structure_combo.grid(row=2, column=1, padx=4, sticky=W, pady=1)
+        structure_combo.pack(side=LEFT, padx=(0, 4))
         structure_combo.bind("<<ComboboxSelected>>", lambda e: (self._deselect_combobox_text(e), self.on_structure_change(e)))
         
-        # Store reference to combobox and display values for later updates
+        # Customize button (✏️) - matching settings cog icon style
+        customize_btn = Label(
+            structure_frame,
+            text="✏️",
+            font=("Segoe UI", 12),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=2,
+            padx=4
+        )
+        customize_btn.pack(side=LEFT, padx=(0, 4))  # Increased spacing between buttons
+        customize_btn.bind("<Button-1>", lambda e: self._show_customize_dialog())
+        customize_btn.bind("<Enter>", lambda e: customize_btn.config(fg='#D4D4D4'))
+        customize_btn.bind("<Leave>", lambda e: customize_btn.config(fg='#808080'))
+        
+        # Manage button (🗑️) - trash can icon for managing/deleting structures
+        has_custom = hasattr(self, 'custom_structures') and self.custom_structures
+        manage_btn = Label(
+            structure_frame,
+            text="🗑️",
+            font=("Segoe UI", 12),
+            bg='#1E1E1E',
+            fg='#808080' if has_custom else '#404040',  # Darker when disabled
+            cursor='hand2' if has_custom else 'arrow',
+            width=3,  # Increased width to give icon more room
+            padx=4
+        )
+        manage_btn.pack(side=LEFT, padx=(2, 0))  # Left padding to prevent icon cutoff
+        if has_custom:
+            manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog())
+            manage_btn.bind("<Enter>", lambda e: manage_btn.config(fg='#D4D4D4') if has_custom else None)
+            manage_btn.bind("<Leave>", lambda e: manage_btn.config(fg='#808080') if has_custom else None)
+        
+        # Store references
         self.structure_combo = structure_combo
         self.structure_display_values = structure_display_values
+        self.customize_btn = customize_btn
+        self.manage_btn = manage_btn
         
-        # Set initial display value immediately
+        # Update dropdown with custom structures and set initial display value
+        self._update_structure_dropdown()
         self.update_structure_display()
         
         # Skip post-processing checkbox (below Folder Structure) - only shown if developer flag is enabled
@@ -1794,7 +1952,7 @@ class BandcampDownloaderGUI:
         widget.after_idle(clear_selection_and_focus)
     
     def _extract_structure_choice(self, choice_str):
-        """Helper method to extract numeric choice from folder structure string."""
+        """Helper method to extract numeric choice from folder structure string or return custom structure."""
         if not choice_str:
             return "4"  # Default
         # Check if it's already a number
@@ -1804,6 +1962,11 @@ class BandcampDownloaderGUI:
         for key, value in self.FOLDER_STRUCTURES.items():
             if choice_str == value:
                 return key
+        # Check if it's a custom structure
+        if hasattr(self, 'custom_structures') and self.custom_structures:
+            for structure in self.custom_structures:
+                if self._format_custom_structure(structure) == choice_str:
+                    return structure  # Return the list itself for custom structures
         # Fallback to default
         return "4"
     
@@ -1827,8 +1990,12 @@ class BandcampDownloaderGUI:
             
         choice = self._extract_structure_choice(self.folder_structure_var.get())
         
-        # Get the display value using class constants
-        display_value = self.FOLDER_STRUCTURES.get(choice, self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE])
+        # Handle custom structures
+        if isinstance(choice, list):
+            display_value = self._format_custom_structure(choice)
+        else:
+            # Get the display value using class constants
+            display_value = self.FOLDER_STRUCTURES.get(choice, self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE])
         
         # Set both the StringVar and the combobox to the display value
         # This ensures the combobox shows the full text
@@ -3855,14 +4022,15 @@ class BandcampDownloaderGUI:
             self.album_art_frame.grid()
             # Update settings frame to span 2 columns (leaving room for album art)
             self.settings_frame.grid_configure(columnspan=2)
-            # Hide the show album art button by making it invisible (keep in grid to prevent layout shift)
-            self.show_album_art_btn.config(fg='#1E1E1E', cursor='arrow')  # Match background, no hand cursor
+            # Remove the show album art button from grid to free up space
+            self.show_album_art_btn.grid_remove()
         else:
             # Hide album art panel
             self.album_art_frame.grid_remove()
             # Update settings frame to span 3 columns (full width)
             self.settings_frame.grid_configure(columnspan=3)
-            # Show the show album art button by making it visible
+            # Show the show album art button by adding it back to grid
+            self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
             self.show_album_art_btn.config(fg='#808080', cursor='hand2')  # Visible, hand cursor
         
         # Save the state
@@ -3937,15 +4105,40 @@ class BandcampDownloaderGUI:
         
         # Get example path based on structure
         base_path = Path(path)
-        examples = {
-            "1": str(base_path / f"{title}{ext}"),
-            "2": str(base_path / album / f"{title}{ext}"),
-            "3": str(base_path / artist / f"{title}{ext}"),
-            "4": str(base_path / artist / album / f"{title}{ext}"),
-            "5": str(base_path / album / artist / f"{title}{ext}"),
-        }
         
-        preview_path = examples.get(choice, examples["4"])
+        # Handle custom structures
+        if isinstance(choice, list):
+            # Build path from custom structure
+            path_parts = [base_path]
+            year = "2024"  # Example year for preview
+            for item in choice:
+                if item == "Artist":
+                    path_parts.append(artist)
+                elif item == "Album":
+                    path_parts.append(album)
+                elif item == "Year":
+                    path_parts.append(year)
+                elif item == "Genre":
+                    path_parts.append("Genre")  # Example genre for preview
+                elif item == "Label":
+                    path_parts.append("Label")  # Example label for preview
+                elif item == "Album Artist":
+                    path_parts.append("Album Artist")  # Example album artist for preview
+                elif item == "Catalog Number":
+                    path_parts.append("CAT001")  # Example catalog number for preview
+            path_parts.append(f"{title}{ext}")
+            preview_path = str(Path(*path_parts))
+        else:
+            # Standard structures
+            examples = {
+                "1": str(base_path / f"{title}{ext}"),
+                "2": str(base_path / album / f"{title}{ext}"),
+                "3": str(base_path / artist / f"{title}{ext}"),
+                "4": str(base_path / artist / album / f"{title}{ext}"),
+                "5": str(base_path / album / artist / f"{title}{ext}"),
+            }
+            preview_path = examples.get(choice, examples["4"])
+        
         # Show only the path (no "Preview: " prefix - that's handled by the label)
         self.preview_var.set(preview_path)
     
@@ -4020,6 +4213,44 @@ class BandcampDownloaderGUI:
             self.save_path()
             self.update_preview()
     
+    def _update_clear_button_state(self):
+        """Update clear log button state based on current conditions.
+        
+        Button should be enabled if:
+        - We have log messages AND we're not currently downloading, OR
+        - We have an undo snapshot available
+        """
+        try:
+            if not hasattr(self, 'clear_log_btn'):
+                return
+            
+            # Check if we have messages
+            has_messages = hasattr(self, 'log_messages') and self.log_messages
+            
+            # Check if we're downloading (cancel button visible = active download)
+            is_downloading = False
+            try:
+                if hasattr(self, 'cancel_btn'):
+                    is_downloading = self.cancel_btn.winfo_viewable()
+            except:
+                pass
+            
+            # Check if we have an undo snapshot
+            has_undo = hasattr(self, 'log_snapshot') and self.log_snapshot
+            
+            # Determine button state
+            if has_undo:
+                # We have an undo snapshot - show undo button
+                self.clear_log_btn.config(text="Undo Clear", command=self._undo_clear_log, state='normal', cursor='hand2')
+            elif has_messages and not is_downloading:
+                # We have messages and we're not downloading - enable clear button
+                self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='normal', cursor='hand2')
+            else:
+                # No messages and no undo - disable button
+                self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='disabled', cursor='arrow')
+        except Exception:
+            pass
+    
     def _clear_log(self):
         """Clear the status log."""
         # Save snapshot before clearing (only if there's content to save)
@@ -4050,12 +4281,8 @@ class BandcampDownloaderGUI:
         if hasattr(self, 'current_match_tag_name'):
             self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
         
-        # Change button to "Undo Clear" if snapshot was saved
-        if self.log_snapshot:
-            self.clear_log_btn.config(text="Undo Clear", command=self._undo_clear_log, state='normal', cursor='hand2')
-        else:
-            # No content to undo, keep button disabled
-            self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='disabled', cursor='arrow')
+        # Update button state using the helper method
+        self._update_clear_button_state()
     
     def _undo_clear_log(self):
         """Restore the log from snapshot after clearing."""
@@ -4102,11 +4329,11 @@ class BandcampDownloaderGUI:
             pass
         self.log_text.config(state='disabled')
         
-        # Reset button back to "Clear Log"
-        self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='normal', cursor='hand2')
-        
         # Clear snapshot
         self.log_snapshot = None
+        
+        # Update button state using the helper method
+        self._update_clear_button_state()
     
     def _toggle_word_wrap(self):
         """Toggle word wrap for the status log."""
@@ -4172,14 +4399,7 @@ class BandcampDownloaderGUI:
         # If undo is available, expire it (new log entry means user's chance to undo has passed)
         if hasattr(self, 'log_snapshot') and self.log_snapshot:
             self.log_snapshot = None
-            # Reset button back to "Clear Log" (only if button is enabled)
-            if hasattr(self, 'clear_log_btn'):
-                current_state = self.clear_log_btn.cget('state')
-                if current_state == 'normal':
-                    self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='normal', cursor='hand2')
-                else:
-                    # Button is disabled, just update text/command but keep disabled state and arrow cursor
-                    self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='disabled', cursor='arrow')
+            # Button state will be updated by _update_clear_button_state() below
         
         # Check if message is a debug message
         is_debug = message.startswith("DEBUG:")
@@ -4189,10 +4409,6 @@ class BandcampDownloaderGUI:
             self.log_messages = []
         self.log_messages.append((message, is_debug))
         
-        # Enable clear button if it was disabled (first message added or after operations complete)
-        if hasattr(self, 'clear_log_btn') and self.clear_log_btn.cget('state') == 'disabled':
-            self.clear_log_btn.config(state='normal', cursor='hand2')
-        
         # Only display if it's not a debug message, or if debug mode is on
         if not is_debug or self.debug_mode:
             # Temporarily enable widget to insert text, then disable again (read-only)
@@ -4201,6 +4417,13 @@ class BandcampDownloaderGUI:
             self.log_text.see(END)
             self.log_text.config(state='disabled')
             self.root.update_idletasks()
+        
+        # Update clear button state using the helper method
+        # Try immediately and with delays to handle timing issues
+        self._update_clear_button_state()
+        self.root.after(10, self._update_clear_button_state)
+        self.root.after(50, self._update_clear_button_state)
+        self.root.after(200, self._update_clear_button_state)
     
     def _on_log_click(self):
         """Handle click on log text to enable Ctrl+F."""
@@ -4653,6 +4876,34 @@ class BandcampDownloaderGUI:
         base_folder = Path(self.path_var.get())
         choice = self._extract_structure_choice(self.folder_structure_var.get())
         
+        # Handle custom structures (list)
+        if isinstance(choice, list):
+            # Build path from custom structure
+            path_parts = [base_folder]
+            for item in choice:
+                if item == "Artist":
+                    path_parts.append("%(artist)s")
+                elif item == "Album":
+                    path_parts.append("%(album)s")
+                elif item == "Year":
+                    # Extract year from release_date (format: YYYYMMDD -> YYYY)
+                    path_parts.append("%(release_date>%Y)s")
+                elif item == "Genre":
+                    # Use genre metadata (will be empty if not available)
+                    path_parts.append("%(genre)s")
+                elif item == "Label":
+                    # Use publisher/label metadata (will be empty if not available)
+                    path_parts.append("%(publisher)s")
+                elif item == "Album Artist":
+                    # Use album_artist metadata (will be empty if not available)
+                    path_parts.append("%(album_artist)s")
+                elif item == "Catalog Number":
+                    # Use catalog_number metadata (will be empty if not available)
+                    path_parts.append("%(catalog_number)s")
+            path_parts.append("%(title)s.%(ext)s")
+            return str(Path(*path_parts))
+        
+        # Handle standard structures
         folder_options = {
             "1": str(base_folder / "%(title)s.%(ext)s"),
             "2": str(base_folder / "%(album)s" / "%(title)s.%(ext)s"),
@@ -4837,14 +5088,8 @@ class BandcampDownloaderGUI:
         self.is_cancelling = False
         
         # Disable clear log button during download operations
-        # Reset to "Clear Log" mode and ensure cursor is arrow when disabled
-        if hasattr(self, 'clear_log_btn'):
-            self.clear_log_btn.config(
-                text="Clear Log",
-                command=self._clear_log,
-                state='disabled',
-                cursor='arrow'
-            )
+        # Update button state (will be disabled because is_downloading will be True)
+        self._update_clear_button_state()
         
         # Start with indeterminate mode (will switch to determinate when we get progress)
         self.progress_bar.config(mode='indeterminate', maximum=100, value=0)
@@ -7850,6 +8095,12 @@ class BandcampDownloaderGUI:
                             self.log(f"{message} (v{version})")
                         else:
                             self.log(message)
+                
+                # Update clear button state after logging launcher status
+                self._update_clear_button_state()
+                # Also try with delays to handle timing
+                self.root.after(10, self._update_clear_button_state)
+                self.root.after(50, self._update_clear_button_state)
             
             # Clear the status file after logging
             update_status_file = self.script_dir / "update_status.json"
@@ -8315,6 +8566,560 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         messagebox.showinfo("About", about_text)
     
+    def _show_customize_dialog(self):
+        """Show modal dialog to customize folder structure."""
+        dialog = Toplevel(self.root)
+        dialog.title("Customize Folder Structure")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 200
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 180
+        dialog.geometry(f"400x380+{x}+{y}")  # Increased height for 4 slots
+        
+        # Configure dialog background
+        dialog.configure(bg='#1E1E1E')
+        
+        # Main container for all content
+        main_container = Frame(dialog, bg='#1E1E1E')
+        main_container.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        
+        # Title
+        title_label = Label(
+            main_container,
+            text="Customize Folder Structure",
+            font=("Segoe UI", 10, "bold"),
+            bg='#1E1E1E',
+            fg='#D4D4D4'
+        )
+        title_label.pack(pady=(10, 5))
+        
+        # Instructions
+        instructions = Label(
+            main_container,
+            text="Drag to reorder • Select options • Max 4 levels",
+            font=("Segoe UI", 8),
+            bg='#1E1E1E',
+            fg='#808080'
+        )
+        instructions.pack(pady=(0, 10))
+        
+        # Container for levels (always show 4 slots)
+        levels_frame = Frame(main_container, bg='#2D2D30')  # Slightly lighter background for visibility
+        levels_frame.pack(fill=BOTH, expand=True, pady=10)
+        
+        # Store dialog and levels
+        dialog.custom_levels = []  # List of level frames (only filled ones)
+        dialog.level_slots = []  # List of all 4 slot frames (for fixed display)
+        dialog.dragging = None
+        dialog.drag_start_y = 0
+        dialog.levels_frame = levels_frame  # Store reference
+        
+        # Load current structure if it's a custom one
+        current_value = self.folder_structure_var.get()
+        initial_structure = None
+        if hasattr(self, 'custom_structures') and self.custom_structures:
+            if current_value not in self.FOLDER_STRUCTURES.values():
+                # This is a custom structure, find it
+                for structure in self.custom_structures:
+                    if self._format_custom_structure(structure) == current_value:
+                        initial_structure = structure.copy()
+                        break
+        
+        # Always create 4 fixed slots
+        for i in range(4):
+            slot_value = initial_structure[i] if initial_structure and i < len(initial_structure) else None
+            self._create_level_slot(dialog, levels_frame, i, slot_value)
+        
+        # Force update to ensure slots are visible
+        levels_frame.update_idletasks()
+        dialog.update_idletasks()
+        
+        # Buttons frame
+        buttons_frame = Frame(main_container, bg='#1E1E1E')
+        buttons_frame.pack(pady=10)
+        
+        # Save button
+        save_btn = ttk.Button(
+            buttons_frame,
+            text="Save Structure",
+            command=lambda: self._save_custom_structure_from_dialog(dialog)
+        )
+        save_btn.pack(side=LEFT, padx=5)
+        
+        # Cancel button
+        cancel_btn = ttk.Button(
+            buttons_frame,
+            text="Cancel",
+            command=dialog.destroy
+        )
+        cancel_btn.pack(side=LEFT, padx=5)
+        
+        # Close on ESC
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+    
+    def _create_level_slot(self, dialog, parent_frame, slot_index, initial_value=None):
+        """Create a level slot - either filled with a level or empty with + Add Level button."""
+        slot_frame = Frame(parent_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        slot_frame.pack(fill=X, pady=2, padx=5, anchor='nw')
+        slot_frame.slot_index = slot_index
+        slot_frame.is_filled = initial_value is not None
+        
+        dialog.level_slots.append(slot_frame)
+        
+        if initial_value:
+            # Create filled level
+            self._fill_level_slot(dialog, slot_frame, initial_value)
+        else:
+            # Create empty slot with + Add Level button (same height as filled slots)
+            add_btn = ttk.Button(
+                slot_frame,
+                text="+ Add Level",
+                command=lambda: self._add_level_to_slot(dialog, slot_frame)
+            )
+            add_btn.pack(side=LEFT, padx=5, pady=2)  # Match padding of filled slot widgets
+            slot_frame.add_btn = add_btn
+    
+    def _fill_level_slot(self, dialog, slot_frame, initial_value):
+        """Fill a slot with a level (dropdown, drag handle, remove button)."""
+        # Clear any existing content
+        for widget in slot_frame.winfo_children():
+            widget.destroy()
+        
+        slot_frame.is_filled = True
+        
+        # Add to custom_levels FIRST so it's included in filtering
+        if slot_frame not in dialog.custom_levels:
+            dialog.custom_levels.append(slot_frame)
+        
+        # Create level_var early so it's available for filtering
+        level_var = StringVar(value=initial_value)
+        slot_frame.level_var = level_var  # Set early so _get_available_level_options can see it
+        
+        # Drag handle (⋮⋮)
+        drag_handle = Label(
+            slot_frame,
+            text="⋮⋮",
+            font=("Segoe UI", 10),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=3
+        )
+        drag_handle.pack(side=LEFT, padx=5)
+        
+        # Bind drag events
+        drag_handle.bind("<Button-1>", lambda e: self._start_drag_level(dialog, slot_frame, e))
+        drag_handle.bind("<B1-Motion>", lambda e: self._drag_level(dialog, slot_frame, e))
+        drag_handle.bind("<ButtonRelease-1>", lambda e: self._end_drag_level(dialog, slot_frame, e))
+        
+        # Dropdown - now filtering will work because slot_frame is already in custom_levels
+        level_combo = ttk.Combobox(
+            slot_frame,
+            textvariable=level_var,
+            values=self._get_available_level_options(dialog, initial_value),
+            state="readonly",
+            width=15
+        )
+        level_combo.pack(side=LEFT, padx=5)
+        level_combo.bind("<<ComboboxSelected>>", lambda e: self._on_level_change(dialog, slot_frame))
+        
+        # Remove button (X) - clears the slot
+        remove_btn = ttk.Button(
+            slot_frame,
+            text="X",
+            width=3,
+            command=lambda: self._clear_level_slot(dialog, slot_frame)
+        )
+        remove_btn.pack(side=LEFT, padx=5)
+        
+        # Store level data
+        slot_frame.level_combo = level_combo
+        slot_frame.remove_btn = remove_btn
+        slot_frame.drag_handle = drag_handle
+        
+        # Update all dropdowns to filter duplicates
+        self._update_all_level_options(dialog)
+    
+    def _add_level_to_slot(self, dialog, slot_frame):
+        """Add a level to an empty slot."""
+        # Find first available option that isn't already selected
+        selected = []
+        for level_frame in dialog.custom_levels:
+            if hasattr(level_frame, 'level_var'):
+                value = level_frame.level_var.get()
+                if value:
+                    selected.append(value)
+        
+        # Default options in order of preference
+        default_options = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
+        default_value = "Artist"  # Fallback
+        for option in default_options:
+            if option not in selected:
+                default_value = option
+                break
+        
+        self._fill_level_slot(dialog, slot_frame, default_value)
+    
+    def _clear_level_slot(self, dialog, slot_frame):
+        """Clear a filled slot, making it empty again."""
+        if slot_frame in dialog.custom_levels:
+            dialog.custom_levels.remove(slot_frame)
+        
+        # Clear all widgets
+        for widget in slot_frame.winfo_children():
+            widget.destroy()
+        
+        slot_frame.is_filled = False
+        
+        # Create + Add Level button (same height as filled slots)
+        add_btn = ttk.Button(
+            slot_frame,
+            text="+ Add Level",
+            command=lambda: self._add_level_to_slot(dialog, slot_frame)
+        )
+        add_btn.pack(side=LEFT, padx=5, pady=2)  # Match padding of filled slot widgets
+        slot_frame.add_btn = add_btn
+        
+        # Update all dropdowns
+        self._update_all_level_options(dialog)
+    
+    def _get_available_level_options(self, dialog, current_value=None):
+        """Get available level options, filtering out already selected ones."""
+        # Get all selected values (excluding current value)
+        selected = []
+        for level_frame in dialog.custom_levels:
+            if not hasattr(level_frame, 'level_var'):
+                continue
+            value = level_frame.level_var.get()
+            if value and value != current_value:
+                selected.append(value)
+        
+        # Available options: all options minus selected ones (plus current value)
+        # Note: yt-dlp metadata fields available from Bandcamp:
+        # - artist, album, release_date (Year), genre, publisher (Label)
+        # - album_artist (if different from artist)
+        # - catalog_number (if available)
+        # - track_number, discnumber (usually for filenames, not folders)
+        all_options = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
+        available = []
+        for option in all_options:
+            if option not in selected or option == current_value:
+                available.append(option)
+        
+        return available
+    
+    def _update_all_level_options(self, dialog):
+        """Update all level dropdowns to filter out selected options."""
+        for level_frame in dialog.custom_levels:
+            if hasattr(level_frame, 'level_var') and hasattr(level_frame, 'level_combo'):
+                current_value = level_frame.level_var.get()
+                level_frame.level_combo['values'] = self._get_available_level_options(dialog, current_value)
+    
+    def _on_level_change(self, dialog, slot_frame):
+        """Handle change in a level dropdown."""
+        self._update_all_level_options(dialog)
+    
+    def _start_drag_level(self, dialog, slot_frame, event):
+        """Start dragging a level."""
+        dialog.dragging = slot_frame
+        dialog.drag_start_y = event.y_root
+        dialog.drag_start_index = dialog.level_slots.index(slot_frame)
+        
+        # Enhanced visual feedback - make dragged slot stand out
+        slot_frame.config(
+            highlightbackground='#00A8FF',  # Brighter blue
+            highlightthickness=3,
+            bg='#2D4A5C'  # Slightly lighter background
+        )
+    
+    def _drag_level(self, dialog, slot_frame, event):
+        """Handle dragging a level - show clear visual feedback of target position."""
+        if not dialog.dragging or dialog.dragging != slot_frame:
+            return
+        
+        # Find which slot we're over
+        current_y = event.y_root
+        target_slot = None
+        target_index = None
+        
+        # Find target position based on mouse Y position
+        for i, other_slot in enumerate(dialog.level_slots):
+            if other_slot == slot_frame:
+                continue
+            slot_y = other_slot.winfo_rooty()
+            slot_height = other_slot.winfo_height()
+            slot_center = slot_y + slot_height // 2
+            
+            # Check if mouse is over this slot
+            if slot_y <= current_y <= slot_y + slot_height:
+                target_slot = other_slot
+                # Determine if we're in the upper or lower half
+                if current_y < slot_center:
+                    target_index = i
+                else:
+                    target_index = i + 1
+                break
+        
+        # If no target found, check if we're at the top or bottom
+        if target_slot is None:
+            if current_y < dialog.level_slots[0].winfo_rooty():
+                target_index = 0
+            else:
+                target_index = len(dialog.level_slots) - 1
+        
+        # Store target for end_drag
+        dialog.drag_target_index = target_index
+        
+        # Enhanced visual feedback - make dragged slot more prominent
+        slot_frame.config(
+            highlightbackground='#00A8FF',  # Brighter blue
+            highlightthickness=3,
+            bg='#2D4A5C'  # Slightly lighter background
+        )
+        
+        # Highlight target position with a different color
+        for i, other_slot in enumerate(dialog.level_slots):
+            if other_slot == slot_frame:
+                continue
+            if i == target_index:
+                # Target position - show where it will drop
+                other_slot.config(
+                    highlightbackground='#00FF88',  # Green for drop target
+                    highlightthickness=3,
+                    bg='#2D4A5C'
+                )
+            else:
+                other_slot.config(
+                    highlightbackground='#3E3E42',
+                    highlightthickness=1,
+                    bg='#1E1E1E'
+                )
+    
+    def _end_drag_level(self, dialog, slot_frame, event):
+        """End dragging and reorder levels by moving slot to target position."""
+        if not dialog.dragging or dialog.dragging != slot_frame:
+            return
+        
+        # Get target index from drag
+        target_index = getattr(dialog, 'drag_target_index', None)
+        if target_index is None:
+            # Fallback: find target based on final mouse position
+            current_y = event.y_root
+            target_index = len(dialog.level_slots) - 1
+            for i, other_slot in enumerate(dialog.level_slots):
+                if other_slot == slot_frame:
+                    continue
+                slot_y = other_slot.winfo_rooty()
+                slot_height = other_slot.winfo_height()
+                slot_center = slot_y + slot_height // 2
+                if slot_y <= current_y <= slot_y + slot_height:
+                    if current_y < slot_center:
+                        target_index = i
+                    else:
+                        target_index = i + 1
+                    break
+        
+        # Clamp target_index
+        target_index = max(0, min(target_index, len(dialog.level_slots) - 1))
+        
+        # Get current index
+        current_index = dialog.level_slots.index(slot_frame)
+        
+        # If position changed, reorder slots
+        if target_index != current_index:
+            # Remove from current position
+            slot_frame.pack_forget()
+            
+            # Reorder the list
+            dialog.level_slots.remove(slot_frame)
+            dialog.level_slots.insert(target_index, slot_frame)
+            
+            # Repack all slots in new order
+            for slot in dialog.level_slots:
+                slot.pack_forget()
+            for slot in dialog.level_slots:
+                slot.pack(fill=X, pady=2, padx=5, anchor='nw')
+            
+            dialog.update_idletasks()
+        
+        # Reset highlights
+        for slot in dialog.level_slots:
+            slot.config(
+                highlightbackground='#3E3E42',
+                highlightthickness=1,
+                bg='#1E1E1E'
+            )
+        
+        dialog.dragging = None
+        dialog.drag_start_index = None
+        dialog.drag_original_y = None
+        dialog.drag_target_index = None
+    
+    def _save_custom_structure_from_dialog(self, dialog):
+        """Save the custom structure from the dialog."""
+        # Build structure list from filled slots (in order)
+        structure = []
+        for slot_frame in dialog.level_slots:
+            if slot_frame.is_filled and hasattr(slot_frame, 'level_var'):
+                value = slot_frame.level_var.get()
+                if value:
+                    structure.append(value)
+        
+        # Validate structure
+        if not structure:
+            messagebox.showwarning("Invalid Structure", "Please add at least one level (Artist, Album, Year, Genre, Label, Album Artist, or Catalog Number).")
+            return
+        
+        # Check for duplicates (safety check - dropdowns should prevent this)
+        if len(structure) != len(set(structure)):
+            duplicates = [item for item in structure if structure.count(item) > 1]
+            messagebox.showwarning(
+                "Duplicate Levels",
+                f"Each level can only be used once.\n\nDuplicate level(s) found: {', '.join(set(duplicates))}\n\nPlease remove duplicates before saving."
+            )
+            return
+        
+        # Format for display
+        formatted = self._format_custom_structure(structure)
+        
+        # Check if this structure already exists
+        structure_exists = False
+        for existing in self.custom_structures:
+            if existing == structure:
+                structure_exists = True
+                break
+        
+        # Add to custom structures if new
+        if not structure_exists:
+            self.custom_structures.append(structure)
+        
+        # Save settings
+        self._save_custom_structures()
+        
+        # Update dropdown
+        self._update_structure_dropdown()
+        
+        # Select this structure in dropdown
+        self.folder_structure_var.set(formatted)
+        if hasattr(self, 'structure_combo'):
+            self.structure_combo.set(formatted)
+        
+        # Save the selection to persist it across sessions
+        self._save_settings()
+        
+        # Update preview
+        self.update_preview()
+        
+        # Close dialog
+        dialog.destroy()
+    
+    def _show_manage_dialog(self):
+        """Show modal dialog to manage custom folder structures."""
+        if not hasattr(self, 'custom_structures') or not self.custom_structures:
+            messagebox.showinfo("No Custom Structures", "No custom folder structures have been saved yet.\n\nCreate one using the Customize button (🎨).")
+            return
+        
+        dialog = Toplevel(self.root)
+        dialog.title("Manage Custom Folder Structures")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 200
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 150
+        dialog.geometry(f"400x300+{x}+{y}")
+        
+        # Configure dialog background
+        dialog.configure(bg='#1E1E1E')
+        
+        # Title
+        title_label = Label(
+            dialog,
+            text="Manage Custom Folder Structures",
+            font=("Segoe UI", 10, "bold"),
+            bg='#1E1E1E',
+            fg='#D4D4D4'
+        )
+        title_label.pack(pady=(10, 10))
+        
+        # Container for structure list
+        list_frame = Frame(dialog, bg='#1E1E1E')
+        list_frame.pack(pady=10, padx=20, fill=BOTH, expand=True)
+        
+        # Create list of structures with delete buttons
+        for structure in self.custom_structures:
+            structure_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+            structure_frame.pack(fill=X, pady=2, padx=5)
+            
+            # Structure label
+            formatted = self._format_custom_structure(structure)
+            structure_label = Label(
+                structure_frame,
+                text=formatted,
+                font=("Segoe UI", 9),
+                bg='#1E1E1E',
+                fg='#D4D4D4',
+                anchor=W
+            )
+            structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
+            
+            # Delete button
+            delete_btn = ttk.Button(
+                structure_frame,
+                text="X",
+                width=3,
+                command=lambda s=structure: self._delete_custom_structure(dialog, s)
+            )
+            delete_btn.pack(side=RIGHT, padx=5)
+        
+        # Close button
+        close_btn = ttk.Button(
+            dialog,
+            text="Close",
+            command=dialog.destroy
+        )
+        close_btn.pack(pady=10)
+        
+        # Close on ESC
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+    
+    def _delete_custom_structure(self, dialog, structure):
+        """Delete a custom structure."""
+        if structure in self.custom_structures:
+            # Check if this is the currently selected structure
+            formatted = self._format_custom_structure(structure)
+            current_value = self.folder_structure_var.get()
+            
+            # Remove from list
+            self.custom_structures.remove(structure)
+            
+            # Save settings
+            self._save_custom_structures()
+            
+            # Update dropdown
+            self._update_structure_dropdown()
+            
+            # If deleted structure was selected, switch to default
+            if current_value == formatted:
+                default_display = self.FOLDER_STRUCTURES.get(self.DEFAULT_STRUCTURE, "Artist / Album")
+                self.folder_structure_var.set(default_display)
+                if hasattr(self, 'structure_combo'):
+                    self.structure_combo.set(default_display)
+                self.update_preview()
+            
+            # Rebuild dialog if structures remain, otherwise close
+            if self.custom_structures:
+                dialog.destroy()
+                self._show_manage_dialog()  # Reopen with updated list
+            else:
+                dialog.destroy()
+    
     def _format_error_message(self, error_str, is_unexpected=False):
         """Format error messages to be more user-friendly."""
         error_lower = error_str.lower()
@@ -8366,9 +9171,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self.download_btn.config(state='normal')
         self.download_btn.grid()
         
-        # Enable clear log button after download/cancel operations complete (if there are log messages)
-        if hasattr(self, 'clear_log_btn') and hasattr(self, 'log_messages') and self.log_messages:
-            self.clear_log_btn.config(state='normal', cursor='hand2')  # Hand cursor when enabled
+        # Update clear log button state after download/cancel operations complete
+        self._update_clear_button_state()
         
         if success:
             # Show 100% completion for main progress bar
