@@ -24,6 +24,9 @@ Requirements:
 SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
+# Application version (update this when releasing)
+__version__ = "1.1.4"
+
 import sys
 import subprocess
 import webbrowser
@@ -180,10 +183,28 @@ class BandcampDownloaderGUI:
         self.root.resizable(False, True)
         self.root.minsize(window_width, window_height)
         
-        # Get script directory first (needed for icon path)
+        # Get script directory first (needed for icon path and settings)
+        # When launched from launcher, __file__ will be in the launcher directory
         self.script_dir = Path(__file__).resolve().parent
+        
+        # If launched from launcher, ensure icon.ico is in script directory
+        # (launcher copies it, but check parent directory as fallback)
+        icon_path = self.script_dir / "icon.ico"
+        if not icon_path.exists():
+            # Try parent directory (where launcher.exe might be)
+            parent_icon = self.script_dir.parent / "icon.ico"
+            if parent_icon.exists():
+                # Use parent directory for icon lookup
+                self.icon_dir = self.script_dir.parent
+            else:
+                self.icon_dir = self.script_dir
+        else:
+            self.icon_dir = self.script_dir
         self.ffmpeg_path = None
         self.ydl = None
+        
+        # Detect if running from launcher.exe
+        self.is_launcher_mode = self._is_launcher_mode()
         
         # Variables
         self.url_var = StringVar()
@@ -199,6 +220,7 @@ class BandcampDownloaderGUI:
         self.create_playlist_var = BooleanVar(value=self.load_saved_create_playlist())
         self.download_cover_art_var = BooleanVar(value=self.load_saved_download_cover_art())
         self.download_discography_var = BooleanVar(value=False)  # Always default to off, not persistent
+        self.auto_check_updates_var = BooleanVar(value=self.load_saved_auto_check_updates())
         
         # Batch URL mode tracking
         self.batch_mode = False  # Track if we're in batch mode (multiple URLs)
@@ -288,6 +310,10 @@ class BandcampDownloaderGUI:
         
         # Bind to window resize events to update expand/collapse button state
         self.root.bind('<Configure>', self._on_window_configure)
+        
+        # Check for updates in background after UI is ready (non-blocking) - only if auto-check is enabled
+        if self.auto_check_updates_var.get():
+            self.root.after(2000, self._check_for_updates_background)  # Wait 2 seconds after startup
     
     def setup_dark_mode(self):
         """Configure dark mode theme."""
@@ -412,7 +438,8 @@ class BandcampDownloaderGUI:
         if not hasattr(self, 'root') or not self.root:
             return
         
-        icon_path = self.script_dir / "icon.ico"
+        # Use icon_dir (which handles launcher mode)
+        icon_path = getattr(self, 'icon_dir', self.script_dir) / "icon.ico"
         
         try:
             if icon_path.exists():
@@ -606,7 +633,8 @@ class BandcampDownloaderGUI:
                 "download_cover_art": self.download_cover_art_var.get(),
                 # download_discography is intentionally not saved - always defaults to off
                 "album_art_visible": self.album_art_visible,
-                "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False
+                "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False,
+                "auto_check_updates": self.auto_check_updates_var.get() if hasattr(self, 'auto_check_updates_var') else True
             }
         
         settings_file = self._get_settings_file()
@@ -736,6 +764,19 @@ class BandcampDownloaderGUI:
         # This function is kept for compatibility but always returns False
         # download_discography is intentionally not persistent
         return False
+    
+    def load_saved_auto_check_updates(self):
+        """Load saved auto-check for updates preference, default to True if not found."""
+        settings = self._load_settings()
+        return settings.get("auto_check_updates", True)  # Default to True
+    
+    def save_auto_check_updates(self):
+        """Save auto-check for updates preference."""
+        self._save_settings()
+    
+    def on_auto_check_updates_change(self):
+        """Handle auto-check for updates checkbox change."""
+        self.save_auto_check_updates()
     
     def save_download_discography(self):
         """Save download discography preference."""
@@ -1095,9 +1136,34 @@ class BandcampDownloaderGUI:
             path_entry.selection_clear()
         path_entry.bind('<FocusOut>', on_path_focus_out)
         
-        browse_btn = ttk.Button(main_frame, text="Browse", command=self.browse_folder, cursor='hand2')
-        browse_btn.grid(row=1, column=2, padx=(4, 0), pady=2)
+        # Container frame for Browse button and Settings cog icon
+        browse_container = Frame(main_frame, bg='#1E1E1E')
+        browse_container.grid(row=1, column=2, sticky=(W, E), padx=(4, 0), pady=2)
+        browse_container.columnconfigure(0, weight=1, minsize=80)  # Browse button expands with minimum width
+        browse_container.columnconfigure(1, weight=0)  # Cog icon fixed width
+        
+        browse_btn = ttk.Button(browse_container, text="Browse", command=self.browse_folder, cursor='hand2')
+        browse_btn.grid(row=0, column=0, sticky=(W, E))  # Expand to fill available space
         self.browse_btn = browse_btn  # Store reference for unfocus handling
+        
+        # Settings cog icon button
+        self.settings_cog_btn = Label(
+            browse_container,
+            text="⚙",
+            font=("Segoe UI", 12),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=2,
+            padx=4
+        )
+        self.settings_cog_btn.grid(row=0, column=1, padx=(4, 0))
+        self.settings_cog_btn.bind("<Button-1>", self._show_settings_menu)
+        self.settings_cog_btn.bind("<Enter>", lambda e: self.settings_cog_btn.config(fg='#D4D4D4'))
+        self.settings_cog_btn.bind("<Leave>", lambda e: self.settings_cog_btn.config(fg='#808080'))
+        
+        # Create settings menu (will be shown on cog click)
+        self.settings_menu = None
         
         # Bind path changes to update preview
         self.path_var.trace_add('write', lambda *args: self.update_preview())
@@ -7696,6 +7762,326 @@ class BandcampDownloaderGUI:
             # Log full traceback for debugging
             tb_str = traceback.format_exc()
             self.root.after(0, lambda tb=tb_str: self.log(f"DEBUG: progress_hook traceback: {tb}"))
+    
+    def get_version(self):
+        """Get current application version."""
+        return __version__
+    
+    def _is_launcher_mode(self):
+        """Detect if running from launcher.exe.
+        
+        Returns True if launched from launcher.exe, False if standalone.
+        """
+        # Method 1: Environment variable (set by launcher)
+        if os.environ.get('BANDCAMP_LAUNCHER') == '1':
+            return True
+        
+        # Method 2: Check if launcher.exe exists in same directory
+        script_dir = Path(__file__).resolve().parent
+        launcher_exe = script_dir / 'launcher.exe'
+        if launcher_exe.exists():
+            return True
+        
+        # Method 3: Check parent process name (if psutil available)
+        try:
+            import psutil
+            try:
+                parent = psutil.Process().parent()
+                if parent and 'launcher' in parent.name().lower():
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        except ImportError:
+            pass
+        
+        return False
+    
+    def _check_for_updates_background(self):
+        """Check for updates in background (non-blocking, no popup if up to date)."""
+        self.check_for_updates(show_if_no_update=False)
+    
+    def check_for_updates(self, show_if_no_update=True):
+        """Check for updates from GitHub releases.
+        
+        Args:
+            show_if_no_update: If True, show message even if no update is available (for manual check)
+        """
+        def check():
+            try:
+                try:
+                    import requests
+                except ImportError:
+                    if show_if_no_update:
+                        self.root.after(0, lambda: messagebox.showerror(
+                            "Update Check Failed",
+                            "The 'requests' library is required for update checking.\n\n"
+                            "Please install it:\n"
+                            "python -m pip install requests"
+                        ))
+                    return
+                
+                # GitHub repository info
+                repo_owner = "kameryn1811"
+                repo_name = "Bandcamp-Downloader"
+                api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
+                
+                # Get latest release from GitHub
+                response = requests.get(api_url, timeout=10)
+                response.raise_for_status()
+                release_data = response.json()
+                
+                # Extract version from tag (e.g., "v1.1.3" -> "1.1.3")
+                latest_tag = release_data.get("tag_name", "")
+                latest_version = latest_tag.lstrip("v") if latest_tag.startswith("v") else latest_tag
+                
+                current_version = self.get_version()
+                
+                # Compare versions (simple string comparison works for semantic versioning)
+                if self._compare_versions(latest_version, current_version) > 0:
+                    # Update available - show popup
+                    download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{latest_tag}/bandcamp_dl_gui.py"
+                    self.root.after(0, lambda: self._show_update_popup(
+                        current_version, latest_version, download_url, release_data.get("body", "")
+                    ))
+                elif show_if_no_update:
+                    # User manually checked, show "up to date" message
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "Update Check",
+                        f"You're running the latest version (v{current_version})"
+                    ))
+            except requests.exceptions.RequestException as e:
+                if show_if_no_update:
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Update Check Failed",
+                        f"Could not check for updates.\n\nError: {str(e)}\n\nPlease check your internet connection."
+                    ))
+            except Exception as e:
+                if show_if_no_update:
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Update Check Failed",
+                        f"An error occurred while checking for updates.\n\nError: {str(e)}"
+                    ))
+        
+        # Run in background thread to avoid blocking UI
+        threading.Thread(target=check, daemon=True).start()
+    
+    def _compare_versions(self, version1, version2):
+        """Compare two version strings.
+        
+        Returns:
+            -1 if version1 < version2
+             0 if version1 == version2
+             1 if version1 > version2
+        """
+        def version_tuple(v):
+            # Split version string and convert to integers
+            parts = []
+            for part in v.split('.'):
+                try:
+                    parts.append(int(part))
+                except ValueError:
+                    parts.append(0)
+            return tuple(parts)
+        
+        v1_tuple = version_tuple(version1)
+        v2_tuple = version_tuple(version2)
+        
+        # Pad with zeros to make same length
+        max_len = max(len(v1_tuple), len(v2_tuple))
+        v1_tuple = v1_tuple + (0,) * (max_len - len(v1_tuple))
+        v2_tuple = v2_tuple + (0,) * (max_len - len(v2_tuple))
+        
+        if v1_tuple < v2_tuple:
+            return -1
+        elif v1_tuple > v2_tuple:
+            return 1
+        else:
+            return 0
+    
+    def _show_update_popup(self, current_version, latest_version, download_url, release_notes=""):
+        """Show update available popup."""
+        # Format release notes (first few lines)
+        notes_preview = ""
+        if release_notes:
+            lines = release_notes.split('\n')[:5]  # First 5 lines
+            notes_preview = "\n\n" + "\n".join(lines)
+            if len(release_notes.split('\n')) > 5:
+                notes_preview += "\n..."
+        
+        response = messagebox.askyesno(
+            "Update Available",
+            f"A new version is available!\n\n"
+            f"Current version: v{current_version}\n"
+            f"Latest version: v{latest_version}\n"
+            f"{notes_preview}\n\n"
+            f"Would you like to update now?\n\n"
+            f"(The app will download the update and restart)"
+        )
+        
+        if response:
+            self._download_and_apply_update(download_url, latest_version)
+    
+    def _download_and_apply_update(self, download_url, new_version):
+        """Download and apply the update."""
+        if self.is_launcher_mode:
+            # In launcher mode, don't try to update ourselves
+            # Just notify user to restart launcher
+            self._update_complete(new_version)
+            return
+        
+        def download():
+            try:
+                import requests
+                
+                # Show downloading message
+                self.root.after(0, lambda: self.log(f"Downloading update (v{new_version})..."))
+                
+                # Download new version
+                response = requests.get(download_url, timeout=30)
+                response.raise_for_status()
+                new_script_content = response.text
+                
+                # Verify it's a valid Python script (basic check)
+                if "BandcampDownloaderGUI" not in new_script_content:
+                    raise ValueError("Downloaded file doesn't appear to be a valid script")
+                
+                # Get current script path
+                current_script_path = Path(__file__).resolve()
+                backup_path = current_script_path.with_suffix('.py.backup')
+                
+                # Create backup of current version
+                if current_script_path.exists():
+                    import shutil
+                    shutil.copy2(current_script_path, backup_path)
+                
+                # Write new version
+                with open(current_script_path, 'w', encoding='utf-8') as f:
+                    f.write(new_script_content)
+                
+                # Success - show message and restart
+                self.root.after(0, lambda: self._update_complete(new_version))
+                
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Update Failed",
+                    f"Failed to download update.\n\nError: {str(e)}\n\n"
+                    f"Please download manually from:\n"
+                    f"https://github.com/kameryn1811/Bandcamp-Downloader/releases/latest"
+                ))
+        
+        # Run download in background thread
+        threading.Thread(target=download, daemon=True).start()
+    
+    def _update_complete(self, new_version):
+        """Handle update completion."""
+        if self.is_launcher_mode:
+            # Launcher mode: Just notify user to restart launcher
+            # Don't try to update ourselves - launcher handles that
+            messagebox.showinfo(
+                "Update Available",
+                f"Version v{new_version} is available!\n\n"
+                f"Please close this application and restart the launcher to get the update.\n\n"
+                f"The launcher will automatically download the latest version on next launch."
+            )
+            # Don't restart - let launcher handle updates
+        else:
+            # Standalone mode: Update and restart as normal
+            messagebox.showinfo(
+                "Update Complete",
+                f"Successfully updated to v{new_version}!\n\n"
+                f"The application will now restart."
+            )
+            
+            # Restart the application
+            python = sys.executable
+            script = Path(__file__).resolve()
+            os.execl(python, python, str(script))
+    
+    def _show_settings_menu(self, event):
+        """Show settings menu when cog icon is clicked."""
+        if self.settings_menu is None:
+            # Create settings menu
+            self.settings_menu = Menu(
+                self.root,
+                tearoff=0,
+                bg='#252526',
+                fg='#CCCCCC',
+                activebackground='#007ACC',
+                activeforeground='#FFFFFF',
+                selectcolor='#007ACC',
+                borderwidth=1,
+                relief='flat'
+            )
+            
+            # Check for Updates
+            self.settings_menu.add_command(
+                label="Check for Updates",
+                command=self.check_for_updates
+            )
+            
+            # Auto-check for updates (checkbox)
+            self.settings_menu.add_checkbutton(
+                label="Automatically Check for Updates",
+                variable=self.auto_check_updates_var,
+                command=self.on_auto_check_updates_change
+            )
+            
+            # Separator
+            self.settings_menu.add_separator()
+            
+            # About
+            self.settings_menu.add_command(
+                label="About",
+                command=self._show_about_dialog
+            )
+            
+            # Separator
+            self.settings_menu.add_separator()
+            
+            # Open GitHub Repository
+            self.settings_menu.add_command(
+                label="GitHub Repository",
+                command=lambda: webbrowser.open("https://github.com/kameryn1811/Bandcamp-Downloader")
+            )
+            
+            # Report Issue
+            self.settings_menu.add_command(
+                label="Report Issue",
+                command=lambda: webbrowser.open("https://github.com/kameryn1811/Bandcamp-Downloader/issues")
+            )
+        
+        # Show menu at cursor position
+        try:
+            self.settings_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            # Make sure to release the grab (Tkinter quirk)
+            self.settings_menu.grab_release()
+    
+    def _show_about_dialog(self):
+        """Show About dialog."""
+        about_text = f"""Bandcamp Downloader GUI
+Version {__version__}
+
+A Python-based GUI application for downloading Bandcamp albums with full metadata and cover art support.
+
+Features:
+• Download albums, tracks, and artist discographies
+• Automatic metadata embedding
+• Cover art support
+• Multiple audio format options
+• Batch download support
+• Customizable folder structures
+
+Requirements:
+• Python 3.11+
+• yt-dlp
+• ffmpeg.exe
+
+GitHub: https://github.com/kameryn1811/Bandcamp-Downloader
+
+This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For high-quality audio, please purchase albums directly from Bandcamp to support the artists."""
+        
+        messagebox.showinfo("About", about_text)
     
     def _format_error_message(self, error_str, is_unexpected=False):
         """Format error messages to be more user-friendly."""
