@@ -66,6 +66,7 @@ This warning appears because:
 **This warning is safe to ignore.** 
 
 The executable is not malicious - it's the same code you can review on GitHub.
+
 To Proceed: 
 1. Click **"More info"** on the warning dialog
 2. Click **"Run anyway"** button that appears
