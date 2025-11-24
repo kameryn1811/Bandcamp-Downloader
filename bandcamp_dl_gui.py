@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.4.2"
+__version__ = "1.1.4.3"
 
 import sys
 import subprocess
@@ -7817,10 +7817,24 @@ class BandcampDownloaderGUI:
                 latest_tag = release_data.get("tag_name", "")
                 latest_version = latest_tag.lstrip("v") if latest_tag.startswith("v") else latest_tag
                 
+                # Debug: Log what we got from GitHub
+                if show_if_no_update:
+                    self.root.after(0, lambda tag=latest_tag, ver=latest_version: self.log(
+                        f"DEBUG: GitHub latest release tag: {tag}, version: {ver}"
+                    ))
+                
                 current_version = self.get_version()
                 
                 # Compare versions (simple string comparison works for semantic versioning)
-                if self._compare_versions(latest_version, current_version) > 0:
+                comparison = self._compare_versions(latest_version, current_version)
+                
+                # Debug logging
+                if show_if_no_update:
+                    self.root.after(0, lambda cv=current_version, lv=latest_version, comp=comparison: self.log(
+                        f"DEBUG: Version comparison - Current: {cv}, Latest: {lv}, Result: {comp}"
+                    ))
+                
+                if comparison > 0:
                     # Update available - show popup
                     download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{latest_tag}/bandcamp_dl_gui.py"
                     self.root.after(0, lambda: self._show_update_popup(
