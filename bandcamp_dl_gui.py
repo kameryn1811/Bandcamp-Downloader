@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.4.3"
+__version__ = "1.1.4.4"
 
 import sys
 import subprocess
@@ -7806,39 +7806,47 @@ class BandcampDownloaderGUI:
                 # GitHub repository info
                 repo_owner = "kameryn1811"
                 repo_name = "Bandcamp-Downloader"
-                api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
                 
-                # Get latest release from GitHub
-                response = requests.get(api_url, timeout=10)
+                # Get version from main branch (more flexible than releases)
+                script_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/bandcamp_dl_gui.py"
+                response = requests.get(script_url, timeout=10)
                 response.raise_for_status()
-                release_data = response.json()
+                script_content = response.text
                 
-                # Extract version from tag (e.g., "v1.1.3" -> "1.1.3")
-                latest_tag = release_data.get("tag_name", "")
-                latest_version = latest_tag.lstrip("v") if latest_tag.startswith("v") else latest_tag
+                # Extract version from script content
+                latest_version = None
+                for line in script_content.split('\n'):
+                    if '__version__' in line and '=' in line:
+                        # Extract version string (handles both "1.1.4" and __version__ = "1.1.4")
+                        version_str = line.split('=')[1].strip().strip('"').strip("'")
+                        latest_version = version_str
+                        break
                 
-                # Debug: Log what we got from GitHub
-                if show_if_no_update:
-                    self.root.after(0, lambda tag=latest_tag, ver=latest_version: self.log(
-                        f"DEBUG: GitHub latest release tag: {tag}, version: {ver}"
-                    ))
+                if not latest_version:
+                    raise ValueError("Could not find version in script")
                 
                 current_version = self.get_version()
                 
                 # Compare versions (simple string comparison works for semantic versioning)
-                comparison = self._compare_versions(latest_version, current_version)
-                
-                # Debug logging
-                if show_if_no_update:
-                    self.root.after(0, lambda cv=current_version, lv=latest_version, comp=comparison: self.log(
-                        f"DEBUG: Version comparison - Current: {cv}, Latest: {lv}, Result: {comp}"
-                    ))
-                
-                if comparison > 0:
+                if self._compare_versions(latest_version, current_version) > 0:
                     # Update available - show popup
-                    download_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/{latest_tag}/bandcamp_dl_gui.py"
+                    # Try to get release notes from latest release if available
+                    release_notes = ""
+                    try:
+                        releases_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
+                        releases_response = requests.get(releases_url, timeout=5)
+                        if releases_response.status_code == 200:
+                            release_data = releases_response.json()
+                            # Check if this release matches our version
+                            release_tag = release_data.get("tag_name", "").lstrip("v")
+                            if release_tag == latest_version:
+                                release_notes = release_data.get("body", "")
+                    except:
+                        pass  # If we can't get release notes, continue without them
+                    
+                    download_url = script_url
                     self.root.after(0, lambda: self._show_update_popup(
-                        current_version, latest_version, download_url, release_data.get("body", "")
+                        current_version, latest_version, download_url, release_notes
                     ))
                 elif show_if_no_update:
                     # User manually checked, show "up to date" message
@@ -8111,10 +8119,56 @@ class BandcampDownloaderGUI:
             f"The application will now restart."
         )
         
-        # Restart the application
-        python = sys.executable
+        # Get script path
         script = Path(__file__).resolve()
-        os.execl(python, python, str(script))
+        
+        # Determine how to restart
+        # If running from launcher, sys.executable might be launcher.exe
+        # If running standalone, sys.executable is Python
+        python_exe = sys.executable
+        
+        # Check if we're running as a script (not frozen/launcher)
+        if not hasattr(sys, 'frozen') and python_exe.endswith('python.exe') or python_exe.endswith('pythonw.exe') or 'python' in python_exe.lower():
+            # Standalone Python mode - restart with Python
+            restart_cmd = [python_exe, str(script)]
+        else:
+            # Launcher mode or frozen - try to find Python or use current executable
+            # Try to find Python in PATH
+            try:
+                python_cmd = subprocess.check_output(['where', 'python'], shell=True, stderr=subprocess.DEVNULL).decode().strip().split('\n')[0]
+                restart_cmd = [python_cmd, str(script)]
+            except:
+                # Fallback: use current executable (launcher will handle it)
+                restart_cmd = [python_exe, str(script)]
+        
+        # Close the main window
+        self.root.quit()
+        self.root.destroy()
+        
+        # Small delay to ensure window closes and file handles are released
+        import time
+        time.sleep(0.3)
+        
+        # Restart using subprocess (more reliable than os.execl)
+        try:
+            # Use CREATE_NEW_CONSOLE on Windows to start in new process
+            creation_flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0
+            subprocess.Popen(restart_cmd, creationflags=creation_flags)
+            # Exit current process
+            sys.exit(0)
+        except Exception as e:
+            # Fallback to os.execl if subprocess fails
+            try:
+                os.execl(restart_cmd[0], *restart_cmd)
+            except:
+                # Last resort: just exit and let user restart manually
+                messagebox.showerror(
+                    "Restart Failed",
+                    f"Update completed, but automatic restart failed.\n\n"
+                    f"Please manually restart the application.\n\n"
+                    f"Error: {str(e)}"
+                )
+                sys.exit(0)
     
     def _show_settings_menu(self, event):
         """Show settings menu when cog icon is clicked."""
