@@ -44,7 +44,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 **Installation**
 
 1. Download [BandcampDownloader.exe](https://github.com/kameryn1811/Bandcamp-Downloader/releases/download/Launcher/BandcampDownloader.exe) and run it! (comes with everything you need bundled in)
-2. Profit!
+2. Profit! **Note:** You may see a Windows Defender SmartScreen Warning, see below for more information. 
 3. Running the launcher automatically:
    - Downloads the latest `bandcamp_dl_gui.py` script from GitHub
    - Launches the application
@@ -52,6 +52,32 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
    - Self-contained - No Python installation needed
    - Comes with ffmpeg.exe bundled
    - Single executable file
+   
+**Windows SmartScreen Warning**
+
+When you first run `BandcampDownloader.exe`, you may see a Windows Defender SmartScreen warning that says:
+> "Windows protected your PC" or "Microsoft Defender SmartScreen prevented an unrecognized app from starting"
+
+This warning appears because:
+- The executable is not code-signed with a Microsoft certificate
+- Code signing certificates cost money (typically $200-400/year)
+- This is a free, open-source project without commercial funding
+
+**This warning is safe to ignore.** 
+
+The executable is not malicious - it's the same code you can review on GitHub.
+To Proceed: 
+1. Click **"More info"** on the warning dialog
+2. Click **"Run anyway"** button that appears
+3. The application will launch normally
+4. After running it once, Windows will remember your choice and won't show the warning again for this file.
+
+**Alternative: Review the Source Code**
+
+If you're concerned about security, you can:
+- Review the source code on [GitHub](https://github.com/kameryn1811/Bandcamp-Downloader)
+- Build the executable yourself using the provided `launcher.spec` file
+- Use the standalone Python script option instead (Option 2 below)
 
 ### Option 2: Standalone Script (For Advanced Users)
 
