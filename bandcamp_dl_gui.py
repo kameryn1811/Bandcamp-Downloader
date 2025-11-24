@@ -149,7 +149,7 @@ class BandcampDownloaderGUI:
         "5": "Album / Artist",
     }
     DEFAULT_STRUCTURE = "4"
-    DEFAULT_FORMAT = "mp3 (128kbps)"
+    DEFAULT_FORMAT = "Original"
     DEFAULT_NUMBERING = "None"
     
     def _extract_format(self, format_val):
@@ -443,13 +443,17 @@ class BandcampDownloaderGUI:
         
         try:
             if icon_path.exists():
-                icon_path_str = str(icon_path)
+                icon_path_str = str(icon_path.resolve())  # Use absolute path
                 
-                # Method 1: iconbitmap - sets title bar icon
+                # Method 1: iconbitmap - sets title bar icon (MUST be called first)
                 try:
                     self.root.iconbitmap(default=icon_path_str)
-                except:
-                    pass
+                except Exception as e:
+                    # If iconbitmap fails, try without default parameter
+                    try:
+                        self.root.iconbitmap(icon_path_str)
+                    except:
+                        pass
                 
                 # Method 2: iconphoto - sets taskbar icon (more reliable)
                 try:
@@ -464,14 +468,15 @@ class BandcampDownloaderGUI:
                 except:
                     pass
                 
-                # Method 3: Windows API - force set taskbar icon (for batch-launched scripts)
+                # Method 3: Windows API - force set both title bar and taskbar icons
                 if sys.platform == 'win32':
                     try:
                         import ctypes
                         from ctypes import wintypes
                         
-                        # Force window update to ensure it's ready
+                        # Wait for window to be fully created
                         self.root.update_idletasks()
+                        self.root.update()
                         
                         # Get window handle - winfo_id() returns the HWND on Windows
                         hwnd = self.root.winfo_id()
@@ -480,8 +485,8 @@ class BandcampDownloaderGUI:
                             LR_LOADFROMFILE = 0x0010
                             IMAGE_ICON = 1
                             WM_SETICON = 0x0080
-                            ICON_SMALL = 0
-                            ICON_BIG = 1
+                            ICON_SMALL = 0  # Title bar icon (16x16)
+                            ICON_BIG = 1    # Taskbar icon (32x32)
                             
                             # Load the icon from file
                             icon_handle = ctypes.windll.user32.LoadImageW(
@@ -495,14 +500,16 @@ class BandcampDownloaderGUI:
                             
                             if icon_handle:
                                 # SendMessageW expects HWND as void pointer
-                                # On Windows, winfo_id() returns the actual HWND
-                                # Use ctypes.windll.user32.SendMessageW with proper types
                                 SendMessageW = ctypes.windll.user32.SendMessageW
                                 SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
                                 SendMessageW.restype = wintypes.LPARAM
                                 
+                                # Set both small (title bar) and big (taskbar) icons
                                 SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon_handle)
                                 SendMessageW(hwnd, WM_SETICON, ICON_BIG, icon_handle)
+                                
+                                # Force window to redraw
+                                self.root.update_idletasks()
                     except Exception:
                         # Silently fail - other methods should still work
                         pass
@@ -669,7 +676,7 @@ class BandcampDownloaderGUI:
         self._save_settings()
     
     def load_saved_format(self):
-        """Load saved audio format preference, default to mp3 (128kbps) if not found."""
+        """Load saved audio format preference, default to Original if not found."""
         settings = self._load_settings()
         format_val = settings.get("audio_format", self.DEFAULT_FORMAT)
         # Support both old format ("mp3") and new format ("mp3 (128kbps)")
