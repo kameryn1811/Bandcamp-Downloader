@@ -98,7 +98,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 ## Troubleshooting
 
-**"Windows SmartScreen Warning**
+**Windows SmartScreen Warning**
 - When you open BandcampDownloader.exe, Windows might say: "Windows protected your PC"
 - This happens because the app isn’t code-signed (certificates are pricey, and this is a free open-source project).
 - No worries, it’s safe to run. The EXE is the same code you can read on GitHub.
