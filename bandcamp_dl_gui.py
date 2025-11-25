@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.9"
+__version__ = "1.2.0"
 
 import sys
 import subprocess
@@ -5368,12 +5368,37 @@ class BandcampDownloaderGUI:
                     track_title = file_title
                     
                     # Try to find track number from download_info
+                    # Use more precise matching to avoid false matches
+                    best_match = None
+                    best_match_score = 0
+                    
+                    # Normalize file title for comparison (remove common prefixes, extra spaces)
+                    normalized_file_title = re.sub(r'^\d+[.\-\s]*', '', file_title.lower()).strip()
+                    
                     for title_key, info in self.download_info.items():
-                        # Match by comparing filename with track title
-                        if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
-                            track_number = info.get("track_number")
-                            track_title = info.get("title", file_title)
-                            break
+                        # Normalize title key for comparison
+                        normalized_title_key = title_key.lower().strip()
+                        
+                        # Calculate match score (prefer exact matches, then contains matches)
+                        match_score = 0
+                        if normalized_file_title == normalized_title_key:
+                            match_score = 100  # Exact match
+                        elif normalized_file_title in normalized_title_key or normalized_title_key in normalized_file_title:
+                            # Substring match - calculate similarity
+                            shorter = min(len(normalized_file_title), len(normalized_title_key))
+                            longer = max(len(normalized_file_title), len(normalized_title_key))
+                            if shorter > 0:
+                                # Score based on how much of the shorter string is in the longer one
+                                match_score = (shorter / longer) * 50
+                        
+                        # Only accept matches with significant similarity (at least 60% of shorter string)
+                        if match_score > best_match_score and match_score >= 30:
+                            best_match_score = match_score
+                            best_match = info
+                    
+                    if best_match:
+                        track_number = best_match.get("track_number")
+                        track_title = best_match.get("title", file_title)
                     
                     # If not found in download_info, try to extract from metadata in file
                     if track_number is None:
@@ -5568,15 +5593,30 @@ class BandcampDownloaderGUI:
                     except Exception:
                         pass
             
-            # If no downloaded files found, fall back to searching base_path but only immediate subdirectories
+            # If no downloaded files found, use timestamp-based fallback to find recently downloaded files
+            # This ensures we only process files from this download session, not existing files
             if not directories_to_search:
-                # Only search immediate subdirectories, not recursively from root
-                try:
-                    for item in base_path.iterdir():
-                        if item.is_dir():
-                            directories_to_search.add(item)
-                except Exception:
-                    pass
+                if hasattr(self, 'download_start_time') and self.download_start_time:
+                    # Use timestamp-based filtering to find directories with recently downloaded files
+                    time_threshold = self.download_start_time - 30
+                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                    try:
+                        for ext in audio_extensions:
+                            for audio_file in base_path.rglob(f"*{ext}"):
+                                # Skip temporary files
+                                if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
+                                    continue
+                                # Only include files modified after download started (with buffer)
+                                try:
+                                    file_mtime = audio_file.stat().st_mtime
+                                    if file_mtime >= time_threshold:
+                                        directories_to_search.add(audio_file.parent)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                
+                # If still no directories found, don't process anything (safety: don't modify existing files)
             
             # Only search in directories that contain downloaded files
             if hasattr(self, 'download_start_time') and self.download_start_time:
@@ -5729,49 +5769,55 @@ class BandcampDownloaderGUI:
                     except Exception:
                         pass
             
-            # If no downloaded files found, fall back to structure-based search
-            # but only search immediate subdirectories, not recursively from root
+            # If no downloaded files found, use timestamp-based fallback to find recently downloaded files
+            # This ensures we only process files from this download session, not existing files
             if not directories_to_check:
-                # Get folder structure choice
-                choice = self._extract_structure_choice(self.folder_structure_var.get())
+                if hasattr(self, 'download_start_time') and self.download_start_time:
+                    # Use timestamp-based filtering to find directories with recently downloaded files
+                    time_threshold = self.download_start_time - 30
+                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                    try:
+                        for ext in audio_extensions:
+                            for audio_file in base_path.rglob(f"*{ext}"):
+                                # Skip temporary files
+                                if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
+                                    continue
+                                # Only include files modified after download started (with buffer)
+                                try:
+                                    file_mtime = audio_file.stat().st_mtime
+                                    if file_mtime >= time_threshold:
+                                        directories_to_check.add(audio_file.parent)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                 
-                # For structure 4 (Artist/Album) or 5 (Album/Artist), check album-level directories
-                if choice in ["4", "5"]:
-                    # Find all directories that are 2 levels deep (Artist/Album or Album/Artist)
-                    try:
-                        for item in base_path.iterdir():
-                            if item.is_dir():
-                                for subitem in item.iterdir():
-                                    if subitem.is_dir():
-                                        directories_to_check.add(subitem)
-                    except Exception:
-                        pass
-                elif choice == "2":
-                    # Structure 2: Album folder - check album directories
-                    try:
-                        for item in base_path.iterdir():
-                            if item.is_dir():
-                                directories_to_check.add(item)
-                    except Exception:
-                        pass
-                elif choice == "3":
-                    # Structure 3: Artist folder - check artist directories
-                    try:
-                        for item in base_path.iterdir():
-                            if item.is_dir():
-                                directories_to_check.add(item)
-                    except Exception:
-                        pass
-                else:
-                    # Structure 1: Root - check base path only (not recursively)
-                    directories_to_check.add(base_path)
+                # If still no directories found, don't process anything (safety: don't modify existing files)
+                # This ensures we only process files that were definitely downloaded in this session
             
             # Process each directory
             for directory in directories_to_check:
                 # Find all cover art files in this directory
                 cover_art_files = []
-                for ext in self.THUMBNAIL_EXTENSIONS:
-                    cover_art_files.extend(directory.glob(f"*{ext}"))
+                
+                # Only process cover art files that were downloaded in this session
+                if hasattr(self, 'download_start_time') and self.download_start_time:
+                    time_threshold = self.download_start_time - 30
+                    for ext in self.THUMBNAIL_EXTENSIONS:
+                        for thumb_file in directory.glob(f"*{ext}"):
+                            try:
+                                # Only include files modified after download started (with buffer)
+                                file_mtime = thumb_file.stat().st_mtime
+                                if file_mtime >= time_threshold:
+                                    cover_art_files.append(thumb_file)
+                            except Exception:
+                                pass
+                else:
+                    # If no timestamp available, only process if we have downloaded_files tracking
+                    # Otherwise skip to avoid modifying existing files
+                    if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                        for ext in self.THUMBNAIL_EXTENSIONS:
+                            cover_art_files.extend(directory.glob(f"*{ext}"))
                 
                 if not cover_art_files:
                     continue
@@ -7193,6 +7239,9 @@ class BandcampDownloaderGUI:
                     # Fetch metadata and artwork (will update preview and artwork)
                     self.fetch_album_metadata(album_url)
                     
+                    # Reset download_start_time for this album to ensure timestamp filtering works correctly
+                    self.download_start_time = time.time()
+                    
                     # Download this album
                     success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_urls))
                     
@@ -7379,6 +7428,9 @@ class BandcampDownloaderGUI:
                     else:
                         # Fetch metadata and artwork (will update preview and artwork)
                         self.fetch_album_metadata(album_url)
+                    
+                    # Reset download_start_time for this album to ensure timestamp filtering works correctly
+                    self.download_start_time = time.time()
                     
                     # Add a small delay between albums in batch mode to avoid rate limiting
                     # (except for the first album)
