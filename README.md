@@ -59,19 +59,18 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 * Track pages: `https://[artist].bandcamp.com/track/[track]`
 * Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
 
-**Windows SmartScreen Warning**
+### Windows SmartScreen Warning
 
 When you open BandcampDownloader.exe, Windows might say:
-   * "Windows protected your PC"
+"Windows protected your PC"
 
 This happens because the app isn’t code-signed (certificates are pricey, and this is a free open-source project).
+
 No worries, it’s safe to run. The EXE is the same code you can read on GitHub.
 
-**To continue:**
-   * Click "More info" amd "Run anyway"
+**To continue:** Click "More info" amd "Run anyway"
 
-**Want extra peace of mind?**
-You can review the code, build it yourself, or use the standalone Python script in Option 2 Below.
+**Want extra peace of mind?** You can review the code, build it yourself, or use the standalone Python script in Option 2 Below.
 
 ### Option 2: Standalone Script (For Advanced Users)
 
