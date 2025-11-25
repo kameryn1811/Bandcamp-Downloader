@@ -37,6 +37,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 ## Quick Start
 
+
 ### Option 1: Launcher (Recommended - Self-Contained)
 
 **For users who want everything bundled:**
@@ -59,6 +60,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 * Track pages: `https://[artist].bandcamp.com/track/[track]`
 * Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
 
+
 ### Windows SmartScreen Warning
 
 When you open BandcampDownloader.exe, Windows might say:
@@ -72,7 +74,8 @@ No worries, it’s safe to run. The EXE is the same code you can read on GitHub.
 
 **Want extra peace of mind?** 
 
-You can review the code, build it yourself, or use the standalone Python script in Option 2 Below.
+You can review the code, build it yourself, or use the standalone Python script like in Option 2 below.
+
 
 ### Option 2: Standalone Script (For Advanced Users)
 
@@ -109,6 +112,7 @@ You can review the code, build it yourself, or use the standalone Python script 
 * Track pages: `https://[artist].bandcamp.com/track/[track]`
 * Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
 
+
 ## Troubleshooting
 
 **"Python not found"**
@@ -133,6 +137,7 @@ You can review the code, build it yourself, or use the standalone Python script 
 - Antivirus software with HTTPS/SSL scanning (Kaspersky, ESET, Dr.Web, etc.) may interfere with image requests — temporarily disable these features to test.
 - Bad DNS routing can also cause slow or missing images. Switching to 1.1.1.1, 8.8.8.8, or 9.9.9.9 may help.
 
+
 ## Audio Quality & Artist Support
 
 **⚠️ About Quality**
@@ -152,11 +157,13 @@ Bandcamp is one of the best platforms for independent artists:
 
 **If you enjoy the music, please support the artists by purchasing their work!**
 
+
 ## Credits & Inspiration
 
 This project exists thanks to [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader). This Python version was created to provide a working alternative while we await updates to the original project.
 
 **Thank you, Otiel, for the inspiration and for building such a useful tool!**
+
 
 ## Legal & Ethical Use
 
@@ -166,6 +173,7 @@ This tool is designed for:
 * Building a local library of music you've purchased
 
 Please respect copyright laws and Bandcamp's terms of service. Support artists by purchasing music when possible.
+
 
 ## Disclaimer
 
