@@ -45,7 +45,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 **Installation**
 
 1. Download [BandcampDownloader.exe](https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.0) and run it! (everything else is automatic)
-2. **Note:** You may see a Windows Defender SmartScreen Warning, see below for more information. 
+2. **Note:** You may see a Windows Defender SmartScreen Warning, see [Troubleshooting](#troubleshooting) for more information. 
 3. What it Does:
    - Downloads the latest `bandcamp_dl_gui.py` script from GitHub and Launches it
    - Checks for updates on startup
@@ -58,22 +58,6 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 * Album pages: `https://[artist].bandcamp.com/album/[album]`
 * Track pages: `https://[artist].bandcamp.com/track/[track]`
 * Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
-
-
-### Windows SmartScreen Warning
-
-When you open BandcampDownloader.exe, Windows might say:
-"Windows protected your PC"
-
-This happens because the app isn’t code-signed (certificates are pricey, and this is a free open-source project).
-
-No worries, it’s safe to run. The EXE is the same code you can read on GitHub.
-
-**To continue:** Click "More info" amd "Run anyway"
-
-**Want extra peace of mind?** 
-
-You can review the code, build it yourself, or use the standalone Python script like in Option 2 below.
 
 
 ### Option 2: Standalone Script (For Advanced Users)
@@ -113,6 +97,13 @@ You can review the code, build it yourself, or use the standalone Python script 
 
 
 ## Troubleshooting
+
+**"Windows SmartScreen Warning**
+- When you open BandcampDownloader.exe, Windows might say: "Windows protected your PC"
+- This happens because the app isn’t code-signed (certificates are pricey, and this is a free open-source project).
+- No worries, it’s safe to run. The EXE is the same code you can read on GitHub.
+- **To continue:** Click "More info" amd "Run anyway"
+- **Want extra peace of mind?** - You can review the code, build it yourself, or use the standalone Python script like in Option 2.
 
 **"Python not found"**
 - Reinstall Python and ensure "Add Python to PATH" is checked
