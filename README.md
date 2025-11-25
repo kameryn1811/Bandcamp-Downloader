@@ -48,7 +48,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 2. **Note:** You may see a Windows Defender SmartScreen Warning, see below for more information. 
 3. What it Does:
    - Downloads the latest `bandcamp_dl_gui.py` script from GitHub and Launches it
-   - Check for updates on startup
+   - Checks for updates on startup
    - Self-contained - No Python installation needed
    - Comes with ffmpeg.exe bundled
    - Single executable file
