@@ -70,7 +70,9 @@ No worries, it’s safe to run. The EXE is the same code you can read on GitHub.
 
 **To continue:** Click "More info" amd "Run anyway"
 
-**Want extra peace of mind?** You can review the code, build it yourself, or use the standalone Python script in Option 2 Below.
+**Want extra peace of mind?** 
+
+You can review the code, build it yourself, or use the standalone Python script in Option 2 Below.
 
 ### Option 2: Standalone Script (For Advanced Users)
 
