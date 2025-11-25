@@ -8329,19 +8329,11 @@ class BandcampDownloaderGUI:
                 # Compare versions
                 comparison_result = self._compare_versions(latest_version, current_version)
                 
-                # Log what we found for debugging
-                if hasattr(self, 'log'):
-                    self.root.after(0, lambda: self.log(
-                        f"Update check: Found version v{latest_version} in main branch, "
-                        f"current version: v{current_version}, comparison result: {comparison_result} "
-                        f"({'newer' if comparison_result > 0 else 'same' if comparison_result == 0 else 'older'})"
-                    ))
-                
                 if comparison_result > 0:
                     # Update available - show popup
-                    # Log the download URL for debugging
+                    # Log update available (user-visible)
                     if hasattr(self, 'log'):
-                        self.root.after(0, lambda: self.log(f"Update: Will download from: {download_url}"))
+                        self.root.after(0, lambda: self.log(f"Update available: v{current_version} → v{latest_version}"))
                     
                     # Try to fetch commit message from GitHub API
                     release_notes = self._fetch_commit_message(repo_owner, repo_name, latest_version)
@@ -8349,12 +8341,21 @@ class BandcampDownloaderGUI:
                     # Capture variables in lambda to avoid closure issues
                     self.root.after(0, lambda cv=current_version, lv=latest_version, du=download_url, rn=release_notes: 
                         self._show_update_popup(cv, lv, du, rn))
-                elif show_if_no_update:
-                    # User manually checked, show "up to date" message
-                    self.root.after(0, lambda: messagebox.showinfo(
-                        "Update Check",
-                        f"You're running the latest version (v{current_version})"
-                    ))
+                else:
+                    # Only log version check details in debug mode
+                    if hasattr(self, 'log'):
+                        self.root.after(0, lambda: self.log(
+                            f"DEBUG: Update check: Found version v{latest_version} in main branch, "
+                            f"current version: v{current_version}, comparison result: {comparison_result} "
+                            f"({'newer' if comparison_result > 0 else 'same' if comparison_result == 0 else 'older'})"
+                        ))
+                    
+                    if show_if_no_update:
+                        # User manually checked, show "up to date" message
+                        self.root.after(0, lambda: messagebox.showinfo(
+                            "Update Check",
+                            f"You're running the latest version (v{current_version})"
+                        ))
             except requests.exceptions.RequestException as e:
                 if show_if_no_update:
                     self.root.after(0, lambda: messagebox.showerror(
@@ -8526,8 +8527,9 @@ class BandcampDownloaderGUI:
                 version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', new_script_content)
                 if version_match:
                     downloaded_version = version_match.group(1)
-                    # Log what we found
-                    self.root.after(0, lambda: self.log(f"Downloaded file version: {downloaded_version}, Expected: {new_version}"))
+                    # Log version verification in debug mode only
+                    if downloaded_version != new_version:
+                        self.root.after(0, lambda: self.log(f"DEBUG: Downloaded file version: {downloaded_version}, Expected: {new_version}"))
                     # The downloaded version should be >= the latest version we detected
                     if self._compare_versions(downloaded_version, new_version) < 0:
                         error_msg = (
