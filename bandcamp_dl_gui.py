@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import sys
 import subprocess
@@ -159,6 +159,36 @@ class BandcampDownloaderGUI:
         if format_val.startswith("mp3"):
             return "mp3"
         return format_val
+    
+    def _clean_title(self, title, artist=None):
+        """
+        Clean title to remove artist prefix if present.
+        Handles formats like "artist - song" or "artist: song" and returns just "song".
+        """
+        if not title:
+            return title
+        
+        # If title contains " - " (space-dash-space), split and take the part after
+        if " - " in title:
+            parts = title.split(" - ", 1)
+            if len(parts) == 2:
+                # Check if first part matches artist (if provided)
+                if artist and parts[0].strip().lower() == artist.lower():
+                    return parts[1].strip()
+                # Even if artist doesn't match, take the part after " - " as it's likely the song title
+                return parts[1].strip()
+        
+        # If title contains ": " (colon-space), split and take the part after
+        if ": " in title:
+            parts = title.split(": ", 1)
+            if len(parts) == 2:
+                if artist and parts[0].strip().lower() == artist.lower():
+                    return parts[1].strip()
+                # Take the part after ": " as it's likely the song title
+                return parts[1].strip()
+        
+        # Return title as-is if no pattern matches
+        return title.strip()
     
     def __init__(self, root):
         self.root = root
@@ -706,23 +736,32 @@ class BandcampDownloaderGUI:
         return True
     
     def _load_custom_structures(self):
-        """Load saved custom folder structures from settings."""
+        """Load saved custom folder structures from settings.
+        Normalizes old format (list of strings) to new format (list of dicts).
+        """
         settings = self._load_settings()
         custom_structures = settings.get("custom_structures", [])
-        # Validate: ensure it's a list of lists
+        # Validate: ensure it's a list
         if isinstance(custom_structures, list):
-            # Filter out invalid entries
+            # Filter out invalid entries and normalize
             valid_structures = []
             for structure in custom_structures:
                 if isinstance(structure, list) and len(structure) > 0:
-                    # Validate each item is a valid option
-                    valid = True
-                    for item in structure:
-                        if item not in ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]:
-                            valid = False
-                            break
-                    if valid:
-                        valid_structures.append(structure)
+                    # Normalize to new format
+                    normalized = self._normalize_structure(structure)
+                    if normalized:
+                        # Validate all fields are valid options
+                        valid = True
+                        all_fields = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
+                        for level in normalized:
+                            for field in level.get("fields", []):
+                                if field not in all_fields:
+                                    valid = False
+                                    break
+                            if not valid:
+                                break
+                        if valid:
+                            valid_structures.append(normalized)
             return valid_structures
         return []
     
@@ -730,15 +769,75 @@ class BandcampDownloaderGUI:
         """Save custom folder structures to settings."""
         self._save_settings()
     
+    def _normalize_structure(self, structure):
+        """Convert old format (list of strings) to new format (list of dicts with fields and separators).
+        Also handles new format (returns as-is if already normalized).
+        Old: ["Artist", "Album", "Year"]
+        New: [{"fields": ["Artist"], "separators": []}, {"fields": ["Album"], "separators": []}, {"fields": ["Year"], "separators": []}]
+        """
+        if not structure:
+            return []
+        
+        normalized = []
+        for item in structure:
+            if isinstance(item, dict) and "fields" in item:
+                # Already in new format, but ensure separators list exists
+                normalized_item = item.copy()
+                if "separator" in normalized_item:
+                    # Convert old single separator to separators list
+                    sep = normalized_item.pop("separator")
+                    normalized_item["separators"] = [sep] if sep else []
+                elif "separators" not in normalized_item:
+                    normalized_item["separators"] = []
+                normalized.append(normalized_item)
+            elif isinstance(item, str):
+                # Old format: single string field
+                normalized.append({"fields": [item], "separators": []})
+            elif isinstance(item, list):
+                # Could be old format list of strings, treat as single field
+                if item and isinstance(item[0], str):
+                    normalized.append({"fields": [item[0]], "separators": []})
+        
+        return normalized
+    
     def _format_custom_structure(self, structure):
-        """Format a custom structure list as display string (e.g., ["Artist", "Year", "Album"] -> "Artist / Year / Album")."""
+        """Format a custom structure as display string.
+        Supports both old format (list of strings) and new format (list of dicts).
+        Old: ["Artist", "Year", "Album"] -> "Artist / Year / Album"
+        New: [{"fields": ["Year"], "separator": None}, {"fields": ["Year", "Album"], "separator": "-"}] -> "Year / Year - Album"
+        """
         if not structure:
             return ""
-        # Filter out "None..." entries
-        filtered = [item for item in structure if item and item != "None..."]
-        if not filtered:
+        
+        # Normalize to new format
+        normalized = self._normalize_structure(structure)
+        if not normalized:
             return ""
-        return " / ".join(filtered)
+        
+        # Build display string for each level
+        level_strings = []
+        for level in normalized:
+            fields = level.get("fields", [])
+            separators = level.get("separators", [])
+            
+            if not fields:
+                continue
+            
+            # Join fields with separators per gap (or space if None)
+            if len(fields) == 1:
+                level_strings.append(fields[0])
+            else:
+                # Join fields with separators per gap
+                result_parts = [fields[0]]
+                for i in range(1, len(fields)):
+                    sep = separators[i-1] if i-1 < len(separators) else "-"
+                    if sep == "None" or not sep:
+                        sep = " "  # Default to space if None
+                    result_parts.append(sep)
+                    result_parts.append(fields[i])
+                level_strings.append("".join(result_parts))
+        
+        return " / ".join(level_strings)
     
     def _get_all_structure_options(self):
         """Get all folder structure options including custom structures."""
@@ -1083,18 +1182,47 @@ class BandcampDownloaderGUI:
         self.url_container_frame.columnconfigure(2, weight=0, minsize=20)  # Expand button fixed width
         self.url_container_frame.rowconfigure(0, weight=1)  # Allow vertical expansion for ScrolledText
         
-        # Single-line Entry widget (default)
+        # Single-line Entry widget (default) - with paste button overlay inside
+        # Create a frame to hold the Entry and paste button overlay
+        entry_container = Frame(self.url_container_frame, bg='#1E1E1E')
+        entry_container.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
+        entry_container.columnconfigure(0, weight=1)
+        self.entry_container = entry_container  # Store reference
+        
+        # Entry widget inside container
         url_entry = ttk.Entry(
-            self.url_container_frame,
+            entry_container,
             textvariable=self.url_var,
             width=45,
             font=("Segoe UI", 9)
         )
-        url_entry.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
+        url_entry.grid(row=0, column=0, sticky=(W, E), pady=0, padx=0)
         self.url_entry_widget = url_entry
         
         # Add placeholder text to Entry
         self._set_entry_placeholder(url_entry, "Paste one URL or multiple to create a batch.")
+        
+        # Paste button overlay inside Entry (positioned on the right, like multiline)
+        self.url_paste_btn = Label(
+            entry_container,
+            text="➕",  # Plus icon - clean, simple, matches suite style
+            font=("Segoe UI", 8),  # Smaller font to fit better
+            bg='#252526',  # Match Entry background
+            fg='#808080',
+            cursor='hand2',
+            width=1,
+            height=0,
+            padx=4,  # Right padding to keep it away from edge
+            pady=0
+        )
+        # Position at right edge of Entry, inside the widget
+        # Use 'e' anchor (east/right) with rely=0.5 for true vertical centering
+        # x offset to stay inside border with padding, y=-1 to move up slightly and avoid border
+        self.url_paste_btn.place(relx=1.0, rely=0.5, anchor='e', x=-4, y=-1)
+        self.url_paste_btn.bind("<Button-1>", lambda e: self._handle_paste_button_click())
+        self.url_paste_btn.bind("<Enter>", lambda e: self.url_paste_btn.config(fg='#D4D4D4'))
+        self.url_paste_btn.bind("<Leave>", lambda e: self.url_paste_btn.config(fg='#808080'))
+        self.url_paste_btn.lift()  # Bring to front
         
         # Clear button (X) - appears when URL field has content
         # Use smaller font and minimal padding to match entry field height
@@ -1142,6 +1270,8 @@ class BandcampDownloaderGUI:
         self._update_url_expand_button()
         
         # Bind events for Entry
+        # Bind paste events - handle selection replacement and custom append behavior
+        url_entry.bind('<<Paste>>', self._handle_entry_paste)  # Virtual paste event (proper way for Entry widgets)
         url_entry.bind('<Control-v>', self._handle_entry_paste)
         url_entry.bind('<Shift-Insert>', self._handle_entry_paste)
         url_entry.bind('<Button-2>', self._handle_entry_paste)  # Middle mouse button paste
@@ -1159,6 +1289,29 @@ class BandcampDownloaderGUI:
         url_text_frame.rowconfigure(0, weight=1)
         url_text_frame.grid_remove()  # Hidden initially
         self.url_text_frame = url_text_frame  # Store reference for easier access
+        
+        # Paste button for ScrolledText mode (overlay on text frame)
+        # This will be shown when ScrolledText is visible
+        self.url_text_paste_btn = Label(
+            url_text_frame,
+            text="➕",  # Plus icon - matches Entry paste button
+            font=("Segoe UI", 9),
+            bg='#252526',
+            fg='#808080',
+            cursor='hand2',
+            width=1,
+            height=1,
+            padx=2,
+            pady=0
+        )
+        # Position at top-right of text frame (will be positioned with place())
+        # Initially hidden, will be shown when text widget is visible
+        self.url_text_paste_btn.place(relx=1.0, rely=0.0, anchor='ne', x=-25, y=2)
+        self.url_text_paste_btn.bind("<Button-1>", lambda e: self._handle_paste_button_click())
+        self.url_text_paste_btn.bind("<Enter>", lambda e: self.url_text_paste_btn.config(fg='#D4D4D4'))
+        self.url_text_paste_btn.bind("<Leave>", lambda e: self.url_text_paste_btn.config(fg='#808080'))
+        self.url_text_paste_btn.lower()  # Place behind text widget initially
+        self.url_text_paste_btn.place_forget()  # Hidden initially
         
         url_text = scrolledtext.ScrolledText(
             url_text_frame,
@@ -1554,7 +1707,7 @@ class BandcampDownloaderGUI:
             font=("Consolas", 8),
             bg='#1E1E1E',
             fg="#2dacd5",  # Blue text
-            wraplength=450,  # Full width for preview path
+            wraplength=400,  # Reduced to ensure proper wrapping
             justify='left',
             anchor='w'  # Left-align the text
         )
@@ -2092,6 +2245,21 @@ class BandcampDownloaderGUI:
             # Currently in ScrolledText mode - collapse to Entry
             self._collapse_to_entry()
     
+    def _handle_paste_button_click(self):
+        """Handle paste button click - replace selection if present, otherwise paste at end."""
+        # Determine which mode we're in and paste accordingly
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # ScrolledText mode - paste at next blank line (handles selection internally)
+            self._paste_at_end_text()
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Entry mode - use the same handler as keyboard paste (handles selection correctly)
+            # Create a dummy event object for the handler
+            class DummyEvent:
+                def __init__(self, widget):
+                    self.widget = widget
+            event = DummyEvent(self.url_entry_widget)
+            self._handle_entry_paste(event)
+    
     def _clear_url_field(self):
         """Clear the URL field and unfocus it."""
         # Cancel any pending URL check timer to prevent race conditions
@@ -2130,29 +2298,9 @@ class BandcampDownloaderGUI:
         self._check_url()
     
     def _handle_right_click_paste(self, event):
-        """Handle right-click paste in URL field (Entry widget)."""
-        try:
-            # Save current content state before pasting (so we can undo back to it)
-            self._save_content_state()
-            
-            # Get clipboard content
-            clipboard_text = self.root.clipboard_get()
-            if clipboard_text:
-                # Clear current selection if any
-                url_entry = event.widget
-                url_entry.delete(0, END)
-                url_entry.insert(0, clipboard_text)
-                # Check if paste contains newlines - if so, expand to multi-line
-                if '\n' in clipboard_text:
-                    self._expand_to_multiline(clipboard_text)
-                    # After expansion, save state and trigger URL check (similar to single-line paste)
-                    self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
-                else:
-                    # Save new state after paste, then trigger URL check
-                    self.root.after(10, lambda: (self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_url_clear_button()))
-        except Exception:
-            # If clipboard is empty or not text, ignore
-            pass
+        """Handle right-click paste in URL field (Entry widget) - replace selection if present, otherwise paste at end."""
+        # Use the same handler as keyboard paste (handles selection correctly)
+        self._handle_entry_paste(event)
     
     def _handle_right_click_paste_entry(self, event):
         """Handle right-click paste in Entry widget."""
@@ -2170,33 +2318,246 @@ class BandcampDownloaderGUI:
             self.url_text_context_menu.grab_release()
     
     def _handle_right_click_paste_text(self, event=None):
-        """Handle right-click paste in ScrolledText widget (can be called from context menu or event)."""
+        """Handle right-click paste in ScrolledText widget - always paste at next blank line."""
+        # Save current content state before pasting (so we can undo back to it)
+        self._save_content_state()
+        # Paste at next blank line instead of at cursor
+        self._paste_at_end_text()
+    
+    def _paste_at_end_entry(self):
+        """Paste clipboard content at the end of Entry widget with space separator.
+        
+        Note: Selection replacement is handled in _handle_entry_paste().
+        This function only handles the append-at-end behavior.
+        """
         try:
-            # Save current content state before pasting (so we can undo back to it)
-            self._save_content_state()
+            # Get clipboard content
+            clipboard_text = self.root.clipboard_get()
+            if not clipboard_text:
+                return
+            
+            # Get current content
+            current_content = self.url_var.get().strip()
+            # Skip placeholder text
+            if current_content == "Paste one URL or multiple to create a batch.":
+                current_content = ""
+            
+            # Prepare new content: append with space separator if content exists
+            if current_content:
+                new_content = current_content + " " + clipboard_text.strip()
+            else:
+                new_content = clipboard_text.strip()
+            
+            # Set new content
+            self.url_var.set(new_content)
+            
+            # Move cursor to end
+            if self.url_entry_widget:
+                self.url_entry_widget.icursor(END)
+            
+            # Check if paste contains newlines - if so, expand to multi-line
+            if '\n' in clipboard_text:
+                self._expand_to_multiline(new_content)
+                # After expansion, save state and trigger URL check
+                self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+            else:
+                # Save new state after paste, then trigger URL check
+                self.root.after(10, lambda: (self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_url_clear_button()))
+        except Exception:
+            # If clipboard is empty or not text, ignore
+            pass
+    
+    def _paste_at_end_text(self):
+        """Paste clipboard content - replace selection if present, otherwise paste at next blank line."""
+        try:
+            # Get clipboard content
+            clipboard_text = self.root.clipboard_get()
+            if not clipboard_text:
+                return
+            
+            if not self.url_text_widget:
+                return
             
             # Hide placeholder immediately when pasting
             self._hide_text_placeholder()
-            # Get clipboard content
-            clipboard_text = self.root.clipboard_get()
-            if clipboard_text:
-                # Get the text widget - from event or use stored reference
-                url_text = event.widget if event and hasattr(event, 'widget') else self.url_text_widget
-                if url_text:
-                    # Insert at cursor position (Text widget)
-                    url_text.insert("insert", clipboard_text)
-                    # Save new state after paste, then trigger URL check and update count
-                    self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+            
+            # Check if there's a selection
+            try:
+                sel_ranges = self.url_text_widget.tag_ranges("sel")
+                if sel_ranges:
+                    # There's a selection - replace it
+                    sel_start = sel_ranges[0]
+                    sel_end = sel_ranges[1]
+                    
+                    # Prepare clipboard content (split by newlines, filter empty)
+                    clipboard_lines = clipboard_text.strip().split('\n')
+                    text_to_insert = '\n'.join(line.strip() for line in clipboard_lines if line.strip())
+                    
+                    # Replace selection with clipboard content
+                    self.url_text_widget.delete(sel_start, sel_end)
+                    self.url_text_widget.insert(sel_start, text_to_insert)
+                    
+                    # Move cursor to end of pasted content
+                    cursor_pos = f"{sel_start}+{len(text_to_insert)}c"
+                    self.url_text_widget.mark_set("insert", cursor_pos)
+                    
+                    # Ensure trailing blank line
+                    self._ensure_trailing_newline()
+                    
+                    # Save new state after paste, then trigger URL check
+                    self.root.after(10, lambda: (self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+                    return
+            except Exception:
+                # If selection handling fails, fall through to append behavior
+                pass
+            
+            # No selection - append at next blank line
+            # Get current content (END includes trailing newline from _ensure_trailing_newline)
+            current_content = self.url_text_widget.get(1.0, END)
+            
+            # Find where to insert: right before the trailing blank line
+            # The trailing blank line is maintained by _ensure_trailing_newline
+            # We want to insert our content on that blank line, replacing it
+            
+            # Get content without the trailing newline for analysis
+            content_without_trailing = current_content.rstrip('\n')
+            
+            if not content_without_trailing.strip():
+                # Empty content - insert at line 1
+                insert_pos = "1.0"
+            else:
+                # Find the last non-blank line
+                lines = content_without_trailing.split('\n')
+                last_non_blank_idx = -1
+                for i in range(len(lines) - 1, -1, -1):
+                    if lines[i].strip():
+                        last_non_blank_idx = i
+                        break
+                
+                if last_non_blank_idx >= 0:
+                    # Insert right after the last non-blank line (on the blank line)
+                    # Line numbers are 1-based, so last_non_blank_idx + 1 is the last non-blank line
+                    # We want to insert at the start of the next line (last_non_blank_idx + 2)
+                    insert_pos = f"{last_non_blank_idx + 2}.0"
+                else:
+                    # All lines are blank - insert at line 1
+                    insert_pos = "1.0"
+            
+            # Prepare clipboard content (split by newlines, filter empty)
+            clipboard_lines = clipboard_text.strip().split('\n')
+            text_to_insert = '\n'.join(line.strip() for line in clipboard_lines if line.strip())
+            
+            # Check if the line we're inserting at is blank (it should be, due to _ensure_trailing_newline)
+            # If it's not blank, we need to add a newline before our content
+            try:
+                line_at_insert = self.url_text_widget.get(insert_pos, f"{insert_pos} lineend")
+                if line_at_insert.strip():
+                    # Line has content - add newline before our content
+                    text_to_insert = '\n' + text_to_insert
+            except:
+                pass
+            
+            # Insert the content (this will replace the blank line if it exists, or insert on it)
+            self.url_text_widget.insert(insert_pos, text_to_insert)
+            
+            # Ensure trailing blank line (this maintains the blank line at the end)
+            # It won't add extra blank lines - it only ensures one exists
+            self._ensure_trailing_newline()
+            
+            # Move cursor to end of inserted content
+            self.url_text_widget.mark_set("insert", "end-1c")
+            
+            # Save new state after paste, then trigger URL check
+            self.root.after(10, lambda: (self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
         except Exception:
             # If clipboard is empty or not text, ignore
             pass
     
     def _handle_entry_paste(self, event):
-        """Handle paste in Entry widget - check for newlines and expand if needed."""
-        # Save current content state before pasting (so we can undo back to it)
+        """Handle paste in Entry widget - replace selection if present, otherwise append at end."""
+        widget = event.widget if hasattr(event, 'widget') else self.url_entry_widget
+        if not widget:
+            widget = self.url_entry_widget
+        
+        # Save current content state before pasting
         self._save_content_state()
-        # Let the paste happen first, then save new state and check
-        self.root.after(10, lambda: (self._check_entry_paste(), self._save_content_state()))
+        
+        # Get clipboard content
+        try:
+            clipboard_text = self.root.clipboard_get()
+        except Exception:
+            return "break"
+        
+        if not clipboard_text:
+            return "break"
+        
+        # Get current cursor position BEFORE checking selection
+        try:
+            cursor_pos = widget.index("insert")
+        except Exception:
+            cursor_pos = None
+        
+        # Try to get and delete selection
+        # Entry widgets: selection_range() is a SETTER, not a getter!
+        # We need to use selection_present() to check, then get indices another way
+        had_selection = False
+        try:
+            # Check if selection is present first
+            if widget.selection_present():
+                # Try to get selection indices using index() with "sel.first" and "sel.last"
+                # These might work for Entry widgets (they work for Text widgets)
+                try:
+                    sel_start = widget.index("sel.first")
+                    sel_end = widget.index("sel.last")
+                    if sel_start is not None and sel_end is not None:
+                        if sel_start > sel_end:
+                            sel_start, sel_end = sel_end, sel_start
+                        if sel_start != sel_end:
+                            # Delete the selected text
+                            widget.delete(sel_start, sel_end)
+                            had_selection = True
+                            # Cursor is now at sel_start after delete
+                            cursor_pos = sel_start
+                except Exception:
+                    # "sel.first" and "sel.last" indices not available
+                    pass
+        except Exception:
+            # No selection or selection_present() failed
+            pass
+        
+        if had_selection:
+            # There was a selection - insert at cursor position (which is now at sel_start)
+            widget.insert("insert", clipboard_text.strip())
+        else:
+            # No selection - check if cursor is at end
+            # widget.index("end") returns position AFTER last character
+            # So if content has N chars, "end" is at position N, and cursor at end is at N-1 or N
+            try:
+                end_pos = widget.index("end")
+                current_content = self.url_var.get()
+                content_len = len(current_content)
+                
+                # Check if cursor is at or past the end of content
+                # This handles both cursor at last char (end_pos - 1) and after last char (end_pos)
+                if cursor_pos is not None:
+                    if cursor_pos >= content_len or cursor_pos == end_pos - 1 or cursor_pos == end_pos:
+                        # Cursor is at end - use our custom append behavior (adds space separator)
+                        self._paste_at_end_entry()
+                        return "break"
+            except Exception:
+                pass
+            
+            # Cursor is in the middle - insert at cursor position (normal paste behavior, no space)
+            widget.insert("insert", clipboard_text.strip())
+        
+        # Handle newlines and updates
+        new_content = self.url_var.get()
+        if '\n' in clipboard_text:
+            self._expand_to_multiline(new_content)
+            self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+        else:
+            self.root.after(10, lambda: (self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_url_clear_button()))
+        return "break"  # Prevent default paste (we handled it ourselves)
     
     def _check_entry_paste(self):
         """Check if Entry content has newlines and expand if needed."""
@@ -2279,14 +2640,13 @@ class BandcampDownloaderGUI:
         return "break"  # Prevent default behavior
     
     def _handle_text_paste(self, event):
-        """Handle paste in ScrolledText widget."""
+        """Handle paste in ScrolledText widget - always paste at next blank line."""
         # Save current content state before pasting (so we can undo back to it)
         self._save_content_state()
-        
-        # Hide placeholder immediately when pasting
-        self._hide_text_placeholder()
-        # Let the paste happen first, then save the new state and check
-        self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
+        # Prevent default paste behavior
+        # Paste at next blank line instead
+        self._paste_at_end_text()
+        return "break"  # Prevent default paste behavior
     
     def _handle_entry_undo(self, event):
         """Handle undo (Ctrl+Z) in Entry widget - cycle to previous content state."""
@@ -2734,6 +3094,12 @@ class BandcampDownloaderGUI:
     
     def _expand_to_multiline(self, initial_content=""):
         """Expand from Entry to ScrolledText for multi-line input."""
+        # Hide Entry paste button, show ScrolledText paste button
+        if hasattr(self, 'url_paste_btn'):
+            self.url_paste_btn.grid_remove()
+        if hasattr(self, 'url_text_paste_btn'):
+            self.url_text_paste_btn.place(relx=1.0, rely=0.0, anchor='ne', x=-25, y=2)
+            self.url_text_paste_btn.lift()  # Bring to front
         if not self.url_text_widget:
             return
         
@@ -2759,8 +3125,13 @@ class BandcampDownloaderGUI:
         # Get the text frame - use stored reference if available, otherwise get from widget
         text_frame = getattr(self, 'url_text_frame', None) or self.url_text_widget.master
         
-        # Hide Entry first - completely remove it from grid
-        if self.url_entry_widget:
+        # Hide Entry container first - completely remove it from grid
+        if hasattr(self, 'entry_container') and self.entry_container:
+            try:
+                self.entry_container.grid_forget()
+            except:
+                pass  # Already removed
+        elif self.url_entry_widget:
             try:
                 self.url_entry_widget.grid_forget()
             except:
@@ -2812,6 +3183,14 @@ class BandcampDownloaderGUI:
         if hasattr(self, 'url_text_resize_handle'):
             self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=5, y=-1)
             self.url_text_resize_handle.lift()  # Bring to front so it's draggable
+        
+        # Show paste button for ScrolledText mode
+        if hasattr(self, 'url_text_paste_btn'):
+            self.url_text_paste_btn.place(relx=1.0, rely=0.0, anchor='ne', x=-25, y=2)
+            self.url_text_paste_btn.lift()  # Bring to front
+        # Hide Entry paste button (it's inside entry_container, so hiding container hides it)
+        if hasattr(self, 'url_paste_btn'):
+            self.url_paste_btn.place_forget()
         
         # Make sure the widget is actually visible
         self.url_text_widget.update_idletasks()
@@ -2874,8 +3253,18 @@ class BandcampDownloaderGUI:
             if hasattr(self, 'url_text_resize_handle'):
                 self.url_text_resize_handle.place_forget()
         
-        # Re-grid the Entry widget with original padding
-        if self.url_entry_widget:
+        # Hide ScrolledText paste button, show Entry paste button
+        if hasattr(self, 'url_text_paste_btn'):
+            self.url_text_paste_btn.place_forget()
+        if hasattr(self, 'entry_container') and self.entry_container:
+            # Re-grid the Entry container with original padding
+            self.entry_container.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
+            # Show paste button inside Entry (reposition to ensure it's centered)
+            if hasattr(self, 'url_paste_btn'):
+                self.url_paste_btn.place(relx=1.0, rely=0.5, anchor='e', x=-4, y=-1)
+                self.url_paste_btn.lift()
+        elif self.url_entry_widget:
+            # Fallback: re-grid Entry widget directly if container doesn't exist
             self.url_entry_widget.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
         
         # Force layout update
@@ -4148,24 +4537,65 @@ class BandcampDownloaderGUI:
         
         # Handle custom structures
         if isinstance(choice, list):
+            # Normalize to new format (handles both old and new)
+            normalized = self._normalize_structure(choice)
+            
             # Build path from custom structure
             path_parts = [base_path]
-            year = "2024"  # Example year for preview
-            for item in choice:
-                if item == "Artist":
-                    path_parts.append(artist)
-                elif item == "Album":
-                    path_parts.append(album)
-                elif item == "Year":
-                    path_parts.append(year)
-                elif item == "Genre":
-                    path_parts.append("Genre")  # Example genre for preview
-                elif item == "Label":
-                    path_parts.append("Label")  # Example label for preview
-                elif item == "Album Artist":
-                    path_parts.append("Album Artist")  # Example album artist for preview
-                elif item == "Catalog Number":
-                    path_parts.append("CAT001")  # Example catalog number for preview
+            
+            # Example metadata values
+            field_values = {
+                "Artist": artist,
+                "Album": album,
+                "Year": "2024",
+                "Genre": "Genre",
+                "Label": "Label",
+                "Album Artist": "Album Artist",
+                "Catalog Number": "CAT001"
+            }
+            
+            for level in normalized:
+                fields = level.get("fields", [])
+                separators = level.get("separators", [])
+                
+                if not fields:
+                    continue
+                
+                # Build level string with prefix, between, and suffix separators
+                result_parts = []
+                
+                # Add prefix separator (before first field)
+                prefix_sep = separators[0] if separators and len(separators) > 0 else ""
+                if prefix_sep and prefix_sep != "None":
+                    result_parts.append(prefix_sep)
+                
+                # Add fields with between separators
+                level_parts = []
+                for field in fields:
+                    value = field_values.get(field, "")
+                    if value:
+                        level_parts.append(value)
+                
+                for i, field_value in enumerate(level_parts):
+                    result_parts.append(field_value)
+                    
+                    # Add between separator (after each field except last)
+                    if i < len(level_parts) - 1:
+                        between_idx = i + 1  # separators[1] after first field, separators[2] after second, etc.
+                        between_sep = separators[between_idx] if between_idx < len(separators) else "-"
+                        if between_sep == "None" or not between_sep:
+                            between_sep = " "  # Default to space if None
+                        result_parts.append(between_sep)
+                
+                # Add suffix separator (after last field)
+                suffix_idx = len(level_parts)  # separators[n] where n = number of fields
+                suffix_sep = separators[suffix_idx] if suffix_idx < len(separators) else ""
+                if suffix_sep and suffix_sep != "None":
+                    result_parts.append(suffix_sep)
+                
+                if result_parts:
+                    path_parts.append("".join(result_parts))
+            
             path_parts.append(f"{title}{ext}")
             preview_path = str(Path(*path_parts))
         else:
@@ -4930,30 +5360,70 @@ class BandcampDownloaderGUI:
         base_folder = Path(self.path_var.get())
         choice = self._extract_structure_choice(self.folder_structure_var.get())
         
-        # Handle custom structures (list)
+        # Handle custom structures (list - can be old or new format)
         if isinstance(choice, list):
+            # Normalize to new format
+            normalized = self._normalize_structure(choice)
+            
             # Build path from custom structure
             path_parts = [base_folder]
-            for item in choice:
-                if item == "Artist":
-                    path_parts.append("%(artist)s")
-                elif item == "Album":
-                    path_parts.append("%(album)s")
-                elif item == "Year":
-                    # Extract year from release_date (format: YYYYMMDD -> YYYY)
-                    path_parts.append("%(release_date>%Y)s")
-                elif item == "Genre":
-                    # Use genre metadata (will be empty if not available)
-                    path_parts.append("%(genre)s")
-                elif item == "Label":
-                    # Use publisher/label metadata (will be empty if not available)
-                    path_parts.append("%(publisher)s")
-                elif item == "Album Artist":
-                    # Use album_artist metadata (will be empty if not available)
-                    path_parts.append("%(album_artist)s")
-                elif item == "Catalog Number":
-                    # Use catalog_number metadata (will be empty if not available)
-                    path_parts.append("%(catalog_number)s")
+            
+            # Field to template mapping
+            field_templates = {
+                "Artist": "%(artist)s",
+                "Album": "%(album)s",
+                "Year": "%(release_date>%Y)s",  # Extract year from release_date
+                "Genre": "%(genre)s",
+                "Label": "%(publisher)s",
+                "Album Artist": "%(album_artist)s",
+                "Catalog Number": "%(catalog_number)s"
+            }
+            
+            for level in normalized:
+                fields = level.get("fields", [])
+                separators = level.get("separators", [])
+                
+                if not fields:
+                    continue
+                
+                # Build template parts for this level
+                template_parts = []
+                for field in fields:
+                    if field in field_templates:
+                        template_parts.append(field_templates[field])
+                
+                if template_parts:
+                    # Build template with prefix, between, and suffix separators
+                    # separators[0] = prefix, separators[1..n-1] = between, separators[n] = suffix
+                    result_parts = []
+                    
+                    # Add prefix separator (before first field)
+                    prefix_sep = separators[0] if separators and len(separators) > 0 else ""
+                    if prefix_sep and prefix_sep != "None":
+                        result_parts.append(prefix_sep)
+                    
+                    # Add fields with between separators
+                    for i, template_part in enumerate(template_parts):
+                        result_parts.append(template_part)
+                        
+                        # Add between separator (after each field except last)
+                        if i < len(template_parts) - 1:
+                            between_idx = i + 1  # separators[1] after first field, separators[2] after second, etc.
+                            between_sep = separators[between_idx] if between_idx < len(separators) else "-"
+                            if between_sep == "None" or not between_sep:
+                                between_sep = " "  # Default to space if None
+                            result_parts.append(between_sep)
+                    
+                    # Add suffix separator (after last field)
+                    suffix_idx = len(template_parts)  # separators[n] where n = number of fields
+                    suffix_sep = separators[suffix_idx] if suffix_idx < len(separators) else ""
+                    if suffix_sep and suffix_sep != "None":
+                        result_parts.append(suffix_sep)
+                    
+                    # Join all parts into single template string (yt-dlp will substitute all variables)
+                    joined_template = "".join(result_parts)
+                    path_parts.append(joined_template)
+            
             path_parts.append("%(title)s.%(ext)s")
             return str(Path(*path_parts))
         
@@ -5373,32 +5843,68 @@ class BandcampDownloaderGUI:
                     best_match_score = 0
                     
                     # Normalize file title for comparison (remove common prefixes, extra spaces)
+                    # Also remove "artist - " pattern if present for better matching
                     normalized_file_title = re.sub(r'^\d+[.\-\s]*', '', file_title.lower()).strip()
+                    # Try to extract artist and clean title from filename for matching
+                    artist_from_filename = None
+                    cleaned_file_title = normalized_file_title
+                    # Check if filename has "artist - title" pattern
+                    artist_match = re.match(r'^([^-]+)\s*-\s*(.+)$', normalized_file_title)
+                    if artist_match:
+                        artist_from_filename = artist_match.group(1).strip()
+                        cleaned_file_title = artist_match.group(2).strip()
                     
                     for title_key, info in self.download_info.items():
                         # Normalize title key for comparison
                         normalized_title_key = title_key.lower().strip()
+                        # Also try to clean the title key if it has "artist - " pattern
+                        cleaned_title_key = normalized_title_key
+                        artist_match_key = re.match(r'^([^-]+)\s*-\s*(.+)$', normalized_title_key)
+                        if artist_match_key:
+                            cleaned_title_key = artist_match_key.group(2).strip()
                         
                         # Calculate match score (prefer exact matches, then contains matches)
                         match_score = 0
-                        if normalized_file_title == normalized_title_key:
-                            match_score = 100  # Exact match
+                        # Try matching cleaned versions first
+                        if cleaned_file_title == cleaned_title_key:
+                            match_score = 100  # Exact match on cleaned titles
+                        elif normalized_file_title == normalized_title_key:
+                            match_score = 95  # Exact match on original
+                        elif cleaned_file_title in cleaned_title_key or cleaned_title_key in cleaned_file_title:
+                            # Substring match on cleaned titles - calculate similarity
+                            shorter = min(len(cleaned_file_title), len(cleaned_title_key))
+                            longer = max(len(cleaned_file_title), len(cleaned_title_key))
+                            if shorter > 0:
+                                match_score = (shorter / longer) * 50
                         elif normalized_file_title in normalized_title_key or normalized_title_key in normalized_file_title:
-                            # Substring match - calculate similarity
+                            # Substring match on original - calculate similarity
                             shorter = min(len(normalized_file_title), len(normalized_title_key))
                             longer = max(len(normalized_file_title), len(normalized_title_key))
                             if shorter > 0:
-                                # Score based on how much of the shorter string is in the longer one
-                                match_score = (shorter / longer) * 50
+                                match_score = (shorter / longer) * 40
                         
-                        # Only accept matches with significant similarity (at least 60% of shorter string)
+                        # Only accept matches with significant similarity (at least 30% of shorter string)
                         if match_score > best_match_score and match_score >= 30:
                             best_match_score = match_score
                             best_match = info
                     
                     if best_match:
                         track_number = best_match.get("track_number")
-                        track_title = best_match.get("title", file_title)
+                        raw_title = best_match.get("title", file_title)
+                        # Clean title to remove artist prefix if present
+                        track_title = self._clean_title(raw_title, best_match.get("artist"))
+                    else:
+                        # If no match found, try to clean the filename itself
+                        # Extract artist from filename if present, or use album artist
+                        artist_for_cleaning = artist_from_filename
+                        if not artist_for_cleaning:
+                            # Try to get artist from album info
+                            try:
+                                artist_for_cleaning = self.album_info_stored.get("artist")
+                            except Exception:
+                                pass
+                        # Clean the filename title
+                        track_title = self._clean_title(file_title, artist_for_cleaning)
                     
                     # If not found in download_info, try to extract from metadata in file
                     if track_number is None:
@@ -5439,7 +5945,10 @@ class BandcampDownloaderGUI:
                                     
                                     # Also get title if available
                                     if not track_title or track_title == file_title:
-                                        track_title = tags.get("title") or tags.get("TITLE") or track_title
+                                        raw_title = tags.get("title") or tags.get("TITLE") or track_title
+                                        # Clean title to remove artist prefix if present
+                                        artist_from_tags = tags.get("artist") or tags.get("ARTIST")
+                                        track_title = self._clean_title(raw_title, artist_from_tags)
                         except Exception:
                             pass
                     
@@ -5490,10 +5999,19 @@ class BandcampDownloaderGUI:
                     parent_dir = audio_file.parent
                     extension = audio_file.suffix
                     
-                    # Check if filename already has numbering
+                    # Check if filename already has numbering AND the title part is already clean
                     # Check if already starts with number
-                    if re.match(r'^\d+[.\-]\s*', file_title):
-                        continue  # Already numbered, skip
+                    has_numbering = re.match(r'^\d+[.\-]\s*', file_title)
+                    if has_numbering:
+                        # Extract the title part (after the number prefix)
+                        title_part = re.sub(r'^\d+[.\-\s]*', '', file_title)
+                        # Check if the title part still has "artist - " pattern
+                        if re.match(r'^[^-]+\s*-\s*', title_part):
+                            # Title still has artist prefix, so we should rename it
+                            pass  # Continue with renaming
+                        else:
+                            # Title is already clean, skip renaming
+                            continue
                     
                     new_name = prefix + sanitized_title + extension
                     new_path = parent_dir / new_name
@@ -6003,6 +6521,9 @@ class BandcampDownloaderGUI:
                                     for title_key, info in self.download_info.items():
                                         if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
                                             metadata = info.copy()
+                                            # Clean title if it contains artist prefix
+                                            if metadata.get("title"):
+                                                metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
                                             break
                                     
                                     # If no metadata found, try to get from file
@@ -6015,6 +6536,9 @@ class BandcampDownloaderGUI:
                                                     "album": album,
                                                     "title": file_title
                                                 }
+                                                # Clean title if it contains artist prefix
+                                                if metadata.get("title"):
+                                                    metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
                                         except Exception:
                                             pass
                                     
@@ -6022,7 +6546,8 @@ class BandcampDownloaderGUI:
                                         success = self.re_embed_mp3_metadata(audio_file_str, metadata, thumbnail_file)
                                     else:
                                         # Try without metadata, just artwork
-                                        success = self.re_embed_mp3_metadata(audio_file_str, {"title": file_title}, thumbnail_file)
+                                        cleaned_file_title = self._clean_title(file_title)
+                                        success = self.re_embed_mp3_metadata(audio_file_str, {"title": cleaned_file_title}, thumbnail_file)
                                 elif audio_ext in [".flac", ".ogg", ".oga"]:
                                     # FLAC/OGG: use embed_cover_art_ffmpeg
                                     success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
@@ -6099,6 +6624,9 @@ class BandcampDownloaderGUI:
                                 for title_key, info in self.download_info.items():
                                     if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
                                         metadata = info.copy()
+                                        # Clean title if it contains artist prefix
+                                        if metadata.get("title"):
+                                            metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
                                         break
                                 
                                 # If no metadata found, try to get from file
@@ -6111,6 +6639,9 @@ class BandcampDownloaderGUI:
                                                 "album": album,
                                                 "title": file_title
                                             }
+                                            # Clean title if it contains artist prefix
+                                            if metadata.get("title"):
+                                                metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
                                     except Exception:
                                         pass
                                 
@@ -6119,7 +6650,8 @@ class BandcampDownloaderGUI:
                                     success = self.re_embed_mp3_metadata(mp3_file_str, metadata, thumbnail_file)
                                 else:
                                     # Try without metadata, just artwork
-                                    success = self.re_embed_mp3_metadata(mp3_file_str, {"title": file_title}, thumbnail_file)
+                                    cleaned_file_title = self._clean_title(file_title)
+                                    success = self.re_embed_mp3_metadata(mp3_file_str, {"title": cleaned_file_title}, thumbnail_file)
                                 
                                 if success:
                                     processed_count += 1
@@ -6305,19 +6837,28 @@ class BandcampDownloaderGUI:
                 import json
                 data = json.loads(result.stdout.decode('utf-8', errors='ignore'))
                 tags = data.get("format", {}).get("tags", {})
+                # Clean title if it contains artist prefix
+                if tags and tags.get("title"):
+                    title = tags.get("title", "")
+                    artist = tags.get("artist") or tags.get("ARTIST")
+                    cleaned_title = self._clean_title(title, artist)
+                    if cleaned_title != title:
+                        tags["title"] = cleaned_title
                 return tags
             return None
         except Exception:
             return None
     
-    def re_embed_mp3_metadata(self, mp3_file, metadata, thumbnail_file=None):
-        """Re-embed metadata into MP3 file using FFmpeg."""
+    def re_embed_audio_metadata(self, audio_file, metadata, thumbnail_file=None):
+        """Re-embed metadata into audio file (MP3, M4A, FLAC, OGG) using FFmpeg."""
         try:
-            temp_output = str(Path(mp3_file).with_suffix('.tmp.mp3'))
+            audio_path = Path(audio_file)
+            audio_ext = audio_path.suffix.lower()
+            temp_output = str(audio_path.with_suffix('.tmp' + audio_path.suffix))
             
             cmd = [
                 str(self.ffmpeg_path),
-                "-i", str(mp3_file),
+                "-i", str(audio_file),
             ]
             
             # Add thumbnail if provided
@@ -6329,9 +6870,14 @@ class BandcampDownloaderGUI:
             else:
                 cmd.extend(["-c:a", "copy"])
             
+            # Clean title before embedding (remove artist prefix if present)
+            clean_title = metadata.get("title", "")
+            if clean_title:
+                clean_title = self._clean_title(clean_title, metadata.get("artist"))
+            
             # Add metadata
-            if metadata.get("title"):
-                cmd.extend(["-metadata", f"title={metadata['title']}"])
+            if clean_title:
+                cmd.extend(["-metadata", f"title={clean_title}"])
             if metadata.get("artist"):
                 cmd.extend(["-metadata", f"artist={metadata['artist']}"])
             if metadata.get("album"):
@@ -6352,8 +6898,8 @@ class BandcampDownloaderGUI:
             )
             
             if result.returncode == 0 and Path(temp_output).exists():
-                Path(mp3_file).unlink()
-                Path(temp_output).rename(mp3_file)
+                Path(audio_file).unlink()
+                Path(temp_output).rename(audio_file)
                 return True
             else:
                 if Path(temp_output).exists():
@@ -6361,6 +6907,11 @@ class BandcampDownloaderGUI:
                 return False
         except Exception:
             return False
+    
+    def re_embed_mp3_metadata(self, mp3_file, metadata, thumbnail_file=None):
+        """Re-embed metadata into MP3 file using FFmpeg."""
+        # Use the generic function for MP3 as well
+        return self.re_embed_audio_metadata(mp3_file, metadata, thumbnail_file)
     
     def verify_and_fix_mp3_metadata(self, download_path):
         """Verify MP3 files have metadata and fix missing ones."""
@@ -6427,6 +6978,26 @@ class BandcampDownloaderGUI:
                 has_artist = tags and tags.get("artist") and tags.get("artist").strip()
                 has_album = tags and tags.get("album") and tags.get("album").strip()
                 
+                # If metadata exists but title might have artist prefix, fix it
+                if tags and has_title and has_artist:
+                    title = tags.get("title", "")
+                    artist = tags.get("artist") or tags.get("ARTIST")
+                    cleaned_title = self._clean_title(title, artist)
+                    if cleaned_title != title:
+                        # Title needs cleaning - re-embed with cleaned title
+                        metadata = {
+                            "title": cleaned_title,
+                            "artist": artist,
+                            "album": tags.get("album") or tags.get("ALBUM"),
+                            "track_number": tags.get("track") or tags.get("TRACK"),
+                            "date": tags.get("date") or tags.get("DATE")
+                        }
+                        thumbnail_file = self.find_thumbnail_file(str(mp3_file))
+                        if self.re_embed_mp3_metadata(mp3_file, metadata, thumbnail_file):
+                            fixed_count += 1
+                            self.root.after(0, lambda f=mp3_file.name: self.log(f"✓ Fixed metadata: {f}"))
+                        continue
+                
                 if not (has_title and has_artist and has_album):
                     # Try to find metadata from download_info
                     # Match by filename
@@ -6453,6 +7024,10 @@ class BandcampDownloaderGUI:
                             "album": self.album_info_stored.get("album"),
                             "date": self.album_info_stored.get("date"),
                         }
+                    
+                    # Clean title if it contains artist prefix
+                    if metadata.get("title"):
+                        metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
                     
                     # Find thumbnail
                     thumbnail_file = self.find_thumbnail_file(str(mp3_file))
@@ -6555,20 +7130,51 @@ class BandcampDownloaderGUI:
                         audio_file_str = str(audio_file)
                         audio_file_name = audio_file.name
                         audio_ext = audio_file.suffix.lower()
+                        file_title = audio_file.stem
+                        
+                        # Get metadata from download_info if available
+                        metadata = {}
+                        for title_key, info in self.download_info.items():
+                            if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
+                                metadata = info.copy()
+                                # Clean title if it contains artist prefix
+                                if metadata.get("title"):
+                                    metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
+                                break
+                        
+                        # If no metadata found, try to get from file
+                        if not metadata:
+                            try:
+                                artist, album = self._get_metadata_from_directory(dir_path)
+                                if artist or album:
+                                    metadata = {
+                                        "artist": artist,
+                                        "album": album,
+                                        "title": file_title
+                                    }
+                                    # Clean title if it contains artist prefix
+                                    if metadata.get("title"):
+                                        metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
+                            except Exception:
+                                pass
+                        
+                        # If still no metadata, use filename as title (cleaned)
+                        if not metadata:
+                            metadata = {"title": self._clean_title(file_title)}
                         
                         success = False
                         if audio_ext in [".m4a", ".mp4", ".aac"]:
-                            # M4A/MP4/AAC: use embed_cover_art_ffmpeg
-                            success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                            # M4A/MP4/AAC: use re_embed_audio_metadata to fix metadata and embed cover art
+                            success = self.re_embed_audio_metadata(audio_file_str, metadata, thumbnail_file)
                         elif audio_ext in [".flac", ".ogg", ".oga"]:
-                            # FLAC/OGG: use embed_cover_art_ffmpeg
-                            success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                            # FLAC/OGG: use re_embed_audio_metadata to fix metadata and embed cover art
+                            success = self.re_embed_audio_metadata(audio_file_str, metadata, thumbnail_file)
                         
                         if success:
                             processed_count += 1
-                            self.root.after(0, lambda name=audio_file_name: self.log(f"✓ Embedded cover art: {name}"))
+                            self.root.after(0, lambda name=audio_file_name: self.log(f"✓ Fixed metadata and embedded cover art: {name}"))
                         else:
-                            self.root.after(0, lambda name=audio_file_name: self.log(f"⚠ Could not embed cover art: {name}"))
+                            self.root.after(0, lambda name=audio_file_name: self.log(f"⚠ Could not fix metadata: {name}"))
                 
                 if processed_count > 0:
                     self.root.after(0, lambda count=processed_count: self.log(f"Embedded cover art for {count} non-MP3 file(s)"))
@@ -6691,7 +7297,9 @@ class BandcampDownloaderGUI:
                         for title_key, info in self.download_info.items():
                             # Match by comparing filename with track title
                             if audio_file.stem.lower() in title_key or title_key in audio_file.stem.lower():
-                                track_title = info.get("title", track_title)
+                                raw_title = info.get("title", track_title)
+                                # Clean title to remove artist prefix if present
+                                track_title = self._clean_title(raw_title, info.get("artist"))
                                 break
                         
                         # Write EXTINF line (duration is optional, use -1 if unknown)
@@ -6946,11 +7554,20 @@ class BandcampDownloaderGUI:
                             
                             for entry in entries:
                                 # Use title as key (will match by filename later)
-                                title = entry.get("title", "")
-                                if title:
-                                    self.download_info[title.lower()] = {
-                                        "title": entry.get("title"),
-                                        "artist": entry.get("artist") or entry.get("uploader") or entry.get("creator") or self.album_info_stored.get("artist"),
+                                raw_title = entry.get("title", "")
+                                if raw_title:
+                                    # Get artist first (needed for title cleaning)
+                                    artist = entry.get("artist") or entry.get("uploader") or entry.get("creator") or self.album_info_stored.get("artist")
+                                    # Clean title to remove artist prefix if present
+                                    cleaned_title = self._clean_title(raw_title, artist)
+                                    
+                                    # Also modify the entry itself so yt-dlp uses cleaned title during embedding
+                                    if cleaned_title != raw_title:
+                                        entry["title"] = cleaned_title
+                                    
+                                    self.download_info[raw_title.lower()] = {
+                                        "title": cleaned_title,  # Use cleaned title (song name only)
+                                        "artist": artist,
                                         "album": entry.get("album") or info.get("title") or self.album_info_stored.get("album"),
                                         "track_number": entry.get("track_number") or entry.get("track"),
                                         "date": entry.get("release_date") or entry.get("upload_date") or self.album_info_stored.get("date"),
@@ -7793,6 +8410,16 @@ class BandcampDownloaderGUI:
         
         try:
             status = d.get('status', '')
+            
+            # Clean title metadata to remove artist prefix before embedding
+            # This ensures yt-dlp's FFmpegMetadata postprocessor uses the cleaned title
+            # Do this for all statuses to catch titles before postprocessing
+            if d.get('title'):
+                title = d.get('title', '')
+                artist = d.get('artist') or d.get('uploader') or d.get('creator')
+                cleaned_title = self._clean_title(title, artist)
+                if cleaned_title != title:
+                    d['title'] = cleaned_title
             
             if status == 'downloading':
                 # Detect album changes in discography mode
@@ -8835,16 +9462,17 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         # Center dialog
         dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 200
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 180
-        dialog.geometry(f"400x380+{x}+{y}")  # Increased height for 4 slots
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 325
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 175
+        dialog.geometry(f"580x350+{x}+{y}")  # Wider to accommodate prefix/suffix separators + X button
+        dialog.resizable(False, False)
         
         # Configure dialog background
         dialog.configure(bg='#1E1E1E')
         
         # Main container for all content
         main_container = Frame(dialog, bg='#1E1E1E')
-        main_container.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        main_container.pack(fill=BOTH, expand=True, padx=10, pady=5)
         
         # Title
         title_label = Label(
@@ -8854,21 +9482,50 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             bg='#1E1E1E',
             fg='#D4D4D4'
         )
-        title_label.pack(pady=(10, 5))
+        title_label.pack(pady=(3, 2))
         
         # Instructions
         instructions = Label(
             main_container,
-            text="Drag to reorder • Select options • Max 4 levels",
+            text="Drag to reorder • Add multiple fields per level • Max 4 levels",
             font=("Segoe UI", 8),
             bg='#1E1E1E',
             fg='#808080'
         )
-        instructions.pack(pady=(0, 10))
+        instructions.pack(pady=(0, 5))
         
         # Container for levels (always show 4 slots)
         levels_frame = Frame(main_container, bg='#2D2D30')  # Slightly lighter background for visibility
-        levels_frame.pack(fill=BOTH, expand=True, pady=10)
+        levels_frame.pack(fill=BOTH, expand=True, pady=(0, 5))  # Expand to show light grey space
+        
+        # Live preview section - match main interface style
+        preview_frame = Frame(main_container, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        preview_frame.pack(fill=X, pady=(0, 5))
+        
+        # Preview label prefix (white, Consolas font like main interface)
+        preview_label_prefix = Label(
+            preview_frame,
+            text="Preview:",
+            font=("Consolas", 8),
+            bg='#1E1E1E',
+            fg='#D4D4D4',
+            justify='left'
+        )
+        preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=4)
+        
+        # Preview path (blue, Consolas font like main interface)
+        dialog.preview_text = Label(
+            preview_frame,
+            text="",
+            font=("Consolas", 8),
+            bg='#1E1E1E',
+            fg="#2dacd5",  # Blue text like main interface
+            wraplength=530,  # Updated for 580px dialog width
+            justify='left',
+            anchor='w'
+        )
+        dialog.preview_text.grid(row=0, column=1, sticky=W, padx=(0, 6), pady=4)
+        preview_frame.columnconfigure(1, weight=1)
         
         # Store dialog and levels
         dialog.custom_levels = []  # List of level frames (only filled ones)
@@ -8885,7 +9542,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 # This is a custom structure, find it
                 for structure in self.custom_structures:
                     if self._format_custom_structure(structure) == current_value:
-                        initial_structure = structure.copy()
+                        # Normalize to ensure new format
+                        initial_structure = self._normalize_structure(structure)
                         break
         
         # Always create 4 fixed slots
@@ -8893,13 +9551,16 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             slot_value = initial_structure[i] if initial_structure and i < len(initial_structure) else None
             self._create_level_slot(dialog, levels_frame, i, slot_value)
         
+        # Update preview after slots are created
+        self._update_preview(dialog)
+        
         # Force update to ensure slots are visible
         levels_frame.update_idletasks()
         dialog.update_idletasks()
         
         # Buttons frame
         buttons_frame = Frame(main_container, bg='#1E1E1E')
-        buttons_frame.pack(pady=10)
+        buttons_frame.pack(pady=(3, 5))  # Add bottom padding so buttons aren't cut off
         
         # Save button
         save_btn = ttk.Button(
@@ -8943,7 +9604,11 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             slot_frame.add_btn = add_btn
     
     def _fill_level_slot(self, dialog, slot_frame, initial_value):
-        """Fill a slot with a level (dropdown, drag handle, remove button)."""
+        """Fill a slot with a multi-field level.
+        initial_value can be:
+        - Old format: string like "Artist"
+        - New format: dict like {"fields": ["Artist"], "separator": None}
+        """
         # Clear any existing content
         for widget in slot_frame.winfo_children():
             widget.destroy()
@@ -8954,9 +9619,30 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         if slot_frame not in dialog.custom_levels:
             dialog.custom_levels.append(slot_frame)
         
-        # Create level_var early so it's available for filtering
-        level_var = StringVar(value=initial_value)
-        slot_frame.level_var = level_var  # Set early so _get_available_level_options can see it
+        # Normalize initial_value to new format
+        if isinstance(initial_value, str):
+            # Old format: single field
+            level_data = {"fields": [initial_value], "separators": []}
+        elif isinstance(initial_value, dict) and "fields" in initial_value:
+            # New format: ensure separators list exists
+            level_data = initial_value.copy()
+            if "separator" in level_data:
+                # Convert old single separator to separators list
+                sep = level_data.pop("separator")
+                level_data["separators"] = [sep] if sep else []
+            elif "separators" not in level_data:
+                level_data["separators"] = []
+        else:
+            # Default: start with first available field
+            available = self._get_all_available_fields(dialog, slot_frame)
+            level_data = {"fields": [available[0]] if available else ["Artist"], "separators": []}
+        
+        # Store level data
+        slot_frame.level_data = level_data
+        
+        # Container for fields and separators
+        fields_container = Frame(slot_frame, bg='#1E1E1E')
+        fields_container.pack(side=LEFT, fill=X, expand=True, padx=5)
         
         # Drag handle (⋮⋮)
         drag_handle = Label(
@@ -8965,7 +9651,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             font=("Segoe UI", 10),
             bg='#1E1E1E',
             fg='#808080',
-            cursor='fleur',  # Grabbing/drag cursor instead of link cursor
+            cursor='fleur',
             width=3
         )
         drag_handle.pack(side=LEFT, padx=5)
@@ -8975,16 +9661,13 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         drag_handle.bind("<B1-Motion>", lambda e: self._drag_level(dialog, slot_frame, e))
         drag_handle.bind("<ButtonRelease-1>", lambda e: self._end_drag_level(dialog, slot_frame, e))
         
-        # Dropdown - now filtering will work because slot_frame is already in custom_levels
-        level_combo = ttk.Combobox(
-            slot_frame,
-            textvariable=level_var,
-            values=self._get_available_level_options(dialog, initial_value),
-            state="readonly",
-            width=15
-        )
-        level_combo.pack(side=LEFT, padx=5)
-        level_combo.bind("<<ComboboxSelected>>", lambda e: self._on_level_change(dialog, slot_frame))
+        # Store references
+        slot_frame.drag_handle = drag_handle
+        slot_frame.fields_container = fields_container
+        slot_frame.field_widgets = []  # List of (field_combo, separator_combo) tuples
+        
+        # Build UI for existing fields
+        self._rebuild_level_fields_ui(dialog, slot_frame)
         
         # Remove button (X) - clears the slot
         remove_btn = ttk.Button(
@@ -8994,34 +9677,454 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             command=lambda: self._clear_level_slot(dialog, slot_frame)
         )
         remove_btn.pack(side=LEFT, padx=5)
-        
-        # Store level data
-        slot_frame.level_combo = level_combo
         slot_frame.remove_btn = remove_btn
-        slot_frame.drag_handle = drag_handle
         
         # Update all dropdowns to filter duplicates
         self._update_all_level_options(dialog)
+        # Update preview
+        self._update_preview(dialog)
+    
+    def _get_all_available_fields(self, dialog, exclude_slot=None):
+        """Get all available fields (strict duplicate prevention - no duplicates anywhere).
+        Returns list of field names that are not used in any level.
+        """
+        # Get all used fields across all levels
+        used_fields = set()
+        for level_frame in dialog.custom_levels:
+            if level_frame == exclude_slot:
+                continue
+            if hasattr(level_frame, 'level_data'):
+                fields = level_frame.level_data.get("fields", [])
+                used_fields.update(fields)
+        
+        # All possible fields
+        all_fields = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
+        
+        # Return available fields
+        return [f for f in all_fields if f not in used_fields]
+    
+    def _get_available_fields_for_slot(self, dialog, slot_frame, exclude_field=None):
+        """Get available fields for a specific slot (allows current field + unused fields)."""
+        # Get all used fields across all levels (excluding this slot and exclude_field)
+        used_fields = set()
+        for level_frame in dialog.custom_levels:
+            if level_frame == slot_frame:
+                continue
+            if hasattr(level_frame, 'level_data'):
+                fields = level_frame.level_data.get("fields", [])
+                used_fields.update(fields)
+        
+        # Also exclude exclude_field if specified
+        if exclude_field:
+            used_fields.add(exclude_field)
+        
+        # All possible fields
+        all_fields = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
+        
+        # Return available fields (including current field if it's not exclude_field)
+        available = []
+        for field in all_fields:
+            if field not in used_fields or (exclude_field and field == exclude_field):
+                available.append(field)
+        
+        return available
+    
+    def _create_separator_entry(self, parent, separator_var, dialog, slot_frame, separator_index, is_prefix=False):
+        """Create a separator text entry widget with dark mode styling and validation."""
+        separator_entry = Entry(
+            parent,
+            textvariable=separator_var,
+            width=5,
+            font=("Segoe UI", 8),
+            bg='#2D2D30',  # Dark background
+            fg='#D4D4D4',  # Light text
+            insertbackground='#D4D4D4',  # Light cursor
+            relief='flat',
+            bd=1,
+            highlightbackground='#3E3E42',
+            highlightcolor='#007ACC',
+            highlightthickness=1
+        )
+        separator_entry.pack(side=LEFT, padx=2)
+        
+        # Limit to 5 characters using validatecommand
+        vcmd = (separator_entry.register(lambda P: len(P) <= 5), '%P')
+        separator_entry.config(validate='key', validatecommand=vcmd)
+        
+        # Update preview in real-time using StringVar trace (fires on every change)
+        def update_preview_realtime(*args, sep_idx=separator_index):
+            # Update preview immediately as separator changes
+            self._on_separator_change(dialog, slot_frame, sep_idx, separator_var)
+        
+        separator_var.trace_add('write', update_preview_realtime)
+        
+        # Validate on key release - check invalid characters
+        def validate_separator(event, sep_idx=separator_index):
+            self._validate_separator_input(dialog, slot_frame, sep_idx, separator_var, separator_entry)
+        
+        separator_entry.bind("<KeyRelease>", validate_separator)
+        separator_entry.bind("<FocusOut>", lambda e, sep_idx=separator_index: self._on_separator_change(dialog, slot_frame, sep_idx, separator_var))
+        
+        return separator_entry
+    
+    def _rebuild_level_fields_ui(self, dialog, slot_frame):
+        """Rebuild the UI for fields and separators in a level."""
+        # Clear existing field widgets
+        if hasattr(slot_frame, 'fields_container'):
+            for widget in slot_frame.fields_container.winfo_children():
+                widget.destroy()
+        
+        slot_frame.field_widgets = []
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        separators = level_data.get("separators", [])
+        
+        if not fields:
+            # No fields, add one
+            fields = [self._get_all_available_fields(dialog, slot_frame)[0] if self._get_all_available_fields(dialog, slot_frame) else "Artist"]
+            level_data["fields"] = fields
+        
+        # Ensure separators list matches: prefix + between fields + suffix (fields + 1 total)
+        # separators[0] = prefix (before first field)
+        # separators[1..n-1] = between fields
+        # separators[n] = suffix (after last field)
+        num_separators = len(fields) + 1
+        while len(separators) < num_separators:
+            separators.append("")  # Default empty (no separator)
+        separators = separators[:num_separators]  # Trim if too many
+        level_data["separators"] = separators
+        
+        # Build UI: [Prefix Sep] [Field1 ▼] [Between Sep] [Field2 ▼] [Between Sep] [Field3 ▼] [Suffix Sep] [+ Add Field]
+        for i, field in enumerate(fields):
+            # Prefix separator (before first field)
+            if i == 0:
+                prefix_separator = separators[0] if separators else ""
+                prefix_var = StringVar(value=prefix_separator if prefix_separator else "")
+                prefix_entry = self._create_separator_entry(
+                    slot_frame.fields_container, prefix_var, dialog, slot_frame, 0, is_prefix=True
+                )
+            else:
+                prefix_entry = None
+                prefix_var = None
+            
+            # Field dropdown
+            field_var = StringVar(value=field)
+            available_fields = self._get_available_fields_for_slot(dialog, slot_frame, field)
+            field_combo = ttk.Combobox(
+                slot_frame.fields_container,
+                textvariable=field_var,
+                values=available_fields,
+                state="readonly",
+                width=12
+            )
+            field_combo.pack(side=LEFT, padx=2)
+            field_combo.bind("<<ComboboxSelected>>", lambda e, idx=i: self._on_field_change(dialog, slot_frame, idx))
+            
+            # Between-fields separator (after each field except last)
+            separator_entry = None
+            separator_var = None
+            if i < len(fields) - 1:
+                # Get separator for this gap (index i+1 in separators list)
+                gap_separator = separators[i + 1] if i + 1 < len(separators) else "-"
+                if gap_separator == "None" or gap_separator is None:
+                    gap_separator = "-"
+                separator_var = StringVar(value=gap_separator)
+                separator_entry = self._create_separator_entry(
+                    slot_frame.fields_container, separator_var, dialog, slot_frame, i + 1, is_prefix=False
+                )
+            
+            # Suffix separator (after last field)
+            suffix_entry = None
+            suffix_var = None
+            if i == len(fields) - 1:
+                suffix_separator = separators[-1] if separators else ""
+                suffix_var = StringVar(value=suffix_separator if suffix_separator else "")
+                suffix_entry = self._create_separator_entry(
+                    slot_frame.fields_container, suffix_var, dialog, slot_frame, len(separators) - 1, is_prefix=False
+                )
+            
+            # Store widgets: (field_combo, prefix_entry, separator_entry, suffix_entry, field_var, prefix_var, separator_var, suffix_var)
+            slot_frame.field_widgets.append((
+                field_combo, prefix_entry, separator_entry, suffix_entry,
+                field_var, prefix_var, separator_var, suffix_var
+            ))
+        
+        # + Add Field button (max 3 fields)
+        if len(fields) < 3:
+            add_field_btn = ttk.Button(
+                slot_frame.fields_container,
+                text="+ Add Field",
+                command=lambda: self._add_field_to_level(dialog, slot_frame)
+            )
+            add_field_btn.pack(side=LEFT, padx=2)
+            slot_frame.add_field_btn = add_field_btn
+        elif hasattr(slot_frame, 'add_field_btn'):
+            slot_frame.add_field_btn.destroy()
+            delattr(slot_frame, 'add_field_btn')
+    
+    def _on_field_change(self, dialog, slot_frame, field_index):
+        """Handle field dropdown change."""
+        field_combo, prefix_entry, separator_entry, suffix_entry, field_var, prefix_var, separator_var, suffix_var = slot_frame.field_widgets[field_index]
+        new_field = field_var.get()
+        
+        # Update level data
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        if field_index < len(fields):
+            fields[field_index] = new_field
+            level_data["fields"] = fields
+        
+        # Rebuild UI to update all dropdowns
+        self._rebuild_level_fields_ui(dialog, slot_frame)
+        self._update_all_level_options(dialog)
+        self._update_preview(dialog)
+    
+    def _on_separator_change(self, dialog, slot_frame, separator_index, separator_var=None):
+        """Handle separator text entry change."""
+        if separator_var is None:
+            # Fallback: find separator_var from separator_index
+            # separator_index 0 = prefix (first field), 1+ = between (field at index-1), last = suffix (last field)
+            level_data = slot_frame.level_data
+            fields = level_data.get("fields", [])
+            if separator_index == 0 and slot_frame.field_widgets:
+                # Prefix separator
+                _, _, _, _, _, separator_var, _, _ = slot_frame.field_widgets[0]
+            elif separator_index == len(fields) and slot_frame.field_widgets:
+                # Suffix separator
+                _, _, _, _, _, _, _, separator_var = slot_frame.field_widgets[-1]
+            elif separator_index > 0 and separator_index < len(fields):
+                # Between separator
+                _, _, separator_var, _, _, _, _, _ = slot_frame.field_widgets[separator_index - 1]
+            else:
+                return
+        
+        new_separator = separator_var.get()  # Don't strip - preserve spaces
+        
+        # Update level data
+        level_data = slot_frame.level_data
+        separators = level_data.get("separators", [])
+        
+        # Ensure separators list is long enough (fields + 1: prefix + between + suffix)
+        num_separators = len(level_data.get("fields", [])) + 1
+        while len(separators) < num_separators:
+            separators.append("")
+        separators = separators[:num_separators]
+        
+        # Empty string means use space (None in our system), but preserve actual spaces
+        if not new_separator:
+            separators[separator_index] = None
+        else:
+            separators[separator_index] = new_separator  # Preserve spaces as-is
+        
+        level_data["separators"] = separators
+        self._update_preview(dialog)
+    
+    def _validate_separator_input(self, dialog, slot_frame, separator_index, separator_var, separator_entry):
+        """Validate separator input: max 5 chars, no invalid Windows filesystem characters."""
+        current_text = separator_var.get()
+        
+        # Limit to 5 characters
+        if len(current_text) > 5:
+            separator_var.set(current_text[:5])
+            current_text = current_text[:5]
+        
+        # Check for invalid Windows filesystem characters: < > : " / \ | ? *
+        invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+        found_invalid = [char for char in current_text if char in invalid_chars]
+        
+        if found_invalid:
+            # Remove invalid characters
+            cleaned_text = ''.join(char for char in current_text if char not in invalid_chars)
+            separator_var.set(cleaned_text)
+            
+            # Show warning
+            messagebox.showwarning(
+                "Invalid Characters",
+                f"The following characters are not allowed in separators: {', '.join(set(found_invalid))}\n\nThey have been removed."
+            )
+    
+    def _add_field_to_level(self, dialog, slot_frame):
+        """Add a new field to a level (max 3 fields)."""
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        
+        if len(fields) >= 3:
+            return  # Max 3 fields
+        
+        # Get first available field
+        available = self._get_all_available_fields(dialog, slot_frame)
+        if not available:
+            return  # No available fields
+        
+        # Add new field
+        fields.append(available[0])
+        level_data["fields"] = fields
+        
+        # Add default separator for the new gap (between the new field and previous)
+        # Structure: prefix + between + suffix, so insert before suffix
+        separators = level_data.get("separators", [])
+        # Insert new between separator before suffix (at index len(fields) - 1)
+        insert_index = len(fields) - 1  # This is where the new between separator goes
+        separators.insert(insert_index, "-")  # Default separator
+        # Ensure we have the right number: fields + 1 (prefix + between + suffix)
+        while len(separators) < len(fields) + 1:
+            separators.append("")  # Add empty suffix if needed
+        separators = separators[:len(fields) + 1]  # Trim to correct length
+        level_data["separators"] = separators
+        
+        # Rebuild UI
+        self._rebuild_level_fields_ui(dialog, slot_frame)
+        self._update_all_level_options(dialog)
+        self._update_preview(dialog)
+    
+    def _remove_field_from_level(self, dialog, slot_frame, field_index):
+        """Remove a field from a level."""
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        
+        if len(fields) <= 1:
+            # Can't remove last field, clear entire level instead
+            self._clear_level_slot(dialog, slot_frame)
+            return
+        
+        # Remove field
+        fields.pop(field_index)
+        level_data["fields"] = fields
+        
+        # Rebuild UI
+        self._rebuild_level_fields_ui(dialog, slot_frame)
+        self._update_all_level_options(dialog)
+        self._update_preview(dialog)
+    
+    def _update_preview(self, dialog):
+        """Update the live preview of the folder structure."""
+        if not hasattr(dialog, 'preview_text'):
+            return
+        
+        # Build structure from all filled slots - read current values from UI widgets
+        structure = []
+        for slot_frame in dialog.level_slots:
+            if slot_frame.is_filled and hasattr(slot_frame, 'level_data'):
+                # Get current values from UI widgets (more reliable than stored data)
+                level_data = slot_frame.level_data.copy()
+                if hasattr(slot_frame, 'field_widgets'):
+                    # Read current field values from UI
+                    current_fields = []
+                    current_separators = []
+                    for i, widget_tuple in enumerate(slot_frame.field_widgets):
+                        field_combo, prefix_entry, separator_entry, suffix_entry, field_var, prefix_var, separator_var, suffix_var = widget_tuple
+                        current_fields.append(field_var.get())
+                        
+                        # Prefix separator (first field only)
+                        if i == 0 and prefix_entry is not None:
+                            prefix_value = prefix_var.get() if prefix_var else ""
+                            current_separators.append(None if not prefix_value else prefix_value)
+                        
+                        # Between separator (after each field except last)
+                        if separator_entry is not None:
+                            sep_value = separator_var.get() if separator_var else ""  # Don't strip - preserve spaces
+                            current_separators.append(None if not sep_value else sep_value)
+                        
+                        # Suffix separator (last field only)
+                        if i == len(slot_frame.field_widgets) - 1 and suffix_entry is not None:
+                            suffix_value = suffix_var.get() if suffix_var else ""
+                            current_separators.append(None if not suffix_value else suffix_value)
+                    
+                    level_data["fields"] = current_fields
+                    level_data["separators"] = current_separators
+                structure.append(level_data)
+        
+        if not structure:
+            dialog.preview_text.config(text="(No levels added)")
+            return
+        
+        # Example metadata (simplified - no "Example" prefix)
+        example_metadata = {
+            "artist": "Artist",
+            "album": "Album",
+            "release_date": "2024",
+            "genre": "Genre",
+            "publisher": "Label",
+            "album_artist": "Album Artist",
+            "catalog_number": "CAT123",
+            "title": "Song",
+            "ext": "mp3"
+        }
+        
+        # Build preview path
+        base_path = Path(self.path_var.get() if self.path_var.get() else "Downloads")
+        path_parts = [str(base_path)]
+        
+        field_values = {
+            "Artist": example_metadata["artist"],
+            "Album": example_metadata["album"],
+            "Year": example_metadata["release_date"] if example_metadata["release_date"] else "",
+            "Genre": example_metadata["genre"] or "",
+            "Label": example_metadata["publisher"] or "",
+            "Album Artist": example_metadata["album_artist"] or "",
+            "Catalog Number": example_metadata["catalog_number"] or ""
+        }
+        
+        for level in structure:
+            fields = level.get("fields", [])
+            separators = level.get("separators", [])
+            
+            if not fields:
+                continue
+            
+            # Build level string
+            level_parts = []
+            for field in fields:
+                value = field_values.get(field, "")
+                if value:
+                    level_parts.append(value)
+            
+            if level_parts:
+                # Build level string with prefix, between, and suffix separators
+                # separators[0] = prefix, separators[1..n-1] = between, separators[n] = suffix
+                result_parts = []
+                
+                # Add prefix separator (before first field)
+                prefix_sep = separators[0] if separators and len(separators) > 0 else ""
+                if prefix_sep and prefix_sep != "None":
+                    result_parts.append(prefix_sep)
+                
+                # Add fields with between separators
+                for i, field_value in enumerate(level_parts):
+                    result_parts.append(field_value)
+                    
+                    # Add between separator (after each field except last)
+                    if i < len(level_parts) - 1:
+                        between_idx = i + 1  # separators[1] after first field, separators[2] after second, etc.
+                        between_sep = separators[between_idx] if between_idx < len(separators) else "-"
+                        if between_sep == "None" or not between_sep:
+                            between_sep = " "  # Default to space if None
+                        result_parts.append(between_sep)
+                
+                # Add suffix separator (after last field)
+                suffix_idx = len(level_parts)  # separators[n] where n = number of fields
+                suffix_sep = separators[suffix_idx] if suffix_idx < len(separators) else ""
+                if suffix_sep and suffix_sep != "None":
+                    result_parts.append(suffix_sep)
+                
+                path_parts.append("".join(result_parts))
+        
+        # Add filename
+        path_parts.append(f"{example_metadata['title']}.{example_metadata['ext']}")
+        
+        # Format preview text - use backslashes like Windows paths (no spaces)
+        preview_path = "\\".join(path_parts)
+        dialog.preview_text.config(text=preview_path)
     
     def _add_level_to_slot(self, dialog, slot_frame):
         """Add a level to an empty slot."""
-        # Find first available option that isn't already selected
-        selected = []
-        for level_frame in dialog.custom_levels:
-            if hasattr(level_frame, 'level_var'):
-                value = level_frame.level_var.get()
-                if value:
-                    selected.append(value)
+        # Get first available field (strict duplicate prevention)
+        available = self._get_all_available_fields(dialog, slot_frame)
+        default_field = available[0] if available else "Artist"
         
-        # Default options in order of preference
-        default_options = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
-        default_value = "Artist"  # Fallback
-        for option in default_options:
-            if option not in selected:
-                default_value = option
-                break
-        
-        self._fill_level_slot(dialog, slot_frame, default_value)
+        # Create level with single field
+        level_data = {"fields": [default_field], "separator": None}
+        self._fill_level_slot(dialog, slot_frame, level_data)
     
     def _clear_level_slot(self, dialog, slot_frame):
         """Clear a filled slot, making it empty again."""
@@ -9045,42 +10148,15 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         # Update all dropdowns
         self._update_all_level_options(dialog)
-    
-    def _get_available_level_options(self, dialog, current_value=None):
-        """Get available level options, filtering out already selected ones."""
-        # Get all selected values (excluding current value)
-        selected = []
-        for level_frame in dialog.custom_levels:
-            if not hasattr(level_frame, 'level_var'):
-                continue
-            value = level_frame.level_var.get()
-            if value and value != current_value:
-                selected.append(value)
-        
-        # Available options: all options minus selected ones (plus current value)
-        # Note: yt-dlp metadata fields available from Bandcamp:
-        # - artist, album, release_date (Year), genre, publisher (Label)
-        # - album_artist (if different from artist)
-        # - catalog_number (if available)
-        # - track_number, discnumber (usually for filenames, not folders)
-        all_options = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
-        available = []
-        for option in all_options:
-            if option not in selected or option == current_value:
-                available.append(option)
-        
-        return available
+        # Update preview
+        self._update_preview(dialog)
     
     def _update_all_level_options(self, dialog):
-        """Update all level dropdowns to filter out selected options."""
+        """Update all level field dropdowns to filter out selected options (strict duplicate prevention)."""
+        # Rebuild UI for all levels to update dropdowns
         for level_frame in dialog.custom_levels:
-            if hasattr(level_frame, 'level_var') and hasattr(level_frame, 'level_combo'):
-                current_value = level_frame.level_var.get()
-                level_frame.level_combo['values'] = self._get_available_level_options(dialog, current_value)
-    
-    def _on_level_change(self, dialog, slot_frame):
-        """Handle change in a level dropdown."""
-        self._update_all_level_options(dialog)
+            if hasattr(level_frame, 'level_data') and hasattr(level_frame, 'fields_container'):
+                self._rebuild_level_fields_ui(dialog, level_frame)
     
     def _start_drag_level(self, dialog, slot_frame, event):
         """Start dragging a level."""
@@ -9212,6 +10288,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 slot.pack(fill=X, pady=2, padx=5, anchor='nw')
             
             dialog.update_idletasks()
+            # Update preview after reordering
+            self._update_preview(dialog)
         
         # Reset highlights
         for slot in dialog.level_slots:
@@ -9228,35 +10306,45 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
     
     def _save_custom_structure_from_dialog(self, dialog):
         """Save the custom structure from the dialog."""
-        # Build structure list from filled slots (in order)
+        # Build structure list from filled slots (in order) - new format
         structure = []
+        all_fields_used = set()
+        
         for slot_frame in dialog.level_slots:
-            if slot_frame.is_filled and hasattr(slot_frame, 'level_var'):
-                value = slot_frame.level_var.get()
-                if value:
-                    structure.append(value)
+            if slot_frame.is_filled and hasattr(slot_frame, 'level_data'):
+                level_data = slot_frame.level_data.copy()
+                fields = level_data.get("fields", [])
+                
+                if not fields:
+                    continue
+        
+                # Check for duplicates (strict: no duplicates anywhere)
+                for field in fields:
+                    if field in all_fields_used:
+                        messagebox.showwarning(
+                            "Duplicate Fields",
+                            f"Each field can only be used once.\n\nDuplicate field found: {field}\n\nPlease remove duplicates before saving."
+                        )
+                        return
+                    all_fields_used.add(field)
+                
+                structure.append(level_data)
         
         # Validate structure
         if not structure:
-            messagebox.showwarning("Invalid Structure", "Please add at least one level (Artist, Album, Year, Genre, Label, Album Artist, or Catalog Number).")
-            return
-        
-        # Check for duplicates (safety check - dropdowns should prevent this)
-        if len(structure) != len(set(structure)):
-            duplicates = [item for item in structure if structure.count(item) > 1]
-            messagebox.showwarning(
-                "Duplicate Levels",
-                f"Each level can only be used once.\n\nDuplicate level(s) found: {', '.join(set(duplicates))}\n\nPlease remove duplicates before saving."
-            )
+            messagebox.showwarning("Invalid Structure", "Please add at least one level with at least one field.")
             return
         
         # Format for display
         formatted = self._format_custom_structure(structure)
         
-        # Check if this structure already exists
+        # Check if this structure already exists (normalize existing structures for comparison)
         structure_exists = False
+        normalized_structure = self._normalize_structure(structure)
         for existing in self.custom_structures:
-            if existing == structure:
+            normalized_existing = self._normalize_structure(existing)
+            # Compare normalized structures
+            if normalized_structure == normalized_existing:
                 structure_exists = True
                 break
         
