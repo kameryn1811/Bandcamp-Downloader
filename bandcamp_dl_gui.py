@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 
 import sys
 import subprocess
@@ -209,6 +209,9 @@ class BandcampDownloaderGUI:
         # Check for launcher update status (will log after UI is set up)
         self.pending_update_status = self._check_launcher_update_status()
         
+        # Track URL field mode: 'entry' for single-line, 'text' for multi-line
+        self.url_field_mode = 'entry'  # Start in single-line mode
+        
         # Variables
         self.url_var = StringVar()
         self.path_var = StringVar()
@@ -300,6 +303,8 @@ class BandcampDownloaderGUI:
         self.root.after(100, self._update_url_count_and_button)
         # Initialize clear button visibility
         self.root.after(100, self._update_url_clear_button)
+        # Initialize expand button icon (should be expand icon ⤢ in single-line mode)
+        self.root.after(100, self._update_url_expand_button)
         # Show format warnings if selected on startup
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
@@ -1133,6 +1138,8 @@ class BandcampDownloaderGUI:
         self.url_expand_btn.bind("<Enter>", lambda e: self.url_expand_btn.config(fg='#D4D4D4'))
         self.url_expand_btn.bind("<Leave>", lambda e: self.url_expand_btn.config(fg='#808080'))
         # Always visible - no grid_remove()
+        # Set initial icon based on mode (should be ⤢ for entry mode)
+        self._update_url_expand_button()
         
         # Bind events for Entry
         url_entry.bind('<Control-v>', self._handle_entry_paste)
@@ -1599,6 +1606,10 @@ class BandcampDownloaderGUI:
         )
         self.download_btn.grid(row=6, column=0, columnspan=3, pady=15)
         
+        # Track if download button is being clicked to prevent URL field collapse interference
+        self.download_button_clicked = False
+        self.download_btn.bind('<Button-1>', lambda e: setattr(self, 'download_button_clicked', True), add='+')
+        
         # Cancel button (hidden initially, shown during download)
         # Uses same style as download button for consistent size
         self.cancel_btn = ttk.Button(
@@ -2043,31 +2054,29 @@ class BandcampDownloaderGUI:
         self.url_check_timer = self.root.after(200, self._check_url)
     
     def _update_url_clear_button(self):
-        """Update the expand/collapse button icon based on current mode. Buttons are always visible."""
+        """Update the clear button visibility based on content. Buttons are always visible."""
         if not hasattr(self, 'url_clear_btn'):
             return
         
-        # Ensure buttons are always visible
+        # Ensure clear button is always visible
         self.url_clear_btn.grid()
+    
+    def _update_url_expand_button(self):
+        """Update the expand/collapse button icon based on current mode."""
+        if not hasattr(self, 'url_expand_btn'):
+            return
         
-        # Determine current mode and update expand/collapse button icon
-        is_entry_mode = False
-        if self.url_text_widget and self.url_text_widget.winfo_viewable():
-            # ScrolledText is visible (multi-line mode)
-            is_entry_mode = False
-        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
-            # Entry is visible (single-line mode)
-            is_entry_mode = True
+        # Use tracked mode instead of checking widget visibility (more reliable)
+        is_entry_mode = (self.url_field_mode == 'entry')
         
         # Always show expand/collapse button and update icon based on current mode
-        if hasattr(self, 'url_expand_btn'):
-            self.url_expand_btn.grid()
-            if is_entry_mode:
-                # Entry mode - show expand icon (⤢)
-                self.url_expand_btn.config(text="⤢")
-            else:
-                # ScrolledText mode - show collapse icon (⤡)
-                self.url_expand_btn.config(text="⤡")
+        self.url_expand_btn.grid()
+        if is_entry_mode:
+            # Entry mode - show expand icon (⤢) - top-left to bottom-right
+            self.url_expand_btn.config(text="⤢")
+        else:
+            # ScrolledText mode - show collapse icon (⤡) - bottom-right to top-left
+            self.url_expand_btn.config(text="⤡")
     
     def _toggle_url_field_mode(self):
         """Toggle between Entry (single-line) and ScrolledText (multi-line) modes."""
@@ -2646,6 +2655,12 @@ class BandcampDownloaderGUI:
             except Exception:
                 pass
             
+            # Check if download button was just clicked - if so, skip collapse
+            # start_download will handle collapsing
+            if hasattr(self, 'download_button_clicked') and self.download_button_clicked:
+                self.download_button_clicked = False
+                return
+            
             # Check if the app is losing focus (focus going outside the app)
             # If so, don't collapse - keep the current height
             try:
@@ -2670,39 +2685,52 @@ class BandcampDownloaderGUI:
                 # If focus is going outside the app, don't collapse
                 if not is_in_app:
                     return
+                
+                # If focus is moving to the download button, don't collapse here
+                # The start_download function will handle collapsing
+                if hasattr(self, 'download_btn') and (new_focus == self.download_btn or self._is_widget_in_hierarchy(new_focus, self.download_btn)):
+                    return
             except Exception:
                 # If we can't determine focus, default to collapsing (safe behavior)
                 pass
             
             # Focus is going to another widget in the app - collapse as normal
-            # Save current scroll position before collapsing
+            # Use after_idle to ensure it doesn't interfere with click events
+            self.root.after_idle(self._perform_text_collapse)
+    
+    def _perform_text_collapse(self):
+        """Perform the actual collapse of the text widget."""
+        if not self.url_text_widget:
+            return
+        
+        # Save current scroll position before collapsing
+        try:
+            # Get the first visible line (top of viewport)
+            top_index = self.url_text_widget.index("@0,0")
+            self._saved_text_scroll_position = top_index
+        except Exception:
+            pass
+        
+        # Save current height before collapsing (if user resized it)
+        if hasattr(self, 'url_text_widget'):
             try:
-                # Get the first visible line (top of viewport)
-                top_index = self.url_text_widget.index("@0,0")
-                self._saved_text_scroll_position = top_index
+                current_height = self.url_text_widget.cget('height')
+                if current_height > 2:
+                    self.url_text_height = current_height
             except Exception:
                 pass
-            
-            # Save current height before collapsing (if user resized it)
-            if hasattr(self, 'url_text_widget'):
-                try:
-                    current_height = self.url_text_widget.cget('height')
-                    if current_height > 2:
-                        self.url_text_height = current_height
-                except Exception:
-                    pass
-            
-            # Collapse height to 2 lines (hide extra lines but keep content)
-            self.url_text_widget.config(height=2)
-            
-            # Don't scroll to top - maintain position when focus returns
-            # The scroll position will be restored when focus returns
-            
-            # Update placeholder visibility based on content
-            self._update_text_placeholder_visibility()
-            
-            # Force update to ensure height change is applied
-            self.url_text_widget.update_idletasks()
+        
+        # Collapse height to 2 lines (hide extra lines but keep content)
+        self.url_text_widget.config(height=2)
+        
+        # Don't scroll to top - maintain position when focus returns
+        # The scroll position will be restored when focus returns
+        
+        # Update placeholder visibility based on content
+        self._update_text_placeholder_visibility()
+        
+        # Force update to ensure height change is applied
+        self.url_text_widget.update_idletasks()
     
     def _expand_to_multiline(self, initial_content=""):
         """Expand from Entry to ScrolledText for multi-line input."""
@@ -2793,6 +2821,12 @@ class BandcampDownloaderGUI:
         # Focus the text widget
         self.url_text_widget.focus_set()
         
+        # Update mode tracking
+        self.url_field_mode = 'text'
+        
+        # Update expand/collapse button icon to collapse (⤡) since we're now in multi-line mode
+        self._update_url_expand_button()
+        
         # Update URL count and clear button
         self._update_url_count_and_button()
         self._update_url_clear_button()
@@ -2850,6 +2884,12 @@ class BandcampDownloaderGUI:
         # Update URL count and clear button
         self._update_url_count_and_button()
         self._update_url_clear_button()
+        
+        # Update mode tracking
+        self.url_field_mode = 'entry'
+        
+        # Update expand/collapse button icon to expand (⤢) since we're now in single-line mode
+        self._update_url_expand_button()
         
         # Focus the Entry widget
         if self.url_entry_widget:
@@ -4724,6 +4764,20 @@ class BandcampDownloaderGUI:
                 break
         return False
     
+    def _is_widget_in_hierarchy(self, widget, parent):
+        """Check if widget is in the hierarchy of parent widget."""
+        if not parent:
+            return False
+        current = widget
+        while current:
+            if current == parent:
+                return True
+            try:
+                current = current.master
+            except:
+                break
+        return False
+    
     def _on_search_change(self):
         """Handle search text change."""
         search_text = self.search_var.get()
@@ -4986,6 +5040,10 @@ class BandcampDownloaderGUI:
     
     def start_download(self):
         """Start the download process in a separate thread."""
+        # Reset the download button clicked flag
+        if hasattr(self, 'download_button_clicked'):
+            self.download_button_clicked = False
+        
         # If multi-line field is visible, collapse to single-line to preserve all URLs
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
             self._collapse_to_entry()
@@ -6368,6 +6426,110 @@ class BandcampDownloaderGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"Error verifying MP3 metadata: {str(e)}"))
     
+    def verify_and_fix_original_format_metadata(self, download_path):
+        """Verify and fix metadata/artwork for all formats in Original format (MP3, M4A, FLAC, etc.)."""
+        try:
+            base_path = Path(download_path)
+            if not base_path.exists():
+                return
+            
+            # Supported formats for Original format
+            audio_extensions = [".mp3", ".m4a", ".mp4", ".aac", ".flac", ".ogg", ".oga"]
+            audio_files = []
+            import time
+            
+            # Find audio files that were just downloaded
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                # Check files from downloaded_files set
+                for downloaded_file in self.downloaded_files:
+                    file_path = Path(downloaded_file)
+                    if file_path.exists() and file_path.suffix.lower() in audio_extensions:
+                        audio_files.append(file_path)
+            
+            # If no files tracked, use timestamp-based filtering
+            if not audio_files and hasattr(self, 'download_start_time'):
+                time_threshold = self.download_start_time - 30
+                album_info = getattr(self, 'album_info_stored', None)
+                artist_lower = (album_info.get("artist") or "").lower() if album_info else None
+                album_lower = (album_info.get("album") or "").lower() if album_info else None
+                
+                for ext in audio_extensions:
+                    for audio_file in base_path.rglob(f"*{ext}"):
+                        try:
+                            file_mtime = audio_file.stat().st_mtime
+                            if file_mtime >= time_threshold:
+                                if album_info and (artist_lower or album_lower):
+                                    file_path_str = str(audio_file).lower()
+                                    if (artist_lower and artist_lower in file_path_str) or \
+                                       (album_lower and album_lower in file_path_str):
+                                        audio_files.append(audio_file)
+                                else:
+                                    audio_files.append(audio_file)
+                        except Exception:
+                            pass
+            
+            if not audio_files:
+                return
+            
+            # Group by extension for logging
+            mp3_files = [f for f in audio_files if f.suffix.lower() == '.mp3']
+            other_files = [f for f in audio_files if f.suffix.lower() != '.mp3']
+            
+            # Process MP3 files (use existing function)
+            if mp3_files:
+                self.verify_and_fix_mp3_metadata(download_path)
+            
+            # Process other formats (M4A, FLAC, etc.)
+            if other_files:
+                self.root.after(0, lambda: self.log(f"Embedding cover art for {len(other_files)} non-MP3 file(s)..."))
+                
+                # Group files by directory
+                files_by_dir = {}
+                for audio_file in other_files:
+                    dir_path = audio_file.parent
+                    if dir_path not in files_by_dir:
+                        files_by_dir[dir_path] = []
+                    files_by_dir[dir_path].append(audio_file)
+                
+                processed_count = 0
+                for dir_path, dir_files in files_by_dir.items():
+                    # Find thumbnail for this directory
+                    thumbnail_file = None
+                    for audio_file in dir_files:
+                        thumb = self.find_thumbnail_file(str(audio_file))
+                        if thumb:
+                            thumbnail_file = thumb
+                            break
+                    
+                    if not thumbnail_file:
+                        continue
+                    
+                    # Process each file
+                    for audio_file in dir_files:
+                        audio_file_str = str(audio_file)
+                        audio_file_name = audio_file.name
+                        audio_ext = audio_file.suffix.lower()
+                        
+                        success = False
+                        if audio_ext in [".m4a", ".mp4", ".aac"]:
+                            # M4A/MP4/AAC: use embed_cover_art_ffmpeg
+                            success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                        elif audio_ext in [".flac", ".ogg", ".oga"]:
+                            # FLAC/OGG: use embed_cover_art_ffmpeg
+                            success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
+                        
+                        if success:
+                            processed_count += 1
+                            self.root.after(0, lambda name=audio_file_name: self.log(f"✓ Embedded cover art: {name}"))
+                        else:
+                            self.root.after(0, lambda name=audio_file_name: self.log(f"⚠ Could not embed cover art: {name}"))
+                
+                if processed_count > 0:
+                    self.root.after(0, lambda count=processed_count: self.log(f"Embedded cover art for {count} non-MP3 file(s)"))
+        
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"Error verifying Original format metadata: {str(e)}"))
+    
     def deduplicate_cover_art(self, directories):
         """Remove duplicate cover art files - keep only one if all are identical."""
         # Cache hashes to avoid recalculating for same files
@@ -7521,9 +7683,12 @@ class BandcampDownloaderGUI:
         # Process downloaded files
         if download_path:
             try:
-                # For MP3, verify and fix metadata if needed
+                # For MP3 format, verify and fix metadata if needed
                 if base_format == "mp3":
                     self.verify_and_fix_mp3_metadata(download_path)
+                # For Original format, verify and fix metadata/artwork for all formats (MP3, M4A, FLAC, etc.)
+                elif base_format == "original":
+                    self.verify_and_fix_original_format_metadata(download_path)
                 # Process other formats (FLAC, OGG, WAV)
                 self.process_downloaded_files(download_path)
                 
