@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 
 import sys
 import subprocess
@@ -8913,7 +8913,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             font=("Segoe UI", 10),
             bg='#1E1E1E',
             fg='#808080',
-            cursor='hand2',
+            cursor='fleur',  # Grabbing/drag cursor instead of link cursor
             width=3
         )
         drag_handle.pack(side=LEFT, padx=5)
@@ -9036,6 +9036,10 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         dialog.drag_start_y = event.y_root
         dialog.drag_start_index = dialog.level_slots.index(slot_frame)
         
+        # Store original cursor and set drag cursor on dialog window
+        dialog.original_cursor = dialog.cget('cursor')
+        dialog.config(cursor='fleur')
+        
         # Enhanced visual feedback - make dragged slot stand out
         slot_frame.config(
             highlightbackground='#00A8FF',  # Brighter blue
@@ -9110,6 +9114,10 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         """End dragging and reorder levels by moving slot to target position."""
         if not dialog.dragging or dialog.dragging != slot_frame:
             return
+        
+        # Restore original cursor
+        if hasattr(dialog, 'original_cursor'):
+            dialog.config(cursor=dialog.original_cursor)
         
         # Get target index from drag
         target_index = getattr(dialog, 'drag_target_index', None)
