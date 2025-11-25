@@ -34,6 +34,11 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 * **Playlist Generation** - Create .m3u playlists automatically
 * **Status Log** - Searchable status log with Ctrl+F, word wrap toggle, and clear with undo
 * **Debug Mode** - Toggle visibility of debug information to troubleshoot issues 
+* **Supported URLs:**
+   * Album pages: `https://[artist].bandcamp.com/album/[album]`
+   * Track pages: `https://[artist].bandcamp.com/track/[track]`
+   * Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
+ 
 
 ## Quick Start
 
@@ -53,16 +58,12 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
    - Comes with ffmpeg.exe bundled
    - Single executable file
 
-**Supported URLs**
-
-* Album pages: `https://[artist].bandcamp.com/album/[album]`
-* Track pages: `https://[artist].bandcamp.com/track/[track]`
-* Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
-
-
 ### Option 2: Standalone Script (Advanced)
 
 **For users who prefer manual setup:**
+  - Smaller download (~200KB script vs ~60MB launcher)
+  - Full control over Python and dependencies
+  - Easy to modify and test the script if needed
 
 **Prerequisites**
 
@@ -83,18 +84,6 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 3. Double-click `Bandcamp Downloader GUI.bat` (optionally create a shortcut to this file and pin it to your start menu, taskbar, desktop, etc)
 4. The app will check for and help install any missing dependencies
 5. Profit
-
-**Benefits:**
-- Smaller download (~200KB script vs ~60MB launcher)
-- Full control over Python and dependencies
-- Easy to modify and test the script if needed
-
-**Supported URLs**
-
-* Album pages: `https://[artist].bandcamp.com/album/[album]`
-* Track pages: `https://[artist].bandcamp.com/track/[track]`
-* Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
-
 
 ## Troubleshooting
 
