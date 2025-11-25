@@ -8343,8 +8343,8 @@ class BandcampDownloaderGUI:
                     if hasattr(self, 'log'):
                         self.root.after(0, lambda: self.log(f"Update: Will download from: {download_url}"))
                     
-                    # No release notes when getting from main branch, but that's okay
-                    release_notes = ""
+                    # Try to fetch commit message from GitHub API
+                    release_notes = self._fetch_commit_message(repo_owner, repo_name, latest_version)
                     
                     # Capture variables in lambda to avoid closure issues
                     self.root.after(0, lambda cv=current_version, lv=latest_version, du=download_url, rn=release_notes: 
@@ -8404,6 +8404,41 @@ class BandcampDownloaderGUI:
         else:
             return 0
     
+    def _fetch_commit_message(self, repo_owner, repo_name, version):
+        """Fetch the commit message for the latest commit that modified bandcamp_dl_gui.py."""
+        try:
+            import requests
+            
+            # Get the latest commit that modified bandcamp_dl_gui.py on main branch
+            api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits"
+            params = {
+                'path': 'bandcamp_dl_gui.py',
+                'sha': 'main',
+                'per_page': 1  # Only need the most recent commit
+            }
+            
+            response = requests.get(api_url, params=params, timeout=10)
+            response.raise_for_status()
+            commits = response.json()
+            
+            if commits and len(commits) > 0:
+                commit_message = commits[0].get('commit', {}).get('message', '')
+                # Clean up the commit message (remove version tag if present, keep the actual message)
+                # Commit messages often have format: "v1.1.8\n\nActual message here"
+                lines = commit_message.strip().split('\n')
+                # Skip the first line if it's just a version number
+                if len(lines) > 1 and (lines[0].startswith('v') or lines[0] == version):
+                    # Join the rest of the lines (the actual commit message)
+                    commit_message = '\n'.join(lines[1:]).strip()
+                return commit_message
+            
+            return ""
+        except Exception as e:
+            # If fetching fails, just return empty string (non-critical)
+            if hasattr(self, 'log'):
+                self.root.after(0, lambda: self.log(f"Could not fetch commit message: {str(e)}"))
+            return ""
+    
     def _show_update_popup(self, current_version, latest_version, download_url, release_notes=""):
         """Show update available popup."""
         # Validate inputs
@@ -8429,10 +8464,15 @@ class BandcampDownloaderGUI:
         # Format release notes (first few lines)
         notes_preview = ""
         if release_notes and release_notes.strip():
-            lines = release_notes.strip().split('\n')[:5]  # First 5 lines
-            notes_preview = "\n\n" + "\n".join(lines)
-            if len(release_notes.strip().split('\n')) > 5:
-                notes_preview += "\n..."
+            # Clean up the commit message - remove empty lines at start/end
+            cleaned_notes = release_notes.strip()
+            lines = [line for line in cleaned_notes.split('\n') if line.strip()]  # Remove empty lines
+            if lines:
+                # Show first 8 lines (more than before to show more context)
+                preview_lines = lines[:8]
+                notes_preview = "\n\n" + "\n".join(preview_lines)
+                if len(lines) > 8:
+                    notes_preview += "\n..."
         
         # Build message
         message = (
