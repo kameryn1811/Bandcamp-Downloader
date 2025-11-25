@@ -38,7 +38,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 ## Quick Start
 
 
-### Option 1: Launcher (Recommended - Self-Contained)
+### Option 1: Launcher (Recommended)
 
 **For users who want everything bundled:**
 
@@ -60,7 +60,7 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 * Artist pages: `https://[artist].bandcamp.com` (downloads all available albums)
 
 
-### Option 2: Standalone Script (For Advanced Users)
+### Option 2: Standalone Script (Advanced)
 
 **For users who prefer manual setup:**
 
