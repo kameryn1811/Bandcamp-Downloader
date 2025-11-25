@@ -18,8 +18,6 @@ Bandcamp Downloader GUI provides a simple way to download the freely available 1
 
 <img width="650" alt="screenshot-main-v1 1 8" src="images/screenshot-main-v1.1.8.png" />
 
-![Main Interface](images/screenshot-main-v1.1.8.png) 
-
 *The main download interface with album art preview and settings panel*
 
 ## Key Features
