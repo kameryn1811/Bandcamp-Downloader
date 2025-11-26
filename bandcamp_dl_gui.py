@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 import sys
 import subprocess
@@ -143,8 +143,8 @@ class BandcampDownloaderGUI:
     THUMBNAIL_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp']
     FOLDER_STRUCTURES = {
         "1": "Root directory",
-        "2": "Album folder",
-        "3": "Artist folder",
+        "2": "Album",
+        "3": "Artist",
         "4": "Artist / Album",
         "5": "Album / Artist",
     }
@@ -450,6 +450,26 @@ class BandcampDownloaderGUI:
         # Progress bar uses Bandcamp blue for a friendly, success-oriented feel
         style.configure('TProgressbar', background=success_color, troughcolor=bg_color,
                         borderwidth=0, lightcolor=success_color, darkcolor=success_color)
+        
+        # Menubutton style (shared by all menubuttons - structure, format, numbering)
+        style.configure('Dark.TMenubutton',
+            background=entry_bg,
+            foreground=entry_fg,
+            borderwidth=1,
+            bordercolor=border_color,
+            relief='solid',
+            padding=(0, 0),  # Remove padding to match combobox alignment
+            arrowcolor='#CCCCCC',  # Light gray arrow
+            arrowpadding=(0, 0, 8, 0)  # Padding for arrow (left, top, right, bottom)
+        )
+        style.map('Dark.TMenubutton',
+            background=[('active', '#2D2D30'), ('!disabled', entry_bg)],
+            foreground=[('active', '#FFFFFF'), ('!disabled', entry_fg)],
+            borderwidth=[('focus', 1), ('!focus', 1)],
+            bordercolor=[('focus', accent_color), ('!focus', border_color)],  # Blue border on focus like combobox
+            relief=[('pressed', 'solid'), ('!pressed', 'solid')],
+            arrowcolor=[('active', '#CCCCCC'), ('!active', '#CCCCCC')]  # Always light gray
+        )
         
         # Overall progress bar style (thinner, more subtle color - gray/white)
         # Try to make it very thin (3px) - thickness may not work on all platforms
@@ -804,7 +824,8 @@ class BandcampDownloaderGUI:
         """Format a custom structure as display string.
         Supports both old format (list of strings) and new format (list of dicts).
         Old: ["Artist", "Year", "Album"] -> "Artist / Year / Album"
-        New: [{"fields": ["Year"], "separator": None}, {"fields": ["Year", "Album"], "separator": "-"}] -> "Year / Year - Album"
+        New: [{"fields": ["Year"], "separators": []}, {"fields": ["Year", "Album"], "separators": ["-"]}] -> "Year / Year - Album"
+        Handles prefix, between-field, and suffix separators correctly.
         """
         if not structure:
             return ""
@@ -823,18 +844,33 @@ class BandcampDownloaderGUI:
             if not fields:
                 continue
             
-            # Join fields with separators per gap (or space if None)
-            if len(fields) == 1:
-                level_strings.append(fields[0])
-            else:
-                # Join fields with separators per gap
-                result_parts = [fields[0]]
-                for i in range(1, len(fields)):
-                    sep = separators[i-1] if i-1 < len(separators) else "-"
-                    if sep == "None" or not sep:
-                        sep = " "  # Default to space if None
-                    result_parts.append(sep)
-                    result_parts.append(fields[i])
+            # Build level string with prefix, between, and suffix separators (same logic as preview)
+            result_parts = []
+            
+            # Add prefix separator (before first field)
+            prefix_sep = separators[0] if separators and len(separators) > 0 else ""
+            if prefix_sep and prefix_sep != "None":
+                result_parts.append(prefix_sep)
+            
+            # Add fields with between separators
+            for i, field in enumerate(fields):
+                result_parts.append(field)
+                
+                # Add between separator (after each field except last)
+                if i < len(fields) - 1:
+                    between_idx = i + 1  # separators[1] after first field, separators[2] after second, etc.
+                    between_sep = separators[between_idx] if between_idx < len(separators) else "-"
+                    if between_sep == "None" or not between_sep:
+                        between_sep = " "  # Default to space if None
+                    result_parts.append(between_sep)
+            
+            # Add suffix separator (after last field)
+            suffix_idx = len(fields)  # separators[n] where n = number of fields
+            suffix_sep = separators[suffix_idx] if suffix_idx < len(separators) else ""
+            if suffix_sep and suffix_sep != "None":
+                result_parts.append(suffix_sep)
+            
+            if result_parts:
                 level_strings.append("".join(result_parts))
         
         return " / ".join(level_strings)
@@ -851,13 +887,161 @@ class BandcampDownloaderGUI:
                     options.append(formatted)
         return options
     
+    def _create_dark_menu(self, parent):
+        """Create a dark-themed menu with consistent styling."""
+        menu = Menu(
+            parent,
+            tearoff=0,
+            bg='#252526',  # Dark background
+            fg='#CCCCCC',  # Light text
+            activebackground='#2D2D30',  # Hover background
+            activeforeground='#FFFFFF',  # Hover text
+            selectcolor='#007ACC',  # Selection indicator
+            borderwidth=0,  # No border
+            relief='flat',
+            activeborderwidth=0  # No border on active items
+        )
+        return menu
+    
+    def _create_menubutton_with_menu(self, parent, textvariable, values, width, callback=None):
+        """Create a menubutton with menu, matching the structure menubutton style.
+        
+        Args:
+            parent: Parent widget
+            textvariable: StringVar to bind to
+            values: List of string values for the menu
+            width: Width of the menubutton
+            callback: Optional callback function called when item is selected (receives selected value)
+        
+        Returns:
+            Tuple of (menubutton, menu)
+        """
+        menubutton = ttk.Menubutton(
+            parent,
+            textvariable=textvariable,
+            width=width,
+            direction='below',
+            style='Dark.TMenubutton'
+        )
+        
+        menu = self._create_dark_menu(menubutton)
+        menubutton['menu'] = menu
+        
+        # Track menu state for toggle behavior
+        menu_open = False
+        item_just_selected = False
+        
+        # Wrap callbacks to track when items are selected
+        def wrap_callback(original_callback, value):
+            def wrapped():
+                nonlocal item_just_selected
+                item_just_selected = True
+                if original_callback:
+                    original_callback(value)
+                else:
+                    textvariable.set(value)
+            return wrapped
+        
+        # Build menu items with padding
+        for value in values:
+            # Add padding: left space + text + right spaces
+            padded_label = f" {value}      "
+            if callback:
+                menu.add_command(
+                    label=padded_label,
+                    command=wrap_callback(callback, value)
+                )
+            else:
+                menu.add_command(
+                    label=padded_label,
+                    command=wrap_callback(None, value)
+                )
+        
+        def on_menu_post(event=None):
+            nonlocal menu_open, item_just_selected
+            menu_open = True
+            item_just_selected = False  # Reset when menu opens
+        
+        def on_menu_unpost(event=None):
+            nonlocal menu_open
+            menu_open = False
+        
+        menu.bind('<<MenuSelect>>', on_menu_post)
+        menu.bind('<<MenuUnpost>>', on_menu_unpost)
+        
+        # Check menu state on click - if open, close it; otherwise let default behavior open it
+        def on_button_click(event=None):
+            nonlocal menu_open, item_just_selected
+            if item_just_selected:
+                # Menu was just closed via item selection - don't interfere, let default behavior open it
+                item_just_selected = False
+                return None  # Let default behavior handle it
+            elif menu_open:
+                # Menu is open - close it and prevent default opening behavior
+                self.root.focus_set()
+                menu.unpost()
+                menu_open = False
+                return "break"
+            # Menu is closed - let default behavior open it
+            return None
+        
+        menubutton.bind('<Button-1>', on_button_click, add=True)
+        
+        return menubutton, menu
+    
+    def _build_structure_menu(self, menu):
+        """Build the structure menu with standard structures, separator, and custom structures."""
+        # Clear existing menu items
+        menu.delete(0, END)
+        
+        # Add standard structures with padding on all sides to match combobox dropdowns
+        for key in ["1", "2", "3", "4", "5"]:
+            display_value = self.FOLDER_STRUCTURES[key]
+            # Add padding: left space + text + right spaces (approximately 50px worth of spaces)
+            # Using ~6-7 spaces for right padding to match left indentation visually
+            padded_label = f" {display_value}      "  # Left space + text + right spaces
+            menu.add_command(
+                label=padded_label,
+                command=lambda val=key: self._on_structure_menu_select(val)
+            )
+        
+        # Add separator if there are custom structures
+        if hasattr(self, 'custom_structures') and self.custom_structures:
+            menu.add_separator()
+            
+            # Add custom structures with padding on all sides
+            for structure in self.custom_structures:
+                formatted = self._format_custom_structure(structure)
+                if formatted:
+                    padded_label = f" {formatted}      "  # Left space + text + right spaces
+                    menu.add_command(
+                        label=padded_label,
+                        command=lambda s=structure: self._on_structure_menu_select(s)
+                    )
+    
+    def _on_structure_menu_select(self, choice):
+        """Handle structure menu item selection."""
+        if isinstance(choice, str) and choice in ["1", "2", "3", "4", "5"]:
+            # Standard structure - set display value
+            display_value = self.FOLDER_STRUCTURES[choice]
+            self.folder_structure_var.set(display_value)
+        else:
+            # Custom structure - set formatted string
+            display_value = self._format_custom_structure(choice)
+            self.folder_structure_var.set(display_value)
+        
+        # Trigger the structure change handler
+        self.on_structure_change()
+    
     def _update_structure_dropdown(self):
-        """Update the structure dropdown with current custom structures."""
-        if not hasattr(self, 'structure_combo'):
+        """Update the structure menu with current custom structures."""
+        if not hasattr(self, 'structure_menu'):
             return
-        new_options = self._get_all_structure_options()
-        self.structure_combo['values'] = new_options
-        self.structure_display_values = new_options
+        # Rebuild the menu - use the rebuild function with tracking if it exists
+        if hasattr(self, '_rebuild_structure_menu_with_tracking'):
+            self._rebuild_structure_menu_with_tracking()
+        else:
+            self._build_structure_menu(self.structure_menu)
         # Update manage button state
         if hasattr(self, 'manage_btn'):
             has_custom = hasattr(self, 'custom_structures') and self.custom_structures
@@ -1470,6 +1654,11 @@ class BandcampDownloaderGUI:
         # Configure columns: label, combo, button (right-aligned)
         self.settings_content.columnconfigure(1, weight=1)  # Allow combo to expand
         
+        # Configure rows for uniform spacing
+        self.settings_content.rowconfigure(0, uniform='settings_row', pad=0)
+        self.settings_content.rowconfigure(1, uniform='settings_row', pad=0)
+        self.settings_content.rowconfigure(2, uniform='settings_row', pad=0)
+        
         # Album art panel (separate frame on the right, same height as settings, square for equal padding)
         self.album_art_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
         self.album_art_frame.grid(row=2, column=2, sticky=(W, E, N), pady=6, padx=(6, 0))
@@ -1504,16 +1693,21 @@ class BandcampDownloaderGUI:
         )
         
         # Audio Format (first) - with eye icon button on the right when album art is hidden
-        ttk.Label(self.settings_content, text="Audio Format:", font=("Segoe UI", 8)).grid(row=0, column=0, padx=4, sticky=W, pady=1)
-        format_combo = ttk.Combobox(
+        ttk.Label(self.settings_content, text="File Format:", font=("Segoe UI", 8)).grid(row=0, column=0, padx=4, sticky=W, pady=1)
+        
+        def on_format_select(value):
+            self.format_var.set(value)
+            self.on_format_change()
+            self.update_preview()
+        
+        format_menubutton, format_menu = self._create_menubutton_with_menu(
             self.settings_content,
-            textvariable=self.format_var,
-            values=["Original", "mp3 (128kbps)", "flac", "ogg", "wav"],
-            state="readonly",
-            width=15
+            self.format_var,
+            ["Original", "mp3 (128kbps)", "flac", "ogg", "wav"],
+            width=21,
+            callback=on_format_select
         )
-        format_combo.grid(row=0, column=1, padx=4, sticky=W, pady=1)
-        format_combo.bind("<<ComboboxSelected>>", lambda e: (self._deselect_combobox_text(e), self.on_format_change(e), self.update_preview()))
+        format_menubutton.grid(row=0, column=1, padx=4, sticky=W, pady=1)
         
         # Show album art button (hidden by default, shown when album art is hidden)
         # Placed in the same row as Audio Format, right-aligned
@@ -1539,37 +1733,114 @@ class BandcampDownloaderGUI:
         
         # Numbering (second, below Audio Format)
         ttk.Label(self.settings_content, text="Numbering:", font=("Segoe UI", 8)).grid(row=1, column=0, padx=4, sticky=W, pady=1)
-        numbering_combo = ttk.Combobox(
+        
+        def on_numbering_select(value):
+            self.numbering_var.set(value)
+            self.on_numbering_change()
+            self.update_preview()
+        
+        numbering_menubutton, numbering_menu = self._create_menubutton_with_menu(
             self.settings_content,
-            textvariable=self.numbering_var,
-            values=["None", "01. Track", "1. Track", "01 - Track", "1 - Track"],
-            state="readonly",
-            width=15
+            self.numbering_var,
+            ["None", "01. Track", "1. Track", "01 - Track", "1 - Track"],
+            width=21,
+            callback=on_numbering_select
         )
-        numbering_combo.grid(row=1, column=1, padx=4, sticky=W, pady=1)
-        numbering_combo.bind("<<ComboboxSelected>>", lambda e: (self._deselect_combobox_text(e), self.on_numbering_change(e), self.update_preview()))
+        numbering_menubutton.grid(row=1, column=1, padx=4, sticky=W, pady=1)
         
         # Folder Structure (third, below Numbering)
-        ttk.Label(self.settings_content, text="Folder Structure:", font=("Segoe UI", 8)).grid(row=2, column=0, padx=4, sticky=W, pady=1)
-        
-        # Create a separate display variable for the combobox using class constants
-        structure_display_values = list(self.FOLDER_STRUCTURES.values())
-        # Add custom structures to dropdown
-        structure_display_values = self._get_all_structure_options()
+        ttk.Label(self.settings_content, text="Structure:", font=("Segoe UI", 8)).grid(row=2, column=0, padx=4, sticky=W, pady=1)
         
         # Create frame for dropdown and buttons
-        structure_frame = Frame(self.settings_content, bg='#1E1E1E')
-        structure_frame.grid(row=2, column=1, padx=4, sticky=W, pady=1, columnspan=1)  # Don't expand to avoid overlap with column 2
+        structure_frame = Frame(self.settings_content, bg='#1E1E1E', highlightthickness=0, borderwidth=0)
+        structure_frame.grid(row=2, column=1, padx=4, sticky=(W, N), pady=1, columnspan=1)  # Don't expand to avoid overlap with column 2
         
-        structure_combo = ttk.Combobox(
+        # Use Menubutton + Menu instead of Combobox for separator support
+        # Create structure menubutton (custom menu building for separator support)
+        structure_menubutton = ttk.Menubutton(
             structure_frame,
             textvariable=self.folder_structure_var,
-            values=structure_display_values,
-            state="readonly",
-            width=17  # Slightly reduced width to make more room for buttons
+            width=21,
+            direction='below',
+            style='Dark.TMenubutton'
         )
-        structure_combo.pack(side=LEFT, padx=(0, 4))
-        structure_combo.bind("<<ComboboxSelected>>", lambda e: (self._deselect_combobox_text(e), self.on_structure_change(e)))
+        structure_menubutton.pack(side=LEFT, padx=(0, 6), pady=0, anchor='w')
+        
+        structure_menu = self._create_dark_menu(structure_menubutton)
+        structure_menubutton['menu'] = structure_menu
+        
+        # Build the menu with standard structures, separator, and custom structures
+        self._build_structure_menu(structure_menu)
+        
+        # Track menu state for toggle behavior
+        self.structure_menu_open = False
+        self.structure_item_just_selected = False
+        
+        # Wrap the structure menu select handler to track item selection
+        original_on_structure_select = self._on_structure_menu_select
+        def wrapped_structure_select(choice):
+            self.structure_item_just_selected = True
+            original_on_structure_select(choice)
+        
+        # Rebuild menu with wrapped callbacks
+        def rebuild_with_tracking():
+            structure_menu.delete(0, END)
+            # Add standard structures
+            for key in ["1", "2", "3", "4", "5"]:
+                display_value = self.FOLDER_STRUCTURES[key]
+                padded_label = f" {display_value}      "
+                structure_menu.add_command(
+                    label=padded_label,
+                    command=lambda val=key: wrapped_structure_select(val)
+                )
+            # Add separator if there are custom structures
+            if hasattr(self, 'custom_structures') and self.custom_structures:
+                structure_menu.add_separator()
+                # Add custom structures
+                for structure in self.custom_structures:
+                    formatted = self._format_custom_structure(structure)
+                    if formatted:
+                        padded_label = f" {formatted}      "
+                        structure_menu.add_command(
+                            label=padded_label,
+                            command=lambda s=structure: wrapped_structure_select(s)
+                        )
+        
+        rebuild_with_tracking()
+        
+        def on_menu_post(event=None):
+            self.structure_menu_open = True
+            self.structure_item_just_selected = False  # Reset when menu opens
+        
+        def on_menu_unpost(event=None):
+            self.structure_menu_open = False
+        
+        structure_menu.bind('<<MenuSelect>>', on_menu_post)
+        structure_menu.bind('<<MenuUnpost>>', on_menu_unpost)
+        
+        # Check menu state on click - if open, close it; otherwise let default behavior open it
+        def on_button_click(event=None):
+            if self.structure_item_just_selected:
+                # Menu was just closed via item selection - don't interfere, let default behavior open it
+                self.structure_item_just_selected = False
+                return None  # Let default behavior handle it
+            elif self.structure_menu_open:
+                # Menu is open - close it and prevent default opening behavior
+                self.root.focus_set()
+                structure_menu.unpost()
+                self.structure_menu_open = False
+                return "break"
+            # Menu is closed - let default behavior open it
+            return None
+        
+        structure_menubutton.bind('<Button-1>', on_button_click, add=True)
+        
+        # Store the rebuild function so _update_structure_dropdown can use it
+        self._rebuild_structure_menu_with_tracking = rebuild_with_tracking
+        
+        # Store references
+        self.structure_menubutton = structure_menubutton
+        self.structure_menu = structure_menu
         
         # Customize button (✏️) - matching settings cog icon style
         customize_btn = Label(
@@ -1580,7 +1851,7 @@ class BandcampDownloaderGUI:
             fg='#808080',
             cursor='hand2',
             width=2,
-            padx=4
+            padx=0
         )
         customize_btn.pack(side=LEFT, padx=(0, 4))  # Increased spacing between buttons
         customize_btn.bind("<Button-1>", lambda e: self._show_customize_dialog())
@@ -1605,9 +1876,7 @@ class BandcampDownloaderGUI:
             manage_btn.bind("<Enter>", lambda e: manage_btn.config(fg='#D4D4D4') if has_custom else None)
             manage_btn.bind("<Leave>", lambda e: manage_btn.config(fg='#808080') if has_custom else None)
         
-        # Store references
-        self.structure_combo = structure_combo
-        self.structure_display_values = structure_display_values
+        # Store references (structure_menubutton and structure_menu already stored above)
         self.customize_btn = customize_btn
         self.manage_btn = manage_btn
         
@@ -1920,7 +2189,8 @@ class BandcampDownloaderGUI:
         self.log_text.tag_config(self.debug_tag_name, foreground='#1E1E1E', background='#1E1E1E')  # Hidden by default (matches background)
         
         # Bind Ctrl+F globally to show search (works anywhere in the app)
-        self.log_text.bind('<Button-1>', lambda e: self._on_log_click())  # Enable focus when clicking log
+        # Use Button-1 with add=True to set focus without interfering with text selection
+        self.log_text.bind('<Button-1>', lambda e: self._on_log_click(), add=True)  # Enable focus when clicking log
         # Use bind_all to ensure Ctrl+F works regardless of which widget has focus
         self.root.bind_all('<Control-f>', lambda e: self._show_search_bar())  # Global Ctrl+F hotkey
         
@@ -2149,7 +2419,7 @@ class BandcampDownloaderGUI:
     
     def update_structure_display(self):
         """Update the dropdown display to show the current selection."""
-        if not hasattr(self, 'structure_combo'):
+        if not hasattr(self, 'structure_menu'):
             return
             
         choice = self._extract_structure_choice(self.folder_structure_var.get())
@@ -2161,10 +2431,8 @@ class BandcampDownloaderGUI:
             # Get the display value using class constants
             display_value = self.FOLDER_STRUCTURES.get(choice, self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE])
         
-        # Set both the StringVar and the combobox to the display value
-        # This ensures the combobox shows the full text
+        # Set the StringVar - menu button text is automatically updated via textvariable binding
         self.folder_structure_var.set(display_value)
-        self.structure_combo.set(display_value)
     
     def on_url_change(self):
         """Handle URL changes - fetch metadata for preview with debouncing."""
@@ -4547,7 +4815,7 @@ class BandcampDownloaderGUI:
             field_values = {
                 "Artist": artist,
                 "Album": album,
-                "Year": "2024",
+                "Year": "Year",
                 "Genre": "Genre",
                 "Label": "Label",
                 "Album Artist": "Album Artist",
@@ -4898,8 +5166,8 @@ class BandcampDownloaderGUI:
     def _on_log_click(self):
         """Handle click on log text to enable Ctrl+F."""
         # Give focus to log_text so Ctrl+F works
+        # Don't return "break" - allow default text selection behavior to work
         self.log_text.focus_set()
-        return "break"  # Prevent default behavior
     
     def _show_search_bar_if_log_focused(self):
         """Show search bar if log text has focus."""
@@ -9452,8 +9720,12 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         messagebox.showinfo("About", about_text)
     
-    def _show_customize_dialog(self):
-        """Show modal dialog to customize folder structure."""
+    def _show_customize_dialog(self, force_new=False):
+        """Show modal dialog to customize folder structure.
+        
+        Args:
+            force_new: If True, open in "new structure" mode regardless of current selection.
+        """
         dialog = Toplevel(self.root)
         dialog.title("Customize Folder Structure")
         dialog.transient(self.root)
@@ -9533,17 +9805,19 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         dialog.dragging = None
         dialog.drag_start_y = 0
         dialog.levels_frame = levels_frame  # Store reference
+        dialog.editing_structure_index = None  # Track which structure is being edited (None = new structure)
         
-        # Load current structure if it's a custom one
+        # Load current structure if it's a custom one (unless force_new is True)
         current_value = self.folder_structure_var.get()
         initial_structure = None
-        if hasattr(self, 'custom_structures') and self.custom_structures:
+        if not force_new and hasattr(self, 'custom_structures') and self.custom_structures:
             if current_value not in self.FOLDER_STRUCTURES.values():
                 # This is a custom structure, find it
-                for structure in self.custom_structures:
+                for idx, structure in enumerate(self.custom_structures):
                     if self._format_custom_structure(structure) == current_value:
                         # Normalize to ensure new format
                         initial_structure = self._normalize_structure(structure)
+                        dialog.editing_structure_index = idx  # Store the index of the structure being edited
                         break
         
         # Always create 4 fixed slots
@@ -9562,21 +9836,56 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         buttons_frame = Frame(main_container, bg='#1E1E1E')
         buttons_frame.pack(pady=(3, 5))  # Add bottom padding so buttons aren't cut off
         
-        # Save button
-        save_btn = ttk.Button(
-            buttons_frame,
-            text="Save Structure",
-            command=lambda: self._save_custom_structure_from_dialog(dialog)
-        )
-        save_btn.pack(side=LEFT, padx=5)
+        # Show different buttons when editing existing structure vs creating new
+        if dialog.editing_structure_index is not None:
+            # Editing existing structure - show multiple options
+            # Create New button
+            create_new_btn = ttk.Button(
+                buttons_frame,
+                text="Create New",
+                command=lambda: self._create_new_structure_in_dialog(dialog)
+            )
+            create_new_btn.pack(side=LEFT, padx=5)
+            
+            # Update Existing button (primary action) - initially disabled
+            update_btn = ttk.Button(
+                buttons_frame,
+                text="Save Existing",
+                command=lambda: self._save_custom_structure_from_dialog(dialog, update_existing=True),
+                state='disabled'
+            )
+            update_btn.pack(side=LEFT, padx=5)
+            dialog.update_btn = update_btn  # Store reference
+            
+            # Save As New button - initially disabled
+            save_as_new_btn = ttk.Button(
+                buttons_frame,
+                text="Save As New",
+                command=lambda: self._save_custom_structure_from_dialog(dialog, update_existing=False),
+                state='disabled'
+            )
+            save_as_new_btn.pack(side=LEFT, padx=5)
+            dialog.save_as_new_btn = save_as_new_btn  # Store reference
+        else:
+            # Creating new structure - show simple Save button
+            save_btn = ttk.Button(
+                buttons_frame,
+                text="Save Structure",
+                command=lambda: self._save_custom_structure_from_dialog(dialog, update_existing=False)
+            )
+            save_btn.pack(side=LEFT, padx=5)
         
-        # Cancel button
+        # Cancel button (always shown)
         cancel_btn = ttk.Button(
             buttons_frame,
             text="Cancel",
             command=dialog.destroy
         )
         cancel_btn.pack(side=LEFT, padx=5)
+        
+        # Store initial structure state for change detection (after dialog is fully set up)
+        if dialog.editing_structure_index is not None:
+            dialog.initial_structure = self._get_structure_from_dialog(dialog)
         
         # Close on ESC
         dialog.bind('<Escape>', lambda e: dialog.destroy())
@@ -9878,6 +10187,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self._rebuild_level_fields_ui(dialog, slot_frame)
         self._update_all_level_options(dialog)
         self._update_preview(dialog)
+        
+        # Check for changes and update button states
+        self._check_structure_changes(dialog)
     
     def _on_separator_change(self, dialog, slot_frame, separator_index, separator_var=None):
         """Handle separator text entry change."""
@@ -9918,6 +10230,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         level_data["separators"] = separators
         self._update_preview(dialog)
+        
+        # Check for changes and update button states
+        self._check_structure_changes(dialog)
     
     def _validate_separator_input(self, dialog, slot_frame, separator_index, separator_var, separator_entry):
         """Validate separator input: max 5 chars, no invalid Windows filesystem characters."""
@@ -9976,6 +10291,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self._rebuild_level_fields_ui(dialog, slot_frame)
         self._update_all_level_options(dialog)
         self._update_preview(dialog)
+        
+        # Check for changes and update button states
+        self._check_structure_changes(dialog)
     
     def _remove_field_from_level(self, dialog, slot_frame, field_index):
         """Remove a field from a level."""
@@ -9995,6 +10313,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self._rebuild_level_fields_ui(dialog, slot_frame)
         self._update_all_level_options(dialog)
         self._update_preview(dialog)
+        
+        # Check for changes and update button states
+        self._check_structure_changes(dialog)
     
     def _update_preview(self, dialog):
         """Update the live preview of the folder structure."""
@@ -10058,7 +10379,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         field_values = {
             "Artist": example_metadata["artist"],
             "Album": example_metadata["album"],
-            "Year": example_metadata["release_date"] if example_metadata["release_date"] else "",
+            "Year": "Year",  # Show field name instead of example year
             "Genre": example_metadata["genre"] or "",
             "Label": example_metadata["publisher"] or "",
             "Album Artist": example_metadata["album_artist"] or "",
@@ -10125,6 +10446,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Create level with single field
         level_data = {"fields": [default_field], "separator": None}
         self._fill_level_slot(dialog, slot_frame, level_data)
+        
+        # Check for changes and update button states
+        self._check_structure_changes(dialog)
     
     def _clear_level_slot(self, dialog, slot_frame):
         """Clear a filled slot, making it empty again."""
@@ -10150,6 +10474,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self._update_all_level_options(dialog)
         # Update preview
         self._update_preview(dialog)
+        
+        # Check for changes and update button states
+        self._check_structure_changes(dialog)
     
     def _update_all_level_options(self, dialog):
         """Update all level field dropdowns to filter out selected options (strict duplicate prevention)."""
@@ -10290,6 +10617,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             dialog.update_idletasks()
             # Update preview after reordering
             self._update_preview(dialog)
+            
+            # Check for changes and update button states
+            self._check_structure_changes(dialog)
         
         # Reset highlights
         for slot in dialog.level_slots:
@@ -10304,8 +10634,108 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         dialog.drag_original_y = None
         dialog.drag_target_index = None
     
-    def _save_custom_structure_from_dialog(self, dialog):
-        """Save the custom structure from the dialog."""
+    def _create_new_structure_in_dialog(self, dialog):
+        """Close current dialog and open a fresh one for creating a new structure."""
+        # Close the current dialog
+        dialog.destroy()
+        
+        # Use after() to ensure the dialog is fully destroyed before opening a new one
+        # Open a fresh customize dialog in "new structure" mode (force_new=True)
+        self.root.after(100, lambda: self._show_customize_dialog(force_new=True))
+    
+    def _get_structure_from_dialog(self, dialog):
+        """Get the current structure from the dialog without saving.
+        
+        Args:
+            dialog: The customize dialog
+            
+        Returns:
+            List of level data dictionaries (normalized structure)
+        """
+        structure = []
+        
+        for slot_frame in dialog.level_slots:
+            if slot_frame.is_filled and hasattr(slot_frame, 'level_data'):
+                level_data = slot_frame.level_data.copy()
+                fields = level_data.get("fields", [])
+                
+                if not fields:
+                    continue
+                
+                # Read current separator values from UI widgets
+                # This ensures separator changes are captured even if _on_separator_change wasn't called
+                if hasattr(slot_frame, 'field_widgets') and slot_frame.field_widgets:
+                    separators = []
+                    num_fields = len(fields)
+                    
+                    # Read separators from widgets: prefix + between + suffix
+                    # separators[0] = prefix, separators[1..n-1] = between, separators[n] = suffix
+                    for i, field_widget_tuple in enumerate(slot_frame.field_widgets):
+                        field_combo, prefix_entry, separator_entry, suffix_entry, field_var, prefix_var, separator_var, suffix_var = field_widget_tuple
+                        
+                        # Prefix separator (first field only, index 0)
+                        if i == 0 and prefix_var is not None:
+                            prefix_sep = prefix_var.get()  # Don't strip - preserve spaces
+                            separators.append(prefix_sep if prefix_sep else None)
+                        
+                        # Between-field separator (after each field except last)
+                        # Field i's separator_var goes to separators[i+1]
+                        if i < num_fields - 1 and separator_var is not None:
+                            between_sep = separator_var.get()  # Don't strip - preserve spaces
+                            separators.append(between_sep if between_sep else None)
+                        
+                        # Suffix separator (last field only, index num_fields)
+                        if i == num_fields - 1 and suffix_var is not None:
+                            suffix_sep = suffix_var.get()  # Don't strip - preserve spaces
+                            separators.append(suffix_sep if suffix_sep else None)
+                    
+                    # Ensure separators list has correct length (fields + 1)
+                    while len(separators) < num_fields + 1:
+                        separators.append(None)
+                    separators = separators[:num_fields + 1]
+                    
+                    # Update level_data with current separator values
+                    level_data["separators"] = separators
+                
+                structure.append(level_data)
+        
+        # Normalize the structure for comparison
+        return self._normalize_structure(structure)
+    
+    def _check_structure_changes(self, dialog):
+        """Check if structure has changed and enable/disable save buttons accordingly."""
+        if not hasattr(dialog, 'editing_structure_index') or dialog.editing_structure_index is None:
+            return  # Not editing, no need to check
+        
+        if not hasattr(dialog, 'initial_structure'):
+            return  # No initial structure stored
+        
+        if not hasattr(dialog, 'update_btn') or not hasattr(dialog, 'save_as_new_btn'):
+            return  # Buttons not created yet
+        
+        # Get current structure
+        current_structure = self._get_structure_from_dialog(dialog)
+        initial_structure = dialog.initial_structure
+        
+        # Compare structures (normalized)
+        has_changes = current_structure != initial_structure
+        
+        # Enable/disable buttons based on changes
+        if has_changes:
+            dialog.update_btn.config(state='normal')
+            dialog.save_as_new_btn.config(state='normal')
+        else:
+            dialog.update_btn.config(state='disabled')
+            dialog.save_as_new_btn.config(state='disabled')
+    
+    def _save_custom_structure_from_dialog(self, dialog, update_existing=None):
+        """Save the custom structure from the dialog.
+        
+        Args:
+            dialog: The customize dialog
+            update_existing: If True, update the existing structure. If False, save as new.
+                            If None, determine automatically based on editing_structure_index.
+        """
         # Build structure list from filled slots (in order) - new format
         structure = []
         all_fields_used = set()
@@ -10328,6 +10758,41 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                         return
                     all_fields_used.add(field)
                 
+                # Read current separator values from UI widgets before saving
+                # This ensures separator changes are captured even if _on_separator_change wasn't called
+                if hasattr(slot_frame, 'field_widgets') and slot_frame.field_widgets:
+                    separators = []
+                    num_fields = len(fields)
+                    
+                    # Read separators from widgets: prefix + between + suffix
+                    # separators[0] = prefix, separators[1..n-1] = between, separators[n] = suffix
+                    for i, field_widget_tuple in enumerate(slot_frame.field_widgets):
+                        field_combo, prefix_entry, separator_entry, suffix_entry, field_var, prefix_var, separator_var, suffix_var = field_widget_tuple
+                        
+                        # Prefix separator (first field only, index 0)
+                        if i == 0 and prefix_var is not None:
+                            prefix_sep = prefix_var.get()  # Don't strip - preserve spaces
+                            separators.append(prefix_sep if prefix_sep else None)
+                        
+                        # Between-field separator (after each field except last)
+                        # Field i's separator_var goes to separators[i+1]
+                        if i < num_fields - 1 and separator_var is not None:
+                            between_sep = separator_var.get()  # Don't strip - preserve spaces
+                            separators.append(between_sep if between_sep else None)
+                        
+                        # Suffix separator (last field only, index num_fields)
+                        if i == num_fields - 1 and suffix_var is not None:
+                            suffix_sep = suffix_var.get()  # Don't strip - preserve spaces
+                            separators.append(suffix_sep if suffix_sep else None)
+                    
+                    # Ensure separators list has correct length (fields + 1)
+                    while len(separators) < num_fields + 1:
+                        separators.append(None)
+                    separators = separators[:num_fields + 1]
+                    
+                    # Update level_data with current separator values
+                    level_data["separators"] = separators
+                
                 structure.append(level_data)
         
         # Validate structure
@@ -10338,19 +10803,30 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Format for display
         formatted = self._format_custom_structure(structure)
         
-        # Check if this structure already exists (normalize existing structures for comparison)
-        structure_exists = False
-        normalized_structure = self._normalize_structure(structure)
-        for existing in self.custom_structures:
-            normalized_existing = self._normalize_structure(existing)
-            # Compare normalized structures
-            if normalized_structure == normalized_existing:
-                structure_exists = True
-                break
+        # Determine if we should update existing or save as new
+        editing_index = getattr(dialog, 'editing_structure_index', None)
         
-        # Add to custom structures if new
-        if not structure_exists:
-            self.custom_structures.append(structure)
+        # If update_existing is None, determine automatically based on editing_index
+        if update_existing is None:
+            update_existing = (editing_index is not None and 0 <= editing_index < len(self.custom_structures))
+        
+        if update_existing and editing_index is not None and 0 <= editing_index < len(self.custom_structures):
+            # We're updating an existing structure - replace it
+            self.custom_structures[editing_index] = structure
+        else:
+            # We're creating a new structure - check if it already exists to avoid duplicates
+            structure_exists = False
+            normalized_structure = self._normalize_structure(structure)
+            for existing in self.custom_structures:
+                normalized_existing = self._normalize_structure(existing)
+                # Compare normalized structures
+                if normalized_structure == normalized_existing:
+                    structure_exists = True
+                    break
+            
+            # Add to custom structures if new
+            if not structure_exists:
+                self.custom_structures.append(structure)
         
         # Save settings
         self._save_custom_structures()
@@ -10360,8 +10836,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         # Select this structure in dropdown
         self.folder_structure_var.set(formatted)
-        if hasattr(self, 'structure_combo'):
-            self.structure_combo.set(formatted)
+        # Menu button text is automatically updated via textvariable binding
         
         # Save the selection to persist it across sessions
         self._save_settings()
@@ -10379,7 +10854,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             return
         
         dialog = Toplevel(self.root)
-        dialog.title("Manage Custom Folder Structures")
+        dialog.title("Delete Custom Folder Structures")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -10396,7 +10871,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Title
         title_label = Label(
             dialog,
-            text="Manage Custom Folder Structures",
+            text="Delete Custom Folder Structures",
             font=("Segoe UI", 10, "bold"),
             bg='#1E1E1E',
             fg='#D4D4D4'
@@ -10464,8 +10939,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             if current_value == formatted:
                 default_display = self.FOLDER_STRUCTURES.get(self.DEFAULT_STRUCTURE, "Artist / Album")
                 self.folder_structure_var.set(default_display)
-                if hasattr(self, 'structure_combo'):
-                    self.structure_combo.set(default_display)
+                # Menu button text is automatically updated via textvariable binding
                 self.update_preview()
             
             # Rebuild dialog if structures remain, otherwise close
