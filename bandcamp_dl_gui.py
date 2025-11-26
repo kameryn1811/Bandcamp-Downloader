@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 import sys
 import subprocess
@@ -286,7 +286,7 @@ class BandcampDownloaderGUI:
         self.log_snapshot = None  # Store snapshot before clearing: (log_messages_copy, debug_mode_state, scroll_position)
         
         # Store metadata for preview
-        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
         self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
         self.url_check_timer = None  # For debouncing URL changes
         self.album_art_image = None  # Store reference to prevent garbage collection
@@ -799,10 +799,12 @@ class BandcampDownloaderGUI:
             return []
         
         normalized = []
+        import copy
         for item in structure:
             if isinstance(item, dict) and "fields" in item:
                 # Already in new format, but ensure separators list exists
-                normalized_item = item.copy()
+                # Use deep copy to prevent modifying original structure
+                normalized_item = copy.deepcopy(item)
                 if "separator" in normalized_item:
                     # Convert old single separator to separators list
                     sep = normalized_item.pop("separator")
@@ -969,21 +971,121 @@ class BandcampDownloaderGUI:
         menu.bind('<<MenuSelect>>', on_menu_post)
         menu.bind('<<MenuUnpost>>', on_menu_unpost)
         
+        # Periodic check function (defined after on_menu_post)
+        def periodic_check():
+            nonlocal menu_open
+            if menu_open:
+                # Flag says open - verify it's actually posted
+                try:
+                    menu.tk.call(menu, 'index', 'active')
+                    # Menu is posted - flag is correct, check again soon
+                    self.root.after(100, periodic_check)
+                except:
+                    # Menu is not posted - update flag
+                    menu_open = False
+        
+        # Start periodic checking when menu opens
+        original_on_menu_post = on_menu_post
+        def on_menu_post_with_check(event=None):
+            original_on_menu_post(event)
+            # Start periodic checking
+            self.root.after(100, periodic_check)
+        
+        menu.unbind('<<MenuSelect>>')
+        menu.bind('<<MenuSelect>>', on_menu_post_with_check)
+        
+        # Detect when menu closes due to outside click by monitoring root window focus/clicks
+        # Use a more aggressive approach: check immediately on any root interaction
+        def detect_menu_close(event=None):
+            nonlocal menu_open
+            if menu_open:
+                # Flag says menu is open - check immediately if it's actually still posted
+                # Don't delay - check right now
+                try:
+                    menu.tk.call(menu, 'index', 'active')
+                    # Menu is still posted - flag is correct, do nothing
+                except:
+                    # Menu is not posted - it closed, update flag immediately
+                    menu_open = False
+        
+        # Bind to root window events that indicate menu might have closed
+        # Focus-in on root: when root gets focus, menu might have closed
+        self.root.bind('<FocusIn>', detect_menu_close, add=True)
+        # Button-1 on root: when clicking outside, menu might have closed
+        def root_click_handler(event):
+            # Check immediately if click is not on the menubutton or menu itself
+            try:
+                widget = event.widget
+                # IMPORTANT: If click is on menubutton, DON'T check - the button click handler will handle it
+                # Only check for clicks outside the menubutton and menu
+                if widget != menubutton and not str(widget).startswith(str(menu)):
+                    detect_menu_close(event)
+            except:
+                pass
+        
+        self.root.bind('<Button-1>', root_click_handler, add=True)
+        
+        # Also periodically check when flag says open (backup detection)
+        def periodic_check():
+            nonlocal menu_open
+            if menu_open:
+                # Flag says open - verify it's actually posted
+                try:
+                    menu.tk.call(menu, 'index', 'active')
+                    # Menu is posted - flag is correct
+                except:
+                    # Menu is not posted - update flag
+                    menu_open = False
+            # Schedule next check (only if flag says open)
+            if menu_open:
+                self.root.after(100, periodic_check)
+        
+        # Start periodic checking when menu opens
+        original_on_menu_post = on_menu_post
+        def on_menu_post_with_check(event=None):
+            original_on_menu_post(event)
+            # Start periodic checking
+            self.root.after(100, periodic_check)
+        
+        menu.unbind('<<MenuSelect>>')
+        menu.bind('<<MenuSelect>>', on_menu_post_with_check)
+        
         # Check menu state on click - if open, close it; otherwise let default behavior open it
+        # Known limitation: Tkinter's Menubutton doesn't reliably notify when menu closes from outside click.
+        # This causes a 2-click requirement after closing menu by clicking outside (flag gets stale).
+        # This is a fundamental Tkinter limitation - the current implementation is the best we can achieve.
         def on_button_click(event=None):
             nonlocal menu_open, item_just_selected
             if item_just_selected:
                 # Menu was just closed via item selection - don't interfere, let default behavior open it
                 item_just_selected = False
                 return None  # Let default behavior handle it
-            elif menu_open:
-                # Menu is open - close it and prevent default opening behavior
+            
+            # Only close if we're CERTAIN menu is open (both flag and actual state must agree)
+            # This prevents false positives that block menu opening
+            flag_says_open = menu_open
+            actual_state_open = False
+            
+            # Quick check of actual state
+            try:
+                menu.tk.call(menu, 'index', 'active')
+                actual_state_open = True
+            except:
+                pass
+            
+            # Only close if BOTH say open - if either is uncertain, allow opening
+            if flag_says_open and actual_state_open:
+                # Both confirm menu is open - close it and prevent default posting
                 self.root.focus_set()
                 menu.unpost()
                 menu_open = False
-                return "break"
-            # Menu is closed - let default behavior open it
-            return None
+                return "break"  # Prevent default behavior (posting menu)
+            else:
+                # Not certain menu is open - always allow default behavior to open it
+                # Update flag if actual state says closed
+                if not actual_state_open:
+                    menu_open = False
+                return None  # Allow default behavior
         
         menubutton.bind('<Button-1>', on_button_click, add=True)
         
@@ -1818,20 +1920,92 @@ class BandcampDownloaderGUI:
         structure_menu.bind('<<MenuSelect>>', on_menu_post)
         structure_menu.bind('<<MenuUnpost>>', on_menu_unpost)
         
+        # Detect when menu closes due to outside click by monitoring root window focus/clicks
+        # Use a more aggressive approach: check immediately on any root interaction
+        def detect_menu_close(event=None):
+            if self.structure_menu_open:
+                # Flag says menu is open - check immediately if it's actually still posted
+                # Don't delay - check right now
+                try:
+                    structure_menu.tk.call(structure_menu, 'index', 'active')
+                    # Menu is still posted - flag is correct, do nothing
+                except:
+                    # Menu is not posted - it closed, update flag immediately
+                    self.structure_menu_open = False
+        
+        # Bind to root window events that indicate menu might have closed
+        # Focus-in on root: when root gets focus, menu might have closed
+        self.root.bind('<FocusIn>', detect_menu_close, add=True)
+        # Button-1 on root: when clicking outside, menu might have closed
+        def root_click_handler(event):
+            # Check immediately if click is not on the menubutton or menu itself
+            try:
+                widget = event.widget
+                # If click is on menubutton or menu, don't check (menu handles its own clicks)
+                if widget != structure_menubutton and not str(widget).startswith(str(structure_menu)):
+                    detect_menu_close(event)
+            except:
+                pass
+        
+        self.root.bind('<Button-1>', root_click_handler, add=True)
+        
+        # Also periodically check when flag says open (backup detection)
+        def periodic_check():
+            if self.structure_menu_open:
+                # Flag says open - verify it's actually posted
+                try:
+                    structure_menu.tk.call(structure_menu, 'index', 'active')
+                    # Menu is posted - flag is correct, check again soon
+                    self.root.after(100, periodic_check)
+                except:
+                    # Menu is not posted - update flag
+                    self.structure_menu_open = False
+        
+        # Start periodic checking when menu opens
+        original_on_menu_post = on_menu_post
+        def on_menu_post_with_check(event=None):
+            original_on_menu_post(event)
+            # Start periodic checking
+            self.root.after(100, periodic_check)
+        
+        structure_menu.unbind('<<MenuSelect>>')
+        structure_menu.bind('<<MenuSelect>>', on_menu_post_with_check)
+        
         # Check menu state on click - if open, close it; otherwise let default behavior open it
+        # Known limitation: Tkinter's Menubutton doesn't reliably notify when menu closes from outside click.
+        # This causes a 2-click requirement after closing menu by clicking outside (flag gets stale).
+        # This is a fundamental Tkinter limitation - the current implementation is the best we can achieve.
         def on_button_click(event=None):
             if self.structure_item_just_selected:
                 # Menu was just closed via item selection - don't interfere, let default behavior open it
                 self.structure_item_just_selected = False
                 return None  # Let default behavior handle it
-            elif self.structure_menu_open:
-                # Menu is open - close it and prevent default opening behavior
+            
+            # Only close if we're CERTAIN menu is open (both flag and actual state must agree)
+            # This prevents false positives that block menu opening
+            flag_says_open = self.structure_menu_open
+            actual_state_open = False
+            
+            # Quick check of actual state
+            try:
+                structure_menu.tk.call(structure_menu, 'index', 'active')
+                actual_state_open = True
+            except:
+                pass
+            
+            # Only close if BOTH say open - if either is uncertain, allow opening
+            if flag_says_open and actual_state_open:
+                # Both confirm menu is open - close it and prevent default posting
                 self.root.focus_set()
                 structure_menu.unpost()
                 self.structure_menu_open = False
-                return "break"
-            # Menu is closed - let default behavior open it
-            return None
+                return "break"  # Prevent default behavior (posting menu)
+            else:
+                # Not certain menu is open - always allow default behavior to open it
+                # Update flag if actual state says closed
+                if not actual_state_open:
+                    self.structure_menu_open = False
+                return None  # Allow default behavior
         
         structure_menubutton.bind('<Button-1>', on_button_click, add=True)
         
@@ -1968,7 +2142,7 @@ class BandcampDownloaderGUI:
         )
         preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=4)
         
-        # Preview path label (blue, left-aligned)
+        # Preview path label (blue, left-aligned, clickable link)
         self.preview_var = StringVar(value="Select a download path")
         preview_label_path = Label(
             preview_frame,
@@ -1978,10 +2152,74 @@ class BandcampDownloaderGUI:
             fg="#2dacd5",  # Blue text
             wraplength=400,  # Reduced to ensure proper wrapping
             justify='left',
-            anchor='w'  # Left-align the text
+            anchor='w',  # Left-align the text
+            cursor='hand2'  # Hand cursor to indicate clickability
         )
         preview_label_path.grid(row=0, column=1, sticky=W, padx=(0, 6), pady=4)
         preview_frame.columnconfigure(1, weight=1)
+        
+        # Make preview path clickable - opens folder in Explorer
+        def open_preview_path(event=None):
+            preview_path = self.preview_var.get()
+            if not preview_path or preview_path == "Select a download path":
+                return
+            
+            try:
+                # Check if the full preview path exists (file or directory)
+                if os.path.exists(preview_path):
+                    # Full path exists - open it
+                    if os.path.isfile(preview_path):
+                        # It's a file - open the parent directory and select the file
+                        parent_dir = os.path.dirname(preview_path)
+                        if parent_dir:
+                            # Try to open parent directory with file selected
+                            try:
+                                subprocess.run(['explorer', '/select,', preview_path], check=False)
+                            except:
+                                # Fallback to just opening the parent directory
+                                os.startfile(parent_dir)
+                    else:
+                        # It's a directory - open it directly
+                        os.startfile(preview_path)
+                else:
+                    # Full path doesn't exist - find the deepest existing directory in the path
+                    path_obj = Path(preview_path)
+                    
+                    # If it's a file path, start from the parent directory
+                    if path_obj.suffix:  # Has file extension, so it's a file
+                        path_obj = path_obj.parent
+                    
+                    # Walk up the path to find the deepest existing directory
+                    deepest_existing = None
+                    current_path = path_obj
+                    
+                    while current_path and current_path != current_path.parent:
+                        if current_path.exists() and current_path.is_dir():
+                            deepest_existing = current_path
+                            break
+                        current_path = current_path.parent
+                    
+                    if deepest_existing:
+                        # Found an existing directory - open it
+                        os.startfile(str(deepest_existing))
+                    else:
+                        # No existing directory found - open the base download path
+                        base_path = self.path_var.get().strip()
+                        if base_path and os.path.exists(base_path):
+                            os.startfile(base_path)
+                        elif base_path:
+                            # Base path doesn't exist either - try to create it and open
+                            try:
+                                os.makedirs(base_path, exist_ok=True)
+                                os.startfile(base_path)
+                            except Exception as e:
+                                messagebox.showinfo("Path Not Found", f"Cannot open path:\n{base_path}\n\nPath does not exist and could not be created.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not open path:\n{str(e)}")
+        
+        preview_label_path.bind('<Button-1>', open_preview_path)
+        preview_label_path.bind('<Enter>', lambda e: preview_label_path.config(fg='#4FC3F7'))  # Lighter blue on hover
+        preview_label_path.bind('<Leave>', lambda e: preview_label_path.config(fg='#2dacd5'))  # Original blue on leave
         
         # Format conversion warning (shown below preview when FLAC, OGG, or WAV is selected)
         self.format_conversion_warning_label = Label(
@@ -2449,7 +2687,7 @@ class BandcampDownloaderGUI:
         
         # If content is empty, immediately clear preview and artwork (don't wait for debounce)
         if not content:
-            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.format_suggestion_shown = False
             self.current_thumbnail_url = None
             self.album_art_fetching = False
@@ -2957,7 +3195,7 @@ class BandcampDownloaderGUI:
                     self.url_var.set("")
                     self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
                     # Immediately clear preview and artwork
-                    self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                    self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self.current_thumbnail_url = None
                     self.album_art_fetching = False
                     self.update_preview()
@@ -2983,7 +3221,7 @@ class BandcampDownloaderGUI:
             self.url_var.set("")
             self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
             # Immediately clear preview and artwork
-            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.current_thumbnail_url = None
             self.album_art_fetching = False
             self.update_preview()
@@ -3031,7 +3269,7 @@ class BandcampDownloaderGUI:
                     self.url_var.set("")
                     self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.")
                     # Immediately clear preview and artwork
-                    self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                    self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self.current_thumbnail_url = None
                     self.album_art_fetching = False
                     self.update_preview()
@@ -3081,7 +3319,7 @@ class BandcampDownloaderGUI:
             if not previous_content or not previous_content.strip():
                 self._update_text_placeholder_visibility()
                 # Immediately clear preview and artwork
-                self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                 self.current_thumbnail_url = None
                 self.album_art_fetching = False
                 self.update_preview()
@@ -3107,7 +3345,7 @@ class BandcampDownloaderGUI:
             self.url_text_widget.delete(1.0, END)
             self._update_text_placeholder_visibility()
             # Immediately clear preview and artwork
-            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.current_thumbnail_url = None
             self.album_art_fetching = False
             self.update_preview()
@@ -3149,7 +3387,7 @@ class BandcampDownloaderGUI:
             if not next_content or not next_content.strip():
                 self._update_text_placeholder_visibility()
                 # Immediately clear preview and artwork
-                self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+                self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                 self.current_thumbnail_url = None
                 self.album_art_fetching = False
                 self.update_preview()
@@ -3847,7 +4085,7 @@ class BandcampDownloaderGUI:
             # Cancel any in-flight artwork fetches
             self.artwork_fetch_id += 1
             self.current_url_being_processed = None
-            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.format_suggestion_shown = False  # Reset format suggestion flag
             self.current_thumbnail_url = None
             self.album_art_fetching = False
@@ -3896,20 +4134,54 @@ class BandcampDownloaderGUI:
                 
                 artist = None
                 album = None
+                year = None
                 
-                # Extract artist - look for various patterns
+                # Extract artist - look for various patterns (ordered by reliability)
                 artist_patterns = [
-                    r'<span[^>]*class=["\'][^"]*artist[^"]*["\'][^>]*>([^<]+)',
-                    r'<a[^>]*class=["\'][^"]*artist[^"]*["\'][^>]*>([^<]+)',
-                    r'by\s+<a[^>]*>([^<]+)</a>',
-                    r'property=["\']music:musician["\'][^>]*content=["\']([^"\']+)',
+                    # Open Graph meta tags (most reliable)
                     r'<meta[^>]*property=["\']og:music:musician["\'][^>]*content=["\']([^"\']+)',
+                    r'property=["\']music:musician["\'][^>]*content=["\']([^"\']+)',
+                    # Extract from title tag (format: "Album by Artist" or "Album | Artist")
+                    r'<title>([^<]+)</title>',
+                    # "by Artist" patterns with various HTML structures
+                    r'by\s+<a[^>]*>([^<]+)</a>',
+                    r'by\s+<span[^>]*>([^<]+)</span>',
+                    r'by\s+([A-Z][a-zA-Z\s]+?)(?:\s*</|</a>|</span>|</h)',
+                    # More flexible "by" pattern - matches "by Artist" with any HTML structure
+                    r'>\s*by\s+([A-Z][a-zA-Z\s]{2,}?)(?:\s*<|</)',
+                    # Pattern for heading structures like "### by Sam Webster"
+                    r'<h[123][^>]*>\s*by\s+([A-Z][a-zA-Z\s]+?)(?:\s*</h)',
+                    # Artist class elements
+                    r'<a[^>]*class=["\'][^"]*artist[^"]*["\'][^>]*>([^<]+)</a>',
+                    r'<span[^>]*class=["\'][^"]*artist[^"]*["\'][^>]*>([^<]+)',
+                    # Heading patterns (h2, h3 with "by")
+                    r'<h[23][^>]*>.*?by\s+([A-Z][a-zA-Z\s]+?)(?:</|</h)',
                 ]
                 
                 for pattern in artist_patterns:
-                    match = re.search(pattern, html, re.IGNORECASE)
+                    match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
                     if match:
                         artist = match.group(1).strip()
+                        # If extracted from title, clean it up
+                        if pattern.startswith(r'<title>'):
+                            # Title format examples:
+                            # "Super Flappy Golf (Game Soundtrack) by Sam Webster"
+                            # "Album Name | Artist Name"
+                            # "Album Name - Artist Name on Bandcamp"
+                            # Extract artist part after "by", "|", or "-"
+                            title_text = artist
+                            # Try to extract artist from "by Artist" pattern
+                            by_match = re.search(r'\s+by\s+([^-|]+?)(?:\s*[-|]|\s+on\s+Bandcamp|$)', title_text, re.IGNORECASE)
+                            if by_match:
+                                artist = by_match.group(1).strip()
+                            else:
+                                # Try "| Artist" or "- Artist" pattern
+                                pipe_match = re.search(r'[-|]\s*([^-|]+?)(?:\s*on\s+Bandcamp|$)', title_text, re.IGNORECASE)
+                                if pipe_match:
+                                    artist = pipe_match.group(1).strip()
+                                else:
+                                    # If no pattern matches, don't use title extraction for artist
+                                    artist = None
                         if artist:
                             break
                 
@@ -3931,14 +4203,55 @@ class BandcampDownloaderGUI:
                         if album:
                             break
                 
-                # Try extracting artist from URL if not found
+                # Extract year/release date - look for various patterns
+                year_patterns = [
+                    r'released\s+[A-Za-z]+\s+\d+,\s+(\d{4})',  # "released June 5, 2025"
+                    r'release[^<]*(\d{4})',  # "release ... 2025"
+                    r'<meta[^>]*property=["\']music:release_date["\'][^>]*content=["\']([^"\']+)',  # Open Graph release date
+                    r'<meta[^>]*property=["\']og:music:release_date["\'][^>]*content=["\']([^"\']+)',  # Open Graph release date
+                    r'<time[^>]*datetime=["\']([^"\']+)["\']',  # HTML5 time element
+                ]
+                
+                for pattern in year_patterns:
+                    match = re.search(pattern, html, re.IGNORECASE)
+                    if match:
+                        date_str = match.group(1).strip()
+                        # Extract year from date string (could be YYYY-MM-DD, YYYYMMDD, or just YYYY)
+                        year_match = re.search(r'(\d{4})', date_str)
+                        if year_match:
+                            year = year_match.group(1)
+                            break
+                
+                # Try extracting artist from URL if not found (last resort)
                 if not artist and "bandcamp.com" in url.lower():
                     try:
                         parsed = urlparse(url)
                         hostname = parsed.hostname or ""
                         if ".bandcamp.com" in hostname:
                             subdomain = hostname.replace(".bandcamp.com", "")
-                            artist = " ".join(word.capitalize() for word in subdomain.split("-"))
+                            
+                            # First try splitting by hyphens (most common)
+                            if "-" in subdomain:
+                                artist = " ".join(word.capitalize() for word in subdomain.split("-"))
+                            else:
+                                # Handle camelCase or all-lowercase subdomains
+                                import re
+                                # Method 1: Split on capital letters (camelCase like "SamWebster")
+                                words = re.findall(r'[a-z]+|[A-Z][a-z]*', subdomain)
+                                if len(words) > 1:
+                                    artist = " ".join(word.capitalize() for word in words)
+                                else:
+                                    # Method 2: Try to detect word boundaries in all-lowercase strings
+                                    # This is heuristic - look for common word patterns
+                                    # For subdomains like "samwebster", try to split on common boundaries
+                                    # Common patterns: consonant-vowel transitions that might indicate word breaks
+                                    # This is imperfect but better than nothing
+                                    subdomain_lower = subdomain.lower()
+                                    # Try common word separators that might be missing
+                                    # For "samwebster", we can't reliably split without context
+                                    # So we'll just capitalize it as-is (better than nothing)
+                                    # Note: This is a fallback - HTML extraction should catch it first
+                                    artist = subdomain.capitalize()
                     except:
                         pass
                 
@@ -3948,7 +4261,8 @@ class BandcampDownloaderGUI:
                         "artist": artist or "Artist",
                         "album": album or "Album",
                         "title": "Track",
-                        "thumbnail_url": None
+                        "thumbnail_url": None,
+                        "year": year  # Store year if found
                     }
                     self.root.after(0, self.update_preview)
                     
@@ -3987,29 +4301,62 @@ class BandcampDownloaderGUI:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     
-                    # Extract artist and album info
+                    # Extract artist, album, and year info
                     artist = None
                     album = None
+                    year = None
+                    artist_from_metadata = None  # Track if artist came from metadata (not URL fallback)
                     
                     if info:
-                        artist = (info.get("artist") or 
-                                 info.get("uploader") or 
-                                 info.get("channel") or
-                                 info.get("creator"))
+                        # Track whether artist came from actual metadata (not URL fallback)
+                        artist_from_metadata = (info.get("artist") or 
+                                               info.get("uploader") or 
+                                               info.get("channel") or
+                                               info.get("creator"))
+                        artist = artist_from_metadata
                         
-                        # Try extracting from URL if not found
+                        # Try extracting from URL if not found (last resort)
+                        # But mark it as URL fallback so we don't overwrite HTML extraction results
+                        artist_from_url = None
                         if not artist and "bandcamp.com" in url.lower():
                             try:
                                 from urllib.parse import urlparse
+                                import re
                                 parsed = urlparse(url)
                                 hostname = parsed.hostname or ""
                                 if ".bandcamp.com" in hostname:
                                     subdomain = hostname.replace(".bandcamp.com", "")
-                                    artist = " ".join(word.capitalize() for word in subdomain.split("-"))
+                                    
+                                    # First try splitting by hyphens (most common)
+                                    if "-" in subdomain:
+                                        artist_from_url = " ".join(word.capitalize() for word in subdomain.split("-"))
+                                    else:
+                                        # Handle camelCase (e.g., "samwebster" -> "Sam Webster")
+                                        # Split on capital letters: "samwebster" -> ["sam", "webster"]
+                                        words = re.findall(r'[a-z]+|[A-Z][a-z]*', subdomain)
+                                        if len(words) > 1:
+                                            artist_from_url = " ".join(word.capitalize() for word in words)
+                                        else:
+                                            # Just capitalize the whole thing as fallback
+                                            artist_from_url = subdomain.capitalize()
                             except:
                                 pass
                         
+                        # Only use URL fallback if we don't have metadata artist
+                        if not artist:
+                            artist = artist_from_url
+                        
                         album = info.get("album") or info.get("title")
+                        
+                        # Extract year from release_date or upload_date
+                        date = info.get("release_date") or info.get("upload_date")
+                        if date:
+                            # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
+                            try:
+                                if len(date) >= 4:
+                                    year = date[:4]  # First 4 characters are the year
+                            except:
+                                pass
                     
                     # Get thumbnail URL for album art (second phase - won't slow down preview)
                     # Prefer larger thumbnails for better quality (now that loading is fast)
@@ -4066,13 +4413,42 @@ class BandcampDownloaderGUI:
                                            info.get("artwork_url") or
                                            info.get("cover"))
                     
-                    # Update album info (keep "Track" as placeholder) - only if we got new data
+                    # Update album info (keep "Track" as placeholder) - preserve HTML extraction results
+                    # Only update artist/album if:
+                    # 1. We got it from yt-dlp metadata (not URL fallback), OR
+                    # 2. HTML extraction didn't find one (still has placeholder)
                     if artist or album:
+                        # Check if HTML extraction already found a good artist (not placeholder)
+                        existing_artist = self.album_info.get("artist")
+                        has_good_artist = existing_artist and existing_artist != "Artist"
+                        
+                        # Only use yt-dlp artist if:
+                        # - We got it from metadata (not URL fallback), OR
+                        # - HTML extraction didn't find one
+                        final_artist = artist
+                        if has_good_artist:
+                            # HTML extraction found artist - only overwrite if yt-dlp got it from metadata
+                            if artist_from_metadata:
+                                # yt-dlp found it in metadata - use it (might be more accurate)
+                                final_artist = artist
+                            else:
+                                # yt-dlp only found it from URL - keep HTML extraction result
+                                final_artist = existing_artist
+                        else:
+                            # HTML extraction didn't find one - use yt-dlp result (even if from URL)
+                            final_artist = artist or existing_artist or "Artist"
+                        
+                        # Similar logic for album
+                        existing_album = self.album_info.get("album")
+                        has_good_album = existing_album and existing_album != "Album"
+                        final_album = album if (album and not has_good_album) else (existing_album or album or "Album")
+                        
                         self.album_info = {
-                            "artist": artist or self.album_info.get("artist") or "Artist",
-                            "album": album or self.album_info.get("album") or "Album",
+                            "artist": final_artist,
+                            "album": final_album,
                             "title": "Track",
-                            "thumbnail_url": thumbnail_url or self.album_info.get("thumbnail_url")
+                            "thumbnail_url": thumbnail_url or self.album_info.get("thumbnail_url"),
+                            "year": year or self.album_info.get("year")  # Store year if found
                         }
                         self.root.after(0, self.update_preview)
                     
@@ -4811,15 +5187,54 @@ class BandcampDownloaderGUI:
             # Build path from custom structure
             path_parts = [base_path]
             
-            # Example metadata values
+            # Get metadata values - use real data when available, placeholders otherwise
+            # Extract Year - check album_info first (from URL paste), then album_info_stored (from download)
+            year_value = "Year"
+            
+            # First check album_info (populated when URL is pasted)
+            year_from_info = self.album_info.get("year")
+            if year_from_info:
+                year_value = year_from_info
+            # Fall back to album_info_stored (from download extraction)
+            elif hasattr(self, 'album_info_stored') and self.album_info_stored:
+                date = self.album_info_stored.get("date")
+                if date:
+                    # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
+                    try:
+                        if len(date) >= 4:
+                            year_value = date[:4]  # First 4 characters are the year
+                    except:
+                        pass
+            
+            # Get other metadata fields if available
+            genre_value = "Genre"
+            label_value = "Label"
+            album_artist_value = "Album Artist"
+            catalog_number_value = "CAT001"
+            
+            # Check if we have stored metadata with these fields
+            if hasattr(self, 'album_info_stored') and self.album_info_stored:
+                # These fields might be in album_info_stored if extracted from yt-dlp
+                genre_value = self.album_info_stored.get("genre") or genre_value
+                label_value = self.album_info_stored.get("label") or self.album_info_stored.get("publisher") or label_value
+                album_artist_value = self.album_info_stored.get("album_artist") or self.album_info_stored.get("albumartist") or album_artist_value
+                catalog_number_value = self.album_info_stored.get("catalog_number") or self.album_info_stored.get("catalognumber") or catalog_number_value
+            
+            # Also check album_info for any metadata that might be there
+            genre_value = self.album_info.get("genre") or genre_value
+            label_value = self.album_info.get("label") or self.album_info.get("publisher") or label_value
+            album_artist_value = self.album_info.get("album_artist") or self.album_info.get("albumartist") or album_artist_value
+            catalog_number_value = self.album_info.get("catalog_number") or self.album_info.get("catalognumber") or catalog_number_value
+            
+            # Sanitize all values for filename use
             field_values = {
                 "Artist": artist,
                 "Album": album,
-                "Year": "Year",
-                "Genre": "Genre",
-                "Label": "Label",
-                "Album Artist": "Album Artist",
-                "Catalog Number": "CAT001"
+                "Year": self.sanitize_filename(str(year_value)) if year_value != "Year" else year_value,
+                "Genre": self.sanitize_filename(str(genre_value)) if genre_value != "Genre" else genre_value,
+                "Label": self.sanitize_filename(str(label_value)) if label_value != "Label" else label_value,
+                "Album Artist": self.sanitize_filename(str(album_artist_value)) if album_artist_value != "Album Artist" else album_artist_value,
+                "Catalog Number": self.sanitize_filename(str(catalog_number_value)) if catalog_number_value != "CAT001" else catalog_number_value
             }
             
             for level in normalized:
@@ -7764,11 +8179,15 @@ class BandcampDownloaderGUI:
                 with yt_dlp.YoutubeDL(extract_opts) as extract_ydl:
                     info = extract_ydl.extract_info(album_url, download=False)
                     if info:
-                        # Store album-level info
+                        # Store album-level info (including all metadata fields for preview)
                         self.album_info_stored = {
                             "artist": info.get("artist") or info.get("uploader") or info.get("creator"),
                             "album": info.get("album") or info.get("title"),
                             "date": info.get("release_date") or info.get("upload_date"),
+                            "genre": info.get("genre"),
+                            "label": info.get("label") or info.get("publisher"),
+                            "album_artist": info.get("album_artist") or info.get("albumartist"),
+                            "catalog_number": info.get("catalog_number") or info.get("catalognumber"),
                         }
                         
                         # Store metadata for each track and update total tracks if not already set
@@ -8199,15 +8618,28 @@ class BandcampDownloaderGUI:
                                                  first_entry.get("creator") or 
                                                  None)
                                 
-                                # If still not found, try extracting from URL subdomain
+                                # If still not found, try extracting from URL subdomain (last resort)
                                 if not artist_name and "bandcamp.com" in url.lower():
                                     try:
                                         from urllib.parse import urlparse
+                                        import re
                                         parsed = urlparse(url)
                                         hostname = parsed.hostname or ""
                                         if ".bandcamp.com" in hostname:
                                             subdomain = hostname.replace(".bandcamp.com", "")
-                                            artist_name = " ".join(word.capitalize() for word in subdomain.split("-"))
+                                            
+                                            # First try splitting by hyphens (most common)
+                                            if "-" in subdomain:
+                                                artist_name = " ".join(word.capitalize() for word in subdomain.split("-"))
+                                            else:
+                                                # Handle camelCase (e.g., "samwebster" -> "Sam Webster")
+                                                # Split on capital letters: "samwebster" -> ["sam", "webster"]
+                                                words = re.findall(r'[a-z]+|[A-Z][a-z]*', subdomain)
+                                                if len(words) > 1:
+                                                    artist_name = " ".join(word.capitalize() for word in words)
+                                                else:
+                                                    # Just capitalize the whole thing as fallback
+                                                    artist_name = subdomain.capitalize()
                                     except Exception:
                                         pass
                                 
@@ -9811,18 +10243,54 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         current_value = self.folder_structure_var.get()
         initial_structure = None
         if not force_new and hasattr(self, 'custom_structures') and self.custom_structures:
+            # Check if current selection is a custom structure (not a standard structure)
             if current_value not in self.FOLDER_STRUCTURES.values():
-                # This is a custom structure, find it
-                for idx, structure in enumerate(self.custom_structures):
-                    if self._format_custom_structure(structure) == current_value:
-                        # Normalize to ensure new format
-                        initial_structure = self._normalize_structure(structure)
-                        dialog.editing_structure_index = idx  # Store the index of the structure being edited
-                        break
+                # This is a custom structure, find it using multiple strategies for robustness
+                found_match = False
+                
+                # Strategy 1: Try to get structure object directly from _extract_structure_choice
+                # and find it by reference (fastest and most reliable)
+                structure_choice = self._extract_structure_choice(current_value)
+                if isinstance(structure_choice, list):
+                    # Check if it's the same object reference as one in custom_structures
+                    for idx, structure in enumerate(self.custom_structures):
+                        if structure is structure_choice:  # Identity comparison (same object)
+                            initial_structure = self._normalize_structure(structure)
+                            dialog.editing_structure_index = idx
+                            found_match = True
+                            break
+                
+                # Strategy 2: Match by formatted string (what user sees in dropdown)
+                if not found_match:
+                    for idx, structure in enumerate(self.custom_structures):
+                        formatted = self._format_custom_structure(structure)
+                        if formatted == current_value:
+                            initial_structure = self._normalize_structure(structure)
+                            dialog.editing_structure_index = idx
+                            found_match = True
+                            break
+                
+                # Strategy 3: Match by normalized structure content (deep comparison)
+                # This handles edge cases where formatting or references differ
+                if not found_match and isinstance(structure_choice, list):
+                    normalized_choice = self._normalize_structure(structure_choice)
+                    for idx, structure in enumerate(self.custom_structures):
+                        normalized_structure = self._normalize_structure(structure)
+                        # Compare normalized structures (deep comparison)
+                        if normalized_choice == normalized_structure:
+                            initial_structure = normalized_structure
+                            dialog.editing_structure_index = idx
+                            break
         
         # Always create 4 fixed slots
+        # IMPORTANT: Create deep copies of structure items to prevent modifying originals in custom_structures
+        import copy
         for i in range(4):
-            slot_value = initial_structure[i] if initial_structure and i < len(initial_structure) else None
+            if initial_structure and i < len(initial_structure):
+                # Deep copy to prevent modifications from affecting the original structure
+                slot_value = copy.deepcopy(initial_structure[i])
+            else:
+                slot_value = None
             self._create_level_slot(dialog, levels_frame, i, slot_value)
         
         # Update preview after slots are created
@@ -10657,10 +11125,26 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         for slot_frame in dialog.level_slots:
             if slot_frame.is_filled and hasattr(slot_frame, 'level_data'):
                 level_data = slot_frame.level_data.copy()
-                fields = level_data.get("fields", [])
+                
+                # Read current field values from UI widgets (not from level_data)
+                # This ensures field changes are captured even if level_data wasn't updated
+                fields = []
+                if hasattr(slot_frame, 'field_widgets') and slot_frame.field_widgets:
+                    for field_widget_tuple in slot_frame.field_widgets:
+                        field_combo, prefix_entry, separator_entry, suffix_entry, field_var, prefix_var, separator_var, suffix_var = field_widget_tuple
+                        if field_var is not None:
+                            field_value = field_var.get()
+                            if field_value:
+                                fields.append(field_value)
+                else:
+                    # Fallback to level_data if widgets don't exist
+                    fields = level_data.get("fields", [])
                 
                 if not fields:
                     continue
+                
+                # Update level_data with current field values
+                level_data["fields"] = fields
                 
                 # Read current separator values from UI widgets
                 # This ensures separator changes are captured even if _on_separator_change wasn't called
