@@ -1,6 +1,6 @@
 <div align="center">
 
-# <img src="images/icon-title.png" width="32" height="32" alt="Icon"> Bandcamp Downloader GUI
+# <img src="images/icon-title.png" width="32" height="32" alt="Icon"> Bandcamp Downloader (Python Edition)
 
 [![Download](images/download-button.png)](https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.0)
 
@@ -14,7 +14,7 @@ This was created as an interim solution for users experiencing issues with [Otie
 
 ## What It Does
 
-Bandcamp Downloader GUI provides a simple way to download the freely available 128 kbps MP3 streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
+Bandcamp Downloader (Python Edition) provides a simple way to download the freely available 128 kbps MP3 streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
 
 <img width="650" alt="screenshot-main-v1 1 8" src="images/screenshot-main-v1.1.8.png" />
 
