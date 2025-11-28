@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 import sys
 import subprocess
@@ -40,7 +40,7 @@ import json
 from pathlib import Path
 from tkinter import (
     Tk, Toplevel, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, LEFT, RIGHT, X, Y, END, WORD, BOTH,
-    Frame, Label, Canvas, Checkbutton, Menu, Entry, Button
+    Frame, Label, Canvas, Checkbutton, Menu, Entry, Button, Listbox, EXTENDED, INSERT, Text
 )
 
 # yt-dlp will be imported after checking if it's installed
@@ -142,15 +142,35 @@ class BandcampDownloaderGUI:
     }
     THUMBNAIL_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp']
     FOLDER_STRUCTURES = {
-        "1": "Root directory",
+        "1": "Root Directory",
         "2": "Album",
         "3": "Artist",
         "4": "Artist / Album",
         "5": "Album / Artist",
     }
+    # Folder structure templates (template-based format)
+    FOLDER_STRUCTURE_TEMPLATES = {
+        "1": {"template": ""},  # Root Directory (empty template)
+        "2": {"template": "Album"},
+        "3": {"template": "Artist"},
+        "4": {"template": "Artist / Album"},
+        "5": {"template": "Album / Artist"},
+    }
     DEFAULT_STRUCTURE = "4"
     DEFAULT_FORMAT = "Original"
-    DEFAULT_NUMBERING = "None"
+    DEFAULT_NUMBERING = "Track"
+    
+    # Filename format constants (template-based, no curly brackets needed)
+    FILENAME_FORMATS = {
+        "Track": {"template": "Track"},
+        "01. Track": {"template": "01. Track"},
+        "Artist - Track": {"template": "Artist - Track"},
+        "01. Artist - Track": {"template": "01. Artist - Track"},
+    }
+    # Valid tag names (without curly brackets)
+    FILENAME_TAG_NAMES = ["01", "1", "Track", "Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
+    # Folder structure tag names (no Track/01/1, and "/" is treated as level separator)
+    FOLDER_TAG_NAMES = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
     
     def _extract_format(self, format_val):
         """Extract base format from display value (e.g., 'mp3 (128kbps)' -> 'mp3')."""
@@ -255,6 +275,11 @@ class BandcampDownloaderGUI:
             # It's a custom structure (formatted string)
             # Try to find it in custom_structures (will be loaded later, but check if it exists)
             display_value = saved_structure  # Use the formatted string directly
+        # Load custom structures and filename formats before loading numbering (needed for validation)
+        self.custom_structures = self._load_custom_structures()  # List of structure lists (old format)
+        self.custom_structure_templates = self._load_custom_structure_templates()  # List of template dicts (new format)
+        self.custom_filename_formats = self._load_custom_filename_formats()  # List of format dicts
+        
         self.folder_structure_var = StringVar(value=display_value)
         self.format_var = StringVar(value=self.load_saved_format())
         self.numbering_var = StringVar(value=self.load_saved_numbering())
@@ -269,9 +294,6 @@ class BandcampDownloaderGUI:
         self.url_entry_widget = None  # Store reference to Entry widget
         self.url_text_widget = None  # Store reference to ScrolledText widget
         self.url_container_frame = None  # Container frame for URL widgets
-        
-        # Custom folder structures
-        self.custom_structures = self._load_custom_structures()  # List of lists: [["Artist", "Year", "Album"], ...]
         
         # Content history for undo/redo functionality (tracks content state, not just pastes)
         self.content_history = []  # List of content states (full field content at each change)
@@ -404,11 +426,11 @@ class BandcampDownloaderGUI:
         style.configure('TFrame', background=bg_color)
         style.configure('TEntry', fieldbackground=entry_bg, foreground=entry_fg, 
                        borderwidth=1, bordercolor=border_color, relief='flat',
-                       insertcolor=fg_color)
+                       insertcolor=fg_color, lightcolor=border_color, darkcolor=border_color)
         style.map('TEntry', 
                   bordercolor=[('focus', accent_color)],
-                  lightcolor=[('focus', accent_color)],
-                  darkcolor=[('focus', accent_color)])
+                  lightcolor=[('focus', border_color), ('!focus', border_color)],
+                  darkcolor=[('focus', border_color), ('!focus', border_color)])
         style.configure('TButton', background=select_bg, foreground=fg_color,
                        borderwidth=1, bordercolor=border_color, relief='flat',
                        padding=(10, 5))
@@ -449,7 +471,7 @@ class BandcampDownloaderGUI:
                  background=[('active', select_bg), ('!active', select_bg)])  # Button area always dark
         # Progress bar uses Bandcamp blue for a friendly, success-oriented feel
         style.configure('TProgressbar', background=success_color, troughcolor=bg_color,
-                        borderwidth=0, lightcolor=success_color, darkcolor=success_color)
+                        borderwidth=2, bordercolor=border_color, lightcolor=success_color, darkcolor=success_color)
         
         # Menubutton style (shared by all menubuttons - structure, format, numbering)
         style.configure('Dark.TMenubutton',
@@ -708,11 +730,25 @@ class BandcampDownloaderGUI:
                 folder_structure = self._format_custom_structure(structure_choice)
             else:
                 folder_structure = structure_choice
+            # Handle template-based structures in save
+            structure_choice = self._extract_structure_choice(self.folder_structure_var.get()) or self.DEFAULT_STRUCTURE
+            if isinstance(structure_choice, dict) and "template" in structure_choice:
+                # Template-based structure
+                folder_structure = self._format_custom_structure_template(structure_choice)
+            elif isinstance(structure_choice, list):
+                # Old format structure
+                folder_structure = self._format_custom_structure(structure_choice)
+            else:
+                # Standard structure
+                folder_structure = structure_choice
+            
             settings = {
                 "folder_structure": folder_structure,
                 "download_path": self.path_var.get(),
                 "audio_format": self.format_var.get(),
                 "track_numbering": self.numbering_var.get(),
+                "custom_filename_formats": self.custom_filename_formats if hasattr(self, 'custom_filename_formats') else [],
+                "custom_structure_templates": self.custom_structure_templates if hasattr(self, 'custom_structure_templates') else [],
                 "skip_postprocessing": self.skip_postprocessing_var.get(),
                 "create_playlist": self.create_playlist_var.get(),
                 "download_cover_art": self.download_cover_art_var.get(),
@@ -720,7 +756,8 @@ class BandcampDownloaderGUI:
                 "album_art_visible": self.album_art_visible,
                 "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False,
                 "auto_check_updates": self.auto_check_updates_var.get() if hasattr(self, 'auto_check_updates_var') else True,
-                "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else [])
+                "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else []),
+                "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else [])
             }
         
         settings_file = self._get_settings_file()
@@ -758,6 +795,7 @@ class BandcampDownloaderGUI:
     def _load_custom_structures(self):
         """Load saved custom folder structures from settings.
         Normalizes old format (list of strings) to new format (list of dicts).
+        Also loads template-based structures if they exist.
         """
         settings = self._load_settings()
         custom_structures = settings.get("custom_structures", [])
@@ -785,9 +823,154 @@ class BandcampDownloaderGUI:
             return valid_structures
         return []
     
+    def _load_custom_structure_templates(self):
+        """Load saved custom folder structure templates from settings.
+        New template-based format.
+        """
+        settings = self._load_settings()
+        custom_templates = settings.get("custom_structure_templates", [])
+        if isinstance(custom_templates, list):
+            valid_templates = []
+            for template_data in custom_templates:
+                if isinstance(template_data, dict) and "template" in template_data:
+                    template = template_data.get("template", "").strip()
+                    if template:
+                        valid_templates.append(template_data)
+            return valid_templates
+        return []
+    
     def _save_custom_structures(self):
         """Save custom folder structures to settings."""
         self._save_settings()
+    
+    # ============================================================================
+    # FILENAME FORMAT CUSTOMIZATION (NEW - SEPARATE SYSTEM)
+    # ============================================================================
+    def _load_custom_filename_formats(self):
+        """Load saved custom filename formats from settings.
+        Migrates old format (fields/separators) to new format (template strings).
+        """
+        settings = self._load_settings()
+        custom_formats = settings.get("custom_filename_formats", [])
+        # Validate: ensure it's a list
+        if isinstance(custom_formats, list):
+            # Filter out invalid entries and migrate to template format
+            valid_formats = []
+            for format_data in custom_formats:
+                if isinstance(format_data, dict):
+                    # Check if it's new template format
+                    if "template" in format_data:
+                        # Already in template format
+                        template = format_data.get("template", "")
+                        if template:
+                            # Remove curly brackets if present (migrate old format)
+                            import re
+                            # Replace {tag} with tag
+                            template = re.sub(r'\{([^}]+)\}', r'\1', template)
+                            valid_formats.append({"template": template})
+                    # Check if it's old format (fields/separators) - migrate it
+                    elif "fields" in format_data:
+                        # Migrate old format to template
+                        template = self._migrate_format_to_template(format_data)
+                        if template:
+                            valid_formats.append({"template": template})
+            return valid_formats
+        return []
+    
+    def _save_custom_filename_formats(self):
+        """Save custom filename formats to settings."""
+        self._save_settings()
+    
+    def _migrate_format_to_template(self, format_data):
+        """Migrate old format (fields/separators) to template string.
+        
+        Args:
+            format_data: Dict with "fields" and "separators"
+            
+        Returns:
+            Template string like "{01}. {Track}" or None if invalid
+        """
+        if not format_data or not isinstance(format_data, dict):
+            return None
+        
+        fields = format_data.get("fields", [])
+        separators = format_data.get("separators", [])
+        
+        if not fields:
+            return None
+        
+        # Build template string (no curly brackets)
+        result_parts = []
+        
+        # Add prefix separator (before first field)
+        prefix_sep = separators[0] if separators and len(separators) > 0 else ""
+        if prefix_sep and prefix_sep != "None":
+            result_parts.append(prefix_sep)
+        
+        # Add fields with between separators
+        for i, field in enumerate(fields):
+            # Use field name directly (no curly brackets)
+            result_parts.append(field)
+            
+            # Add between separator (after each field except last)
+            if i < len(fields) - 1:
+                between_idx = i + 1
+                between_sep = separators[between_idx] if between_idx < len(separators) else " "
+                if between_sep == "None" or not between_sep:
+                    between_sep = " "
+                result_parts.append(between_sep)
+        
+        # Add suffix separator (after last field)
+        suffix_idx = len(fields)
+        suffix_sep = separators[suffix_idx] if suffix_idx < len(separators) else ""
+        if suffix_sep and suffix_sep != "None":
+            result_parts.append(suffix_sep)
+        
+        return "".join(result_parts)
+    
+    def _normalize_filename_format(self, format_data):
+        """Normalize filename format to ensure consistent structure.
+        
+        Args:
+            format_data: Dict with "template" string
+            
+        Returns:
+            Normalized format dict with "template" string
+        """
+        if not format_data or not isinstance(format_data, dict):
+            return None
+        
+        import copy
+        normalized = copy.deepcopy(format_data)
+        
+        # Ensure template exists
+        if "template" not in normalized:
+            return None
+        
+        template = normalized.get("template", "").strip()
+        if not template:
+            return None
+        
+        normalized["template"] = template
+        return normalized
+    
+    def _format_custom_filename(self, format_data):
+        """Format a custom filename format as display string.
+        
+        Args:
+            format_data: Dict with "template" string
+            
+        Returns:
+            Template string (for display in dropdown)
+        """
+        if not format_data:
+            return ""
+        
+        normalized = self._normalize_filename_format(format_data)
+        if not normalized:
+            return ""
+        
+        return normalized.get("template", "")
     
     def _normalize_structure(self, structure):
         """Convert old format (list of strings) to new format (list of dicts with fields and separators).
@@ -877,6 +1060,261 @@ class BandcampDownloaderGUI:
         
         return " / ".join(level_strings)
     
+    def _parse_folder_template(self, template):
+        """Parse folder template string to extract tags, level separators, and literal text.
+        
+        Args:
+            template: Template string like "Artist / Album - Year" where "/" is level separator
+            
+        Returns:
+            List of level parts, where each level is a list of (type, value) tuples
+            Example: [[('tag', 'Artist')], [('tag', 'Album'), ('literal', ' - '), ('tag', 'Year')]]
+        """
+        if not template:
+            return []
+        
+        import re
+        levels = []
+        
+        # Normalize both "/" and "\" to "/" for splitting (but preserve original in display)
+        # We'll treat both "/" and "\" as level separators
+        # Replace "\" with "/" for parsing, but we'll handle both in the original template
+        normalized_template = template.replace('\\', '/')
+        level_strings = normalized_template.split('/')
+        
+        for level_str in level_strings:
+            level_str = level_str.strip()
+            if not level_str:
+                continue
+            
+            # Parse this level for tags and literals (similar to filename parsing)
+            parts = []
+            
+            # Sort tag names by length (longest first) to match "Album Artist" before "Album"
+            tag_names_sorted = sorted(self.FOLDER_TAG_NAMES, key=len, reverse=True)
+            
+            # Build regex pattern for whole word matching
+            pattern_parts = []
+            for tag_name in tag_names_sorted:
+                escaped = re.escape(tag_name)
+                if ' ' in tag_name:
+                    # Multi-word tags like "Album Artist"
+                    pattern_parts.append(rf'\b{escaped}\b')
+                else:
+                    # Single word tags
+                    pattern_parts.append(rf'\b{escaped}\b')
+            
+            # Combine patterns with alternation
+            pattern = '|'.join(pattern_parts)
+            
+            # Find all matches
+            all_matches = list(re.finditer(pattern, level_str, re.IGNORECASE))
+            
+            # Filter out overlapping matches (prefer longer matches)
+            valid_matches = []
+            used_ranges = []
+            for match in sorted(all_matches, key=lambda m: (m.end() - m.start(), m.start()), reverse=True):
+                start, end = match.span()
+                # Check if this range overlaps with any already used
+                overlaps = False
+                for used_start, used_end in used_ranges:
+                    if not (end <= used_start or start >= used_end):
+                        overlaps = True
+                        break
+                if not overlaps:
+                    valid_matches.append(match)
+                    used_ranges.append((start, end))
+            
+            # Sort matches by position
+            valid_matches.sort(key=lambda m: m.start())
+            
+            last_end = 0
+            for match in valid_matches:
+                # Add literal text before this tag
+                if match.start() > last_end:
+                    literal = level_str[last_end:match.start()]
+                    if literal:
+                        parts.append(('literal', literal))
+                
+                # Add the tag
+                tag_name = match.group(0)  # The matched text
+                parts.append(('tag', tag_name))
+                
+                last_end = match.end()
+            
+            # Add remaining literal text
+            if last_end < len(level_str):
+                literal = level_str[last_end:]
+                if literal:
+                    parts.append(('literal', literal))
+            
+            if parts:
+                levels.append(parts)
+        
+        return levels
+    
+    def _migrate_structure_to_template(self, structure):
+        """Migrate old structure format to template string.
+        
+        Args:
+            structure: Old format list like [{"fields": ["Artist"]}, {"fields": ["Album"]}]
+            
+        Returns:
+            Template string like "Artist / Album"
+        """
+        if not structure:
+            return ""
+        
+        normalized = self._normalize_structure(structure)
+        if not normalized:
+            return ""
+        
+        level_strings = []
+        for level in normalized:
+            fields = level.get("fields", [])
+            separators = level.get("separators", [])
+            
+            if not fields:
+                continue
+            
+            # Build level string with prefix, between, and suffix separators
+            result_parts = []
+            
+            # Add prefix separator (before first field)
+            prefix_sep = separators[0] if separators and len(separators) > 0 else ""
+            if prefix_sep and prefix_sep != "None":
+                result_parts.append(prefix_sep)
+            
+            # Add fields with between separators
+            for i, field in enumerate(fields):
+                result_parts.append(field)
+                
+                # Add between separator (after each field except last)
+                if i < len(fields) - 1:
+                    between_idx = i + 1
+                    between_sep = separators[between_idx] if between_idx < len(separators) else " "
+                    if between_sep == "None" or not between_sep:
+                        between_sep = " "  # Default to space if None
+                    result_parts.append(between_sep)
+            
+            # Add suffix separator (after last field)
+            suffix_idx = len(fields)
+            suffix_sep = separators[suffix_idx] if suffix_idx < len(separators) else ""
+            if suffix_sep and suffix_sep != "None":
+                result_parts.append(suffix_sep)
+            
+            if result_parts:
+                level_strings.append("".join(result_parts))
+        
+        return " / ".join(level_strings)
+    
+    def _generate_path_from_template(self, template, metadata=None, preview_mode=False):
+        """Generate folder path from template string.
+        
+        Args:
+            template: Template string like "Artist / Album - Year"
+            metadata: Dict with metadata values (artist, album, etc.)
+            preview_mode: If True, use field names for preview; if False, use actual values
+            
+        Returns:
+            List of folder path parts (for yt-dlp template generation)
+        """
+        if not template:
+            return []
+        
+        # Parse template into levels
+        levels = self._parse_folder_template(template)
+        if not levels:
+            return []
+        
+        # Default metadata if not provided
+        if metadata is None:
+            metadata = {}
+        
+        # Field to yt-dlp template mapping
+        field_templates = {
+            "Artist": "%(artist)s",
+            "Album": "%(album)s",
+            "Year": "%(release_date>%Y)s",
+            "Genre": "%(genre)s",
+            "Label": "%(publisher)s",
+            "Album Artist": "%(album_artist)s",
+            "Catalog Number": "%(catalog_number)s"
+        }
+        
+        # Field to preview value mapping (for modal preview - show field names)
+        field_preview = {
+            "Artist": "Artist",
+            "Album": "Album",
+            "Year": "Year",
+            "Genre": "Genre",
+            "Label": "Label",
+            "Album Artist": "Album Artist",
+            "Catalog Number": "Catalog Number"
+        }
+        
+        # Field to actual value mapping (for main preview with real data)
+        # Extract year properly
+        year_str = "Year"
+        if metadata.get("year"):
+            year_str = str(metadata.get("year"))
+        elif metadata.get("date"):
+            date_val = metadata.get("date")
+            if isinstance(date_val, str) and len(date_val) >= 4:
+                year_str = date_val[:4]
+        
+        field_values = {
+            "Artist": self.sanitize_filename(metadata.get("artist", "")) or "Artist",
+            "Album": self.sanitize_filename(metadata.get("album", "")) or "Album",
+            "Year": year_str,
+            "Genre": self.sanitize_filename(metadata.get("genre", "")) or "Genre",
+            "Label": self.sanitize_filename(metadata.get("label") or metadata.get("publisher", "")) or "Label",
+            "Album Artist": self.sanitize_filename(metadata.get("album_artist") or metadata.get("albumartist", "")) or "Album Artist",
+            "Catalog Number": self.sanitize_filename(metadata.get("catalog_number") or metadata.get("catalognumber", "")) or "Catalog Number"
+        }
+        
+        path_parts = []
+        for level in levels:
+            # Build template parts for this level
+            template_parts = []
+            preview_parts = []
+            
+            for part_type, part_value in level:
+                if part_type == 'tag':
+                    # Replace tag with yt-dlp template or preview value
+                    if preview_mode:
+                        # For modal preview, use field names; for main preview, use actual values
+                        # Check if metadata has real values (not just placeholders)
+                        if metadata and any(metadata.get(k) not in [None, "", "Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"] for k in ["artist", "album", "year", "genre", "label", "album_artist", "catalog_number"]):
+                            # Use actual values for main preview
+                            value = field_values.get(part_value, part_value)
+                        else:
+                            # Use field names for modal preview
+                            value = field_preview.get(part_value, part_value)
+                        preview_parts.append(value)
+                    else:
+                        # For yt-dlp, use template format
+                        yt_template = field_templates.get(part_value)
+                        if yt_template:
+                            template_parts.append(yt_template)
+                else:
+                    # Literal text - keep as-is
+                    if preview_mode:
+                        preview_parts.append(part_value)
+                    else:
+                        template_parts.append(part_value)
+            
+            if preview_mode:
+                # For preview, join parts
+                if preview_parts:
+                    path_parts.append("".join(preview_parts))
+            else:
+                # For yt-dlp, join template parts
+                if template_parts:
+                    path_parts.append("".join(template_parts))
+        
+        return path_parts
+    
     def _get_all_structure_options(self):
         """Get all folder structure options including custom structures."""
         # Start with standard options
@@ -904,6 +1342,79 @@ class BandcampDownloaderGUI:
             activeborderwidth=0  # No border on active items
         )
         return menu
+    
+    # ============================================================================
+    # SHARED UTILITIES (Used by both folder structure and filename format systems)
+    # ============================================================================
+    def _create_dialog_base(self, title, width, height):
+        """Create base dialog with common styling and centering.
+        
+        Args:
+            title: Dialog title
+            width: Dialog width in pixels
+            height: Dialog height in pixels
+            
+        Returns:
+            Configured Toplevel dialog
+        """
+        dialog = Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (width // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (height // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.resizable(False, False)
+        
+        # Configure dialog background
+        dialog.configure(bg='#1E1E1E')
+        
+        return dialog
+    
+    def _create_preview_frame(self, parent, wraplength=530):
+        """Create preview frame with common styling.
+        
+        Args:
+            parent: Parent widget
+            wraplength: Wraplength for preview text
+            
+        Returns:
+            Tuple of (preview_frame, preview_text_label)
+        """
+        preview_frame = Frame(parent, bg='#1E1E1E', relief='flat', bd=1, 
+                             highlightbackground='#3E3E42', highlightthickness=1)
+        preview_frame.pack(fill=X, pady=(0, 5))
+        
+        # Preview label prefix
+        preview_label_prefix = Label(
+            preview_frame,
+            text="Preview:",
+            font=("Consolas", 8),
+            bg='#1E1E1E',
+            fg='#D4D4D4',
+            justify='left'
+        )
+        preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=4)
+        
+        # Preview text
+        preview_text = Label(
+            preview_frame,
+            text="",
+            font=("Consolas", 8),
+            bg='#1E1E1E',
+            fg="#2dacd5",
+            wraplength=wraplength,
+            justify='left',
+            anchor='w'
+        )
+        preview_text.grid(row=0, column=1, sticky=W, padx=(0, 6), pady=4)
+        preview_frame.columnconfigure(1, weight=1)
+        
+        return preview_frame, preview_text
     
     def _create_menubutton_with_menu(self, parent, textvariable, values, width, callback=None):
         """Create a menubutton with menu, matching the structure menubutton style.
@@ -1092,7 +1603,7 @@ class BandcampDownloaderGUI:
         return menubutton, menu
     
     def _build_structure_menu(self, menu):
-        """Build the structure menu with standard structures, separator, and custom structures."""
+        """Build the structure menu with standard structures, separator, and custom structures (templates and old format)."""
         # Clear existing menu items
         menu.delete(0, END)
         
@@ -1107,19 +1618,38 @@ class BandcampDownloaderGUI:
                 command=lambda val=key: self._on_structure_menu_select(val)
             )
         
-        # Add separator if there are custom structures
+        # Add separator if there are custom structures (templates or old format)
+        has_custom = False
+        if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates:
+            has_custom = True
         if hasattr(self, 'custom_structures') and self.custom_structures:
+            has_custom = True
+        
+        if has_custom:
             menu.add_separator()
             
-            # Add custom structures with padding on all sides
-            for structure in self.custom_structures:
-                formatted = self._format_custom_structure(structure)
-                if formatted:
-                    padded_label = f" {formatted}      "  # Left space + text + right spaces
-                    menu.add_command(
-                        label=padded_label,
-                        command=lambda s=structure: self._on_structure_menu_select(s)
-                    )
+            # Add custom structures in order: old format first, then templates (newest at end)
+            # Old format structures (will be migrated on use)
+            if hasattr(self, 'custom_structures') and self.custom_structures:
+                for structure in self.custom_structures:
+                    formatted = self._format_custom_structure(structure)
+                    if formatted:
+                        padded_label = f" {formatted}      "  # Left space + text + right spaces
+                        menu.add_command(
+                            label=padded_label,
+                            command=lambda s=structure: self._on_structure_menu_select(s)
+                        )
+            
+            # Custom template structures (new format) - added after old format, so newest appear at end
+            if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates:
+                for template_data in self.custom_structure_templates:
+                    formatted = self._format_custom_structure_template(template_data)
+                    if formatted:
+                        padded_label = f" {formatted}      "  # Left space + text + right spaces
+                        menu.add_command(
+                            label=padded_label,
+                            command=lambda t=template_data: self._on_structure_menu_select(t)
+                        )
     
     def _on_structure_menu_select(self, choice):
         """Handle structure menu item selection."""
@@ -1127,8 +1657,12 @@ class BandcampDownloaderGUI:
             # Standard structure - set display value
             display_value = self.FOLDER_STRUCTURES[choice]
             self.folder_structure_var.set(display_value)
+        elif isinstance(choice, dict) and "template" in choice:
+            # Custom template structure (new format) - set formatted string
+            display_value = self._format_custom_structure_template(choice)
+            self.folder_structure_var.set(display_value)
         else:
-            # Custom structure - set formatted string
+            # Custom structure (old format) - set formatted string
             display_value = self._format_custom_structure(choice)
             self.folder_structure_var.set(display_value)
         
@@ -1146,7 +1680,7 @@ class BandcampDownloaderGUI:
             self._build_structure_menu(self.structure_menu)
         # Update manage button state
         if hasattr(self, 'manage_btn'):
-            has_custom = hasattr(self, 'custom_structures') and self.custom_structures
+            has_custom = (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates) or (hasattr(self, 'custom_structures') and self.custom_structures)
             if has_custom:
                 self.manage_btn.config(fg='#808080', cursor='hand2')
                 # Rebind events if they don't exist
@@ -1223,12 +1757,23 @@ class BandcampDownloaderGUI:
         self._save_settings()
     
     def load_saved_numbering(self):
-        """Load saved track numbering preference, default to None if not found."""
+        """Load saved track numbering preference, default to Track if not found."""
         settings = self._load_settings()
         numbering_val = settings.get("track_numbering", self.DEFAULT_NUMBERING)
-        valid_options = ["None", "01. Track", "1. Track", "01 - Track", "1 - Track"]
+        
+        # Check if it's a default format
+        valid_options = ["Track", "01. Track", "Artist - Track", "01. Artist - Track"]
         if numbering_val in valid_options:
             return numbering_val
+        
+        # Check if it's a custom format (match by formatted string)
+        if hasattr(self, 'custom_filename_formats') and self.custom_filename_formats:
+            for custom_format in self.custom_filename_formats:
+                formatted = self._format_custom_filename(custom_format)
+                if formatted == numbering_val:
+                    return numbering_val
+        
+        # If not found, return default
         return self.DEFAULT_NUMBERING
     
     def save_numbering(self):
@@ -1456,7 +2001,7 @@ class BandcampDownloaderGUI:
         main_frame.grid(row=0, column=0, sticky=(W, E, N, S))
         
         # URL input - supports both single Entry and multi-line ScrolledText
-        ttk.Label(main_frame, text="Album URL:", font=("Segoe UI", 9)).grid(
+        ttk.Label(main_frame, text="URL:", font=("Segoe UI", 9)).grid(
             row=0, column=0, sticky=(W, N), pady=2
         )
         
@@ -1475,12 +2020,20 @@ class BandcampDownloaderGUI:
         entry_container.columnconfigure(0, weight=1)
         self.entry_container = entry_container  # Store reference
         
-        # Entry widget inside container
-        url_entry = ttk.Entry(
+        # Entry widget inside container (regular Entry to match ScrolledText styling)
+        url_entry = Entry(
             entry_container,
             textvariable=self.url_var,
             width=45,
-            font=("Segoe UI", 9)
+            font=("Segoe UI", 9),
+            bg='#252526',
+            fg='#CCCCCC',
+            insertbackground='#D4D4D4',
+            relief='flat',
+            borderwidth=1,
+            highlightthickness=2,
+            highlightbackground='#3E3E42',
+            highlightcolor='#007ACC'
         )
         url_entry.grid(row=0, column=0, sticky=(W, E), pady=0, padx=0)
         self.url_entry_widget = url_entry
@@ -1609,7 +2162,7 @@ class BandcampDownloaderGUI:
             insertbackground='#D4D4D4',
             relief='flat',
             borderwidth=1,
-            highlightthickness=1,
+            highlightthickness=2,
             highlightbackground='#3E3E42',
             highlightcolor='#007ACC',
             wrap='none'  # Disable text wrapping
@@ -1624,10 +2177,10 @@ class BandcampDownloaderGUI:
             bg='#252526',  # Match text widget background to blend in
             fg='#A0A0A0',  # Lighter gray for better visibility
             cursor='sb_v_double_arrow',  # Vertical resize cursor
-            height=3,  # Allow space for 3 lines
+            height=4,  # Allow space for 3 lines
             relief='flat',
             borderwidth=0,
-            font=("Segoe UI", 7),  # Slightly larger font for better visibility
+            font=("Segoe UI", 9),  # Slightly larger font for better visibility
             anchor='center',  # Center the text
             justify='center',  # Center the lines
             wraplength=50  # Allow text wrapping if needed
@@ -1636,7 +2189,7 @@ class BandcampDownloaderGUI:
         # This way it doesn't take up grid space, doesn't cover borders or scrollbar
         # Position it centered with some padding from edges
         # Height matches user's adjustment (10px) to accommodate 3 stacked lines
-        self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=10, y=-1)
+        self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=10, y=-2)
         self.url_text_resize_handle.lower()  # Place behind text widget initially
         self.url_text_resize_handle.place_forget()  # Hidden initially, shown when text widget is visible
         
@@ -1695,10 +2248,13 @@ class BandcampDownloaderGUI:
         url_text.bind('<Control-y>', self._handle_text_redo)  # Redo (Ctrl+Y - alternative)
         
         # Download path - compact
-        ttk.Label(main_frame, text="Download Path:", font=("Segoe UI", 9)).grid(
+        ttk.Label(main_frame, text="Path:", font=("Segoe UI", 9)).grid(
             row=1, column=0, sticky=W, pady=2
         )
-        path_entry = ttk.Entry(main_frame, textvariable=self.path_var, width=35, font=("Segoe UI", 9), state='normal')
+        path_entry = Entry(main_frame, textvariable=self.path_var, width=35, font=("Segoe UI", 9), 
+                          bg='#252526', fg='#CCCCCC', insertbackground='#D4D4D4',
+                          relief='flat', borderwidth=1, highlightthickness=2,
+                          highlightbackground='#3E3E42', highlightcolor='#007ACC', state='normal')
         path_entry.grid(row=1, column=1, sticky=(W, E), pady=2, padx=(8, 0))
         self.path_entry = path_entry  # Store reference for unfocus handling
         
@@ -1795,7 +2351,7 @@ class BandcampDownloaderGUI:
         )
         
         # Audio Format (first) - with eye icon button on the right when album art is hidden
-        ttk.Label(self.settings_content, text="File Format:", font=("Segoe UI", 8)).grid(row=0, column=0, padx=4, sticky=W, pady=1)
+        ttk.Label(self.settings_content, text="Format:", font=("Segoe UI", 8)).grid(row=0, column=0, padx=4, sticky=W, pady=1)
         
         def on_format_select(value):
             self.format_var.set(value)
@@ -1834,24 +2390,69 @@ class BandcampDownloaderGUI:
         self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg='#808080'))
         
         # Numbering (second, below Audio Format)
-        ttk.Label(self.settings_content, text="Numbering:", font=("Segoe UI", 8)).grid(row=1, column=0, padx=4, sticky=W, pady=1)
+        ttk.Label(self.settings_content, text="Filename:", font=("Segoe UI", 8)).grid(row=1, column=0, padx=4, sticky=W, pady=1)
         
-        def on_numbering_select(value):
-            self.numbering_var.set(value)
-            self.on_numbering_change()
-            self.update_preview()
+        # Create frame for dropdown and buttons (similar to folder structure)
+        filename_frame = Frame(self.settings_content, bg='#1E1E1E', highlightthickness=0, borderwidth=0)
+        filename_frame.grid(row=1, column=1, padx=4, sticky=(W, N), pady=1, columnspan=1)
         
-        numbering_menubutton, numbering_menu = self._create_menubutton_with_menu(
-            self.settings_content,
-            self.numbering_var,
-            ["None", "01. Track", "1. Track", "01 - Track", "1 - Track"],
+        # Create filename menubutton with custom menu (similar to folder structure)
+        numbering_menubutton = ttk.Menubutton(
+            filename_frame,
+            textvariable=self.numbering_var,
             width=21,
-            callback=on_numbering_select
+            direction='below',
+            style='Dark.TMenubutton'
         )
-        numbering_menubutton.grid(row=1, column=1, padx=4, sticky=W, pady=1)
+        numbering_menubutton.pack(side=LEFT, padx=(0, 6), pady=0, anchor='w')
+        
+        numbering_menu = self._create_dark_menu(numbering_menubutton)
+        numbering_menubutton['menu'] = numbering_menu
+        
+        self.filename_menubutton = numbering_menubutton  # Store reference
+        self.filename_menu = numbering_menu  # Store reference
+        
+        # Build the menu with standard formats, separator, and custom formats
+        self._build_filename_menu(numbering_menu)
+        
+        # Customize button (✏️) - matching folder structure style
+        filename_customize_btn = Label(
+            filename_frame,
+            text="✏️",
+            font=("Segoe UI", 12),
+            bg='#1E1E1E',
+            fg='#808080',
+            cursor='hand2',
+            width=2,
+            padx=0
+        )
+        filename_customize_btn.pack(side=LEFT, padx=(0, 4))
+        filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog())
+        filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg='#D4D4D4'))
+        filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg='#808080'))
+        self.filename_customize_btn = filename_customize_btn  # Store reference
+        
+        # Manage button (🗑️) - trash can icon for managing/deleting filename formats
+        has_custom_filename = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
+        filename_manage_btn = Label(
+            filename_frame,
+            text="🗑️",
+            font=("Segoe UI", 12),
+            bg='#1E1E1E',
+            fg='#808080' if has_custom_filename else '#404040',  # Darker when disabled
+            cursor='hand2' if has_custom_filename else 'arrow',
+            width=3,
+            padx=4
+        )
+        filename_manage_btn.pack(side=LEFT, padx=(2, 0))
+        if has_custom_filename:
+            filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog())
+            filename_manage_btn.bind("<Enter>", lambda e: filename_manage_btn.config(fg='#D4D4D4') if has_custom_filename else None)
+            filename_manage_btn.bind("<Leave>", lambda e: filename_manage_btn.config(fg='#808080') if has_custom_filename else None)
+        self.filename_manage_btn = filename_manage_btn  # Store reference
         
         # Folder Structure (third, below Numbering)
-        ttk.Label(self.settings_content, text="Structure:", font=("Segoe UI", 8)).grid(row=2, column=0, padx=4, sticky=W, pady=1)
+        ttk.Label(self.settings_content, text="Folder(s):", font=("Segoe UI", 8)).grid(row=2, column=0, padx=4, sticky=W, pady=1)
         
         # Create frame for dropdown and buttons
         structure_frame = Frame(self.settings_content, bg='#1E1E1E', highlightthickness=0, borderwidth=0)
@@ -1895,18 +2496,36 @@ class BandcampDownloaderGUI:
                     label=padded_label,
                     command=lambda val=key: wrapped_structure_select(val)
                 )
-            # Add separator if there are custom structures
+            # Add separator if there are custom structures (templates or old format)
+            has_custom = False
+            if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates:
+                has_custom = True
             if hasattr(self, 'custom_structures') and self.custom_structures:
+                has_custom = True
+            
+            if has_custom:
                 structure_menu.add_separator()
-                # Add custom structures
-                for structure in self.custom_structures:
-                    formatted = self._format_custom_structure(structure)
-                    if formatted:
-                        padded_label = f" {formatted}      "
-                        structure_menu.add_command(
-                            label=padded_label,
-                            command=lambda s=structure: wrapped_structure_select(s)
-                        )
+                # Add custom structures in order: old format first, then templates (newest at end)
+                # Old format structures
+                if hasattr(self, 'custom_structures') and self.custom_structures:
+                    for structure in self.custom_structures:
+                        formatted = self._format_custom_structure(structure)
+                        if formatted:
+                            padded_label = f" {formatted}      "
+                            structure_menu.add_command(
+                                label=padded_label,
+                                command=lambda s=structure: wrapped_structure_select(s)
+                            )
+                # Custom template structures (new format) - added after old format, so newest appear at end
+                if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates:
+                    for template_data in self.custom_structure_templates:
+                        formatted = self._format_custom_structure_template(template_data)
+                        if formatted:
+                            padded_label = f" {formatted}      "
+                            structure_menu.add_command(
+                                label=padded_label,
+                                command=lambda t=template_data: wrapped_structure_select(t)
+                            )
         
         rebuild_with_tracking()
         
@@ -2624,7 +3243,7 @@ class BandcampDownloaderGUI:
         widget.after_idle(clear_selection_and_focus)
     
     def _extract_structure_choice(self, choice_str):
-        """Helper method to extract numeric choice from folder structure string or return custom structure."""
+        """Helper method to extract numeric choice from folder structure string or return custom structure/template."""
         if not choice_str:
             return "4"  # Default
         # Check if it's already a number
@@ -2634,7 +3253,13 @@ class BandcampDownloaderGUI:
         for key, value in self.FOLDER_STRUCTURES.items():
             if choice_str == value:
                 return key
-        # Check if it's a custom structure
+        # Check if it's a custom template structure (new format)
+        if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates:
+            for template_data in self.custom_structure_templates:
+                formatted = self._format_custom_structure_template(template_data)
+                if formatted == choice_str:
+                    return template_data  # Return the template dict
+        # Check if it's a custom structure (old format - will be migrated)
         if hasattr(self, 'custom_structures') and self.custom_structures:
             for structure in self.custom_structures:
                 if self._format_custom_structure(structure) == choice_str:
@@ -2664,10 +3289,17 @@ class BandcampDownloaderGUI:
         
         # Handle custom structures
         if isinstance(choice, list):
+            # Old format custom structure
             display_value = self._format_custom_structure(choice)
-        else:
-            # Get the display value using class constants
+        elif isinstance(choice, dict) and "template" in choice:
+            # New template-based custom structure
+            display_value = self._format_custom_structure_template(choice)
+        elif isinstance(choice, str) and choice in ["1", "2", "3", "4", "5"]:
+            # Default structure - get the display value using class constants
             display_value = self.FOLDER_STRUCTURES.get(choice, self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE])
+        else:
+            # Fallback to default
+            display_value = self.FOLDER_STRUCTURES[self.DEFAULT_STRUCTURE]
         
         # Set the StringVar - menu button text is automatically updated via textvariable binding
         self.folder_structure_var.set(display_value)
@@ -3687,7 +4319,7 @@ class BandcampDownloaderGUI:
         
         # Show resize handle when text widget is visible (place it just above bottom edge, centered)
         if hasattr(self, 'url_text_resize_handle'):
-            self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=5, y=-1)
+            self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=5, y=-2)
             self.url_text_resize_handle.lift()  # Bring to front so it's draggable
         
         # Show paste button for ScrolledText mode
@@ -5162,69 +5794,115 @@ class BandcampDownloaderGUI:
         album = self.sanitize_filename(self.album_info.get("album")) or "Album"
         title = self.sanitize_filename(self.album_info.get("title")) or "Track"
         
-        # Apply track numbering if selected
+        # Apply filename format if selected
         numbering_style = self.numbering_var.get()
-        if numbering_style != "None":
-            # Use track number 1 for preview
-            track_number = 1
-            if numbering_style == "01. Track":
-                title = f"{track_number:02d}. {title}"
-            elif numbering_style == "1. Track":
-                title = f"{track_number}. {title}"
-            elif numbering_style == "01 - Track":
-                title = f"{track_number:02d} - {title}"
-            elif numbering_style == "1 - Track":
-                title = f"{track_number} - {title}"
+        # Skip if "None" (old format, no longer used but handle for backward compatibility)
+        if numbering_style == "None":
+            pass  # Don't apply any format
+        else:
+            # Get format data (either from FILENAME_FORMATS or custom_filename_formats)
+            format_data = None
+            if numbering_style in self.FILENAME_FORMATS:
+                format_data = self.FILENAME_FORMATS[numbering_style]
+            else:
+                # Check custom formats
+                if hasattr(self, 'custom_filename_formats') and self.custom_filename_formats:
+                    for custom_format in self.custom_filename_formats:
+                        formatted = self._format_custom_filename(custom_format)
+                        if formatted == numbering_style:
+                            format_data = custom_format
+                            break
+            
+            if format_data:
+                # Generate filename using format
+                track_number = 1  # Use track number 1 for preview
+                # Create a dummy file path for preview
+                dummy_file = Path("dummy.mp3")
+                dummy_dir = Path(path)
+                
+                # Generate filename
+                generated_name = self._generate_filename_from_format(
+                    format_data, track_number, title, dummy_file, dummy_dir
+                )
+                if generated_name:
+                    title = generated_name
         
         # Get example path based on structure
         base_path = Path(path)
         
-        # Handle custom structures
-        if isinstance(choice, list):
+        # Extract metadata values - use real data when available, placeholders otherwise
+        # Extract Year - check album_info first (from URL paste), then album_info_stored (from download)
+        year_value = "Year"
+        
+        # First check album_info (populated when URL is pasted)
+        year_from_info = self.album_info.get("year")
+        if year_from_info:
+            year_value = year_from_info
+        # Fall back to album_info_stored (from download extraction)
+        elif hasattr(self, 'album_info_stored') and self.album_info_stored:
+            date = self.album_info_stored.get("date")
+            if date:
+                # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
+                try:
+                    if len(date) >= 4:
+                        year_value = date[:4]  # First 4 characters are the year
+                except:
+                    pass
+        
+        # Get other metadata fields if available
+        genre_value = "Genre"
+        label_value = "Label"
+        album_artist_value = "Album Artist"
+        catalog_number_value = "CAT001"
+        
+        # Check if we have stored metadata with these fields
+        if hasattr(self, 'album_info_stored') and self.album_info_stored:
+            # These fields might be in album_info_stored if extracted from yt-dlp
+            genre_value = self.album_info_stored.get("genre") or genre_value
+            label_value = self.album_info_stored.get("label") or self.album_info_stored.get("publisher") or label_value
+            album_artist_value = self.album_info_stored.get("album_artist") or self.album_info_stored.get("albumartist") or album_artist_value
+            catalog_number_value = self.album_info_stored.get("catalog_number") or self.album_info_stored.get("catalognumber") or catalog_number_value
+        
+        # Also check album_info for any metadata that might be there
+        genre_value = self.album_info.get("genre") or genre_value
+        label_value = self.album_info.get("label") or self.album_info.get("publisher") or label_value
+        album_artist_value = self.album_info.get("album_artist") or self.album_info.get("albumartist") or album_artist_value
+        catalog_number_value = self.album_info.get("catalog_number") or self.album_info.get("catalognumber") or catalog_number_value
+        
+        # Handle template-based structures (new format)
+        if isinstance(choice, dict) and "template" in choice:
+            template = choice.get("template", "").strip()
+            if template:
+                # Build metadata for preview
+                metadata = {
+                    "artist": artist,
+                    "album": album,
+                    "title": title,
+                    "year": year_value if year_value != "Year" else "Year",
+                    "genre": genre_value if genre_value != "Genre" else "Genre",
+                    "label": label_value if label_value != "Label" else "Label",
+                    "album_artist": album_artist_value if album_artist_value != "Album Artist" else "Album Artist",
+                    "catalog_number": catalog_number_value if catalog_number_value != "CAT001" else "Catalog Number"
+                }
+                
+                # Generate path parts from template
+                path_parts = self._generate_path_from_template(template, metadata, preview_mode=True)
+                if path_parts:
+                    path_parts = [base_path] + path_parts + [f"{title}{ext}"]
+                    preview_path = str(Path(*path_parts))
+                else:
+                    preview_path = str(base_path / f"{title}{ext}")
+            else:
+                preview_path = str(base_path / f"{title}{ext}")
+        # Handle custom structures (old format - will be migrated)
+        elif isinstance(choice, list):
             # Normalize to new format (handles both old and new)
             normalized = self._normalize_structure(choice)
             
             # Build path from custom structure
             path_parts = [base_path]
             
-            # Get metadata values - use real data when available, placeholders otherwise
-            # Extract Year - check album_info first (from URL paste), then album_info_stored (from download)
-            year_value = "Year"
-            
-            # First check album_info (populated when URL is pasted)
-            year_from_info = self.album_info.get("year")
-            if year_from_info:
-                year_value = year_from_info
-            # Fall back to album_info_stored (from download extraction)
-            elif hasattr(self, 'album_info_stored') and self.album_info_stored:
-                date = self.album_info_stored.get("date")
-                if date:
-                    # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
-                    try:
-                        if len(date) >= 4:
-                            year_value = date[:4]  # First 4 characters are the year
-                    except:
-                        pass
-            
-            # Get other metadata fields if available
-            genre_value = "Genre"
-            label_value = "Label"
-            album_artist_value = "Album Artist"
-            catalog_number_value = "CAT001"
-            
-            # Check if we have stored metadata with these fields
-            if hasattr(self, 'album_info_stored') and self.album_info_stored:
-                # These fields might be in album_info_stored if extracted from yt-dlp
-                genre_value = self.album_info_stored.get("genre") or genre_value
-                label_value = self.album_info_stored.get("label") or self.album_info_stored.get("publisher") or label_value
-                album_artist_value = self.album_info_stored.get("album_artist") or self.album_info_stored.get("albumartist") or album_artist_value
-                catalog_number_value = self.album_info_stored.get("catalog_number") or self.album_info_stored.get("catalognumber") or catalog_number_value
-            
-            # Also check album_info for any metadata that might be there
-            genre_value = self.album_info.get("genre") or genre_value
-            label_value = self.album_info.get("label") or self.album_info.get("publisher") or label_value
-            album_artist_value = self.album_info.get("album_artist") or self.album_info.get("albumartist") or album_artist_value
-            catalog_number_value = self.album_info.get("catalog_number") or self.album_info.get("catalognumber") or catalog_number_value
+            # Metadata values are already extracted above (shared with template-based structures)
             
             # Sanitize all values for filename use
             field_values = {
@@ -5282,15 +5960,58 @@ class BandcampDownloaderGUI:
             path_parts.append(f"{title}{ext}")
             preview_path = str(Path(*path_parts))
         else:
-            # Standard structures
-            examples = {
-                "1": str(base_path / f"{title}{ext}"),
-                "2": str(base_path / album / f"{title}{ext}"),
-                "3": str(base_path / artist / f"{title}{ext}"),
-                "4": str(base_path / artist / album / f"{title}{ext}"),
-                "5": str(base_path / album / artist / f"{title}{ext}"),
-            }
-            preview_path = examples.get(choice, examples["4"])
+            # Standard structures (can also use templates now)
+            if choice in self.FOLDER_STRUCTURE_TEMPLATES:
+                template_data = self.FOLDER_STRUCTURE_TEMPLATES[choice]
+                template = template_data.get("template", "").strip()
+                if template:
+                    # Build metadata for preview
+                    metadata = {
+                        "artist": artist,
+                        "album": album,
+                        "title": title,
+                        "year": year_value if year_value != "Year" else "Year",
+                        "genre": genre_value if genre_value != "Genre" else "Genre",
+                        "label": label_value if label_value != "Label" else "Label",
+                        "album_artist": album_artist_value if album_artist_value != "Album Artist" else "Album Artist",
+                        "catalog_number": catalog_number_value if catalog_number_value != "CAT001" else "Catalog Number"
+                    }
+                    
+                    # Generate path parts from template
+                    path_parts = self._generate_path_from_template(template, metadata, preview_mode=True)
+                    if path_parts:
+                        path_parts = [base_path] + path_parts + [f"{title}{ext}"]
+                        preview_path = str(Path(*path_parts))
+                    else:
+                        # Fallback to old hardcoded
+                        examples = {
+                            "1": str(base_path / f"{title}{ext}"),
+                            "2": str(base_path / album / f"{title}{ext}"),
+                            "3": str(base_path / artist / f"{title}{ext}"),
+                            "4": str(base_path / artist / album / f"{title}{ext}"),
+                            "5": str(base_path / album / artist / f"{title}{ext}"),
+                        }
+                        preview_path = examples.get(choice, examples["4"])
+                else:
+                    # Fallback to old hardcoded
+                    examples = {
+                        "1": str(base_path / f"{title}{ext}"),
+                        "2": str(base_path / album / f"{title}{ext}"),
+                        "3": str(base_path / artist / f"{title}{ext}"),
+                        "4": str(base_path / artist / album / f"{title}{ext}"),
+                        "5": str(base_path / album / artist / f"{title}{ext}"),
+                    }
+                    preview_path = examples.get(choice, examples["4"])
+            else:
+                # Fallback to old hardcoded
+                examples = {
+                    "1": str(base_path / f"{title}{ext}"),
+                    "2": str(base_path / album / f"{title}{ext}"),
+                    "3": str(base_path / artist / f"{title}{ext}"),
+                    "4": str(base_path / artist / album / f"{title}{ext}"),
+                    "5": str(base_path / album / artist / f"{title}{ext}"),
+                }
+                preview_path = examples.get(choice, examples["4"])
         
         # Show only the path (no "Preview: " prefix - that's handled by the label)
         self.preview_var.set(preview_path)
@@ -6110,7 +6831,28 @@ class BandcampDownloaderGUI:
             path_parts.append("%(title)s.%(ext)s")
             return str(Path(*path_parts))
         
-        # Handle standard structures
+        # Handle template-based structures (new format - check if choice is a template dict)
+        if isinstance(choice, dict) and "template" in choice:
+            template = choice.get("template", "").strip()
+            if template:
+                # Generate path parts from template
+                path_parts = self._generate_path_from_template(template, preview_mode=False)
+                if path_parts:
+                    path_parts = [base_folder] + path_parts + ["%(title)s.%(ext)s"]
+                    return str(Path(*path_parts))
+        
+        # Handle standard structures (can also use templates now)
+        if choice in self.FOLDER_STRUCTURE_TEMPLATES:
+            template_data = self.FOLDER_STRUCTURE_TEMPLATES[choice]
+            template = template_data.get("template", "").strip()
+            if template:
+                # Generate path parts from template
+                path_parts = self._generate_path_from_template(template, preview_mode=False)
+                if path_parts:
+                    path_parts = [base_folder] + path_parts + ["%(title)s.%(ext)s"]
+                    return str(Path(*path_parts))
+        
+        # Fallback to old hardcoded options
         folder_options = {
             "1": str(base_folder / "%(title)s.%(ext)s"),
             "2": str(base_folder / "%(album)s" / "%(title)s.%(ext)s"),
@@ -6447,13 +7189,163 @@ class BandcampDownloaderGUI:
         
         return None
     
+    def _generate_filename_from_format(self, format_data, track_number, track_title, audio_file, dir_path):
+        """Generate filename from format data using track number and metadata.
+        
+        Args:
+            format_data: Format dict with template string
+            track_number: Track number (integer)
+            track_title: Cleaned track title (string)
+            audio_file: Path to audio file (for getting metadata if needed)
+            dir_path: Directory path (for getting metadata if needed)
+            
+        Returns:
+            New filename string (without extension) or None if generation failed
+        """
+        if not format_data:
+            return None
+        
+        normalized = self._normalize_filename_format(format_data)
+        if not normalized:
+            return None
+        
+        template = normalized.get("template", "")
+        if not template:
+            return None
+        
+        # Get metadata values (try multiple sources)
+        metadata = {}
+        
+        # Try to get from download_info (if it exists)
+        if hasattr(self, 'download_info') and self.download_info:
+            file_title = audio_file.stem
+            for title_key, info in self.download_info.items():
+                if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
+                    metadata = info.copy()
+                    break
+        
+        # Try to get from album_info_stored
+        if not metadata and hasattr(self, 'album_info_stored') and self.album_info_stored:
+            metadata.update(self.album_info_stored)
+        
+        # Try to get from directory structure
+        if not metadata.get("artist") or not metadata.get("album"):
+            try:
+                artist, album = self._get_metadata_from_directory(dir_path)
+                if artist:
+                    metadata["artist"] = artist
+                if album:
+                    metadata["album"] = album
+            except:
+                pass
+        
+        # Try to read metadata directly from audio file if still missing
+        if not metadata.get("artist") or not metadata.get("album") or not metadata.get("date"):
+            try:
+                import subprocess
+                import sys
+                import json
+                
+                # Try to use ffprobe to read metadata
+                if hasattr(self, 'ffmpeg_path') and self.ffmpeg_path:
+                    ffprobe_path = self.ffmpeg_path.parent / "ffprobe.exe"
+                    if not ffprobe_path.exists() and hasattr(self, 'script_dir'):
+                        ffprobe_path = self.script_dir / "ffprobe.exe"
+                    
+                    if ffprobe_path.exists() and audio_file.exists():
+                        cmd = [
+                            str(ffprobe_path),
+                            "-v", "quiet",
+                            "-print_format", "json",
+                            "-show_format",
+                            str(audio_file)
+                        ]
+                        
+                        result = subprocess.run(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+                            timeout=5
+                        )
+                        
+                        if result.returncode == 0:
+                            data = json.loads(result.stdout.decode('utf-8', errors='ignore'))
+                            tags = data.get("format", {}).get("tags", {})
+                            
+                            # Extract artist
+                            if not metadata.get("artist"):
+                                artist = (tags.get("artist") or tags.get("ARTIST") or 
+                                         tags.get("album_artist") or tags.get("ALBUMARTIST") or
+                                         tags.get("albumartist") or tags.get("ALBUMARTIST"))
+                                if artist:
+                                    metadata["artist"] = artist
+                            
+                            # Extract album
+                            if not metadata.get("album"):
+                                album = tags.get("album") or tags.get("ALBUM")
+                                if album:
+                                    metadata["album"] = album
+                            
+                            # Extract date/year
+                            if not metadata.get("date") and not metadata.get("year"):
+                                date = (tags.get("date") or tags.get("DATE") or 
+                                       tags.get("year") or tags.get("YEAR") or
+                                       tags.get("originaldate") or tags.get("ORIGINALDATE"))
+                                if date:
+                                    metadata["date"] = str(date)
+            except Exception:
+                pass  # Silently fail if metadata reading doesn't work
+        
+        # Extract year from date if available
+        year_value = None
+        if metadata.get("date"):
+            date = metadata["date"]
+            try:
+                if len(date) >= 4:
+                    year_value = date[:4]
+            except:
+                pass
+        
+        # Add title to metadata
+        metadata["title"] = track_title
+        
+        # Add year if extracted
+        if year_value:
+            metadata["year"] = year_value
+        
+        # Generate filename using template
+        filename = self._generate_filename_from_template(template, track_number, metadata, preview_mode=False)
+        
+        return filename
+    
     def apply_track_numbering(self, download_path):
-        """Apply track numbering to downloaded files based on user preference."""
+        """Apply custom filename format to downloaded files based on user preference.
+        Replaces old apply_track_numbering method with new custom format system.
+        """
         import re
         import time
         
         numbering_style = self.numbering_var.get()
+        # Skip if "None" (old format, no longer used but handle for backward compatibility)
         if numbering_style == "None":
+            return
+        
+        # Get format data (either from FILENAME_FORMATS or custom_filename_formats)
+        format_data = None
+        if numbering_style in self.FILENAME_FORMATS:
+            format_data = self.FILENAME_FORMATS[numbering_style]
+        else:
+            # Check custom formats
+            if hasattr(self, 'custom_filename_formats') and self.custom_filename_formats:
+                for custom_format in self.custom_filename_formats:
+                    formatted = self._format_custom_filename(custom_format)
+                    if formatted == numbering_style:
+                        format_data = custom_format
+                        break
+        
+        # If no format data found, skip (shouldn't happen, but safety check)
+        if not format_data:
             return
         
         try:
@@ -6537,6 +7429,11 @@ class BandcampDownloaderGUI:
                         artist_from_filename = artist_match.group(1).strip()
                         cleaned_file_title = artist_match.group(2).strip()
                     
+                    # Also try matching just the stem without any prefixes
+                    # Remove common separators and normalize
+                    stem_only = re.sub(r'[^\w\s]', ' ', file_title.lower())
+                    stem_only = ' '.join(stem_only.split())  # Normalize whitespace
+                    
                     for title_key, info in self.download_info.items():
                         # Normalize title key for comparison
                         normalized_title_key = title_key.lower().strip()
@@ -6546,6 +7443,10 @@ class BandcampDownloaderGUI:
                         if artist_match_key:
                             cleaned_title_key = artist_match_key.group(2).strip()
                         
+                        # Also normalize the title key stem
+                        title_key_stem = re.sub(r'[^\w\s]', ' ', normalized_title_key)
+                        title_key_stem = ' '.join(title_key_stem.split())  # Normalize whitespace
+                        
                         # Calculate match score (prefer exact matches, then contains matches)
                         match_score = 0
                         # Try matching cleaned versions first
@@ -6553,12 +7454,20 @@ class BandcampDownloaderGUI:
                             match_score = 100  # Exact match on cleaned titles
                         elif normalized_file_title == normalized_title_key:
                             match_score = 95  # Exact match on original
+                        elif stem_only == title_key_stem:
+                            match_score = 90  # Exact match on normalized stems
                         elif cleaned_file_title in cleaned_title_key or cleaned_title_key in cleaned_file_title:
                             # Substring match on cleaned titles - calculate similarity
                             shorter = min(len(cleaned_file_title), len(cleaned_title_key))
                             longer = max(len(cleaned_file_title), len(cleaned_title_key))
                             if shorter > 0:
                                 match_score = (shorter / longer) * 50
+                        elif stem_only in title_key_stem or title_key_stem in stem_only:
+                            # Substring match on normalized stems
+                            shorter = min(len(stem_only), len(title_key_stem))
+                            longer = max(len(stem_only), len(title_key_stem))
+                            if shorter > 0:
+                                match_score = (shorter / longer) * 45
                         elif normalized_file_title in normalized_title_key or normalized_title_key in normalized_file_title:
                             # Substring match on original - calculate similarity
                             shorter = min(len(normalized_file_title), len(normalized_title_key))
@@ -6566,8 +7475,10 @@ class BandcampDownloaderGUI:
                             if shorter > 0:
                                 match_score = (shorter / longer) * 40
                         
-                        # Only accept matches with significant similarity (at least 30% of shorter string)
-                        if match_score > best_match_score and match_score >= 30:
+                        # Only accept matches with high confidence
+                        # Require at least 70% similarity for substring matches, or exact matches
+                        min_score = 70 if match_score < 90 else 30  # Exact matches (90+) need lower threshold
+                        if match_score > best_match_score and match_score >= min_score:
                             best_match_score = match_score
                             best_match = info
                     
@@ -6663,40 +7574,20 @@ class BandcampDownloaderGUI:
                     
                     file_title = audio_file.stem
                     
-                    # Use sanitized track title for the new filename
-                    sanitized_title = self.sanitize_filename(track_title)
-                    
-                    # Format track number prefix based on style
-                    if numbering_style == "01. Track":
-                        prefix = f"{track_number:02d}. "
-                    elif numbering_style == "1. Track":
-                        prefix = f"{track_number}. "
-                    elif numbering_style == "01 - Track":
-                        prefix = f"{track_number:02d} - "
-                    elif numbering_style == "1 - Track":
-                        prefix = f"{track_number} - "
-                    else:
-                        continue  # Unknown style
-                    
                     # Get original filename parts
                     parent_dir = audio_file.parent
                     extension = audio_file.suffix
                     
-                    # Check if filename already has numbering AND the title part is already clean
-                    # Check if already starts with number
-                    has_numbering = re.match(r'^\d+[.\-]\s*', file_title)
-                    if has_numbering:
-                        # Extract the title part (after the number prefix)
-                        title_part = re.sub(r'^\d+[.\-\s]*', '', file_title)
-                        # Check if the title part still has "artist - " pattern
-                        if re.match(r'^[^-]+\s*-\s*', title_part):
-                            # Title still has artist prefix, so we should rename it
-                            pass  # Continue with renaming
-                        else:
-                            # Title is already clean, skip renaming
-                            continue
+                    # Generate new filename using format data
+                    new_name_base = self._generate_filename_from_format(
+                        format_data, track_number, track_title, 
+                        audio_file, dir_path
+                    )
                     
-                    new_name = prefix + sanitized_title + extension
+                    if not new_name_base:
+                        continue  # Skip if generation failed
+                    
+                    new_name = new_name_base + extension
                     new_path = parent_dir / new_name
                     
                     # Rename file if new name is different
@@ -10153,26 +11044,12 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         messagebox.showinfo("About", about_text)
     
     def _show_customize_dialog(self, force_new=False):
-        """Show modal dialog to customize folder structure.
+        """Show modal dialog to customize folder structure using template system.
         
         Args:
             force_new: If True, open in "new structure" mode regardless of current selection.
         """
-        dialog = Toplevel(self.root)
-        dialog.title("Customize Folder Structure")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-        
-        # Center dialog
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 325
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 175
-        dialog.geometry(f"580x350+{x}+{y}")  # Wider to accommodate prefix/suffix separators + X button
-        dialog.resizable(False, False)
-        
-        # Configure dialog background
-        dialog.configure(bg='#1E1E1E')
+        dialog = self._create_dialog_base("Customize Folder Structure", 580, 350)
         
         # Main container for all content
         main_container = Frame(dialog, bg='#1E1E1E')
@@ -10191,157 +11068,315 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Instructions
         instructions = Label(
             main_container,
-            text="Drag to reorder • Add multiple fields per level • Max 4 levels",
+            text="Type a template using tags like Artist, Album, etc. Use / to separate folder levels",
             font=("Segoe UI", 8),
             bg='#1E1E1E',
             fg='#808080'
         )
         instructions.pack(pady=(0, 5))
         
-        # Container for levels (always show 4 slots)
-        levels_frame = Frame(main_container, bg='#2D2D30')  # Slightly lighter background for visibility
-        levels_frame.pack(fill=BOTH, expand=True, pady=(0, 5))  # Expand to show light grey space
+        # Template input section
+        template_frame = Frame(main_container, bg='#1E1E1E')
+        template_frame.pack(fill=X, pady=(0, 5))
         
-        # Live preview section - match main interface style
-        preview_frame = Frame(main_container, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
-        preview_frame.pack(fill=X, pady=(0, 5))
+        # Label row (horizontal frame for label + warning)
+        label_row = Frame(template_frame, bg='#1E1E1E')
+        label_row.pack(anchor=W, pady=(0, 3))
         
-        # Preview label prefix (white, Consolas font like main interface)
-        preview_label_prefix = Label(
-            preview_frame,
-            text="Preview:",
-            font=("Consolas", 8),
+        # Label for template input
+        template_label = Label(
+            label_row,
+            text="Folder structure:",
+            font=("Segoe UI", 9),
             bg='#1E1E1E',
-            fg='#D4D4D4',
-            justify='left'
+            fg='#D4D4D4'
         )
-        preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=4)
+        template_label.pack(side=LEFT)
         
-        # Preview path (blue, Consolas font like main interface)
-        dialog.preview_text = Label(
-            preview_frame,
-            text="",
-            font=("Consolas", 8),
+        # Template input field (Text widget for tag visualization)
+        template_text = Text(
+            template_frame,
+            font=("Segoe UI", 9),
+            bg='#252526',
+            fg='#CCCCCC',
+            insertbackground='#D4D4D4',
+            relief='flat',
+            borderwidth=1,
+            highlightthickness=2,
+            highlightbackground='#3E3E42',
+            highlightcolor='#007ACC',
+            height=3,
+            wrap=WORD,
+            padx=5,
+            pady=5
+        )
+        template_text.pack(fill=X, pady=(0, 8))
+        dialog.template_text = template_text
+        
+        # Add character filtering for folder (blocks: : * ? " < > |, allows \ /)
+        self._setup_folder_character_filter(dialog, template_text, template_frame)
+        
+        # Configure tag styling
+        template_text.tag_configure("tag", background='#007ACC', foreground='#FFFFFF', 
+                                   relief='flat', borderwidth=0, 
+                                   font=("Segoe UI", 9))
+        template_text.tag_configure("tag_bg", background='#007ACC', foreground='#FFFFFF')
+        
+        # Store tag positions for deletion handling
+        dialog.tag_positions = {}  # {tag_id: (start, end)}
+        
+        # Content history for undo/redo functionality
+        dialog.template_history = []  # List of content states
+        dialog.template_history_index = -1  # Current position in history (-1 = most recent)
+        dialog.template_save_timer = None  # Timer for debounced content state saving
+        
+        # Save initial state
+        initial_content = template_text.get('1.0', END).rstrip('\n')
+        dialog.template_history = [initial_content]
+        dialog.template_history_index = 0
+        
+        # Tag buttons section
+        tags_label = Label(
+            template_frame,
+            text="Quick insert:",
+            font=("Segoe UI", 8),
             bg='#1E1E1E',
-            fg="#2dacd5",  # Blue text like main interface
-            wraplength=530,  # Updated for 580px dialog width
-            justify='left',
-            anchor='w'
+            fg='#808080'
         )
-        dialog.preview_text.grid(row=0, column=1, sticky=W, padx=(0, 6), pady=4)
-        preview_frame.columnconfigure(1, weight=1)
+        tags_label.pack(anchor=W, pady=(0, 3))
         
-        # Store dialog and levels
-        dialog.custom_levels = []  # List of level frames (only filled ones)
-        dialog.level_slots = []  # List of all 4 slot frames (for fixed display)
-        dialog.dragging = None
-        dialog.drag_start_y = 0
-        dialog.levels_frame = levels_frame  # Store reference
+        # Container for tag buttons (will wrap using grid)
+        tags_container = Frame(template_frame, bg='#1E1E1E')
+        tags_container.pack(fill=X, pady=(0, 5))
+        
+        # Create tag buttons with wrapping (folder tags + "/" for level separator)
+        tag_order = ["Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number", "/"]
+        dialog.tag_buttons = []
+        max_cols = 4  # Number of buttons per row
+        for idx, tag in enumerate(tag_order):
+            row = idx // max_cols
+            col = idx % max_cols
+            # Special styling for "/" separator button
+            if tag == "/":
+                tag_btn = ttk.Button(
+                    tags_container,
+                    text=tag,
+                    width=4,
+                    command=lambda t=tag: self._insert_folder_tag_into_template(dialog, t)
+                )
+            else:
+                tag_btn = ttk.Button(
+                    tags_container,
+                    text=tag,
+                    width=len(tag) + 2,
+                    command=lambda t=tag: self._insert_folder_tag_into_template(dialog, t)
+                )
+            tag_btn.grid(row=row, column=col, padx=2, pady=2, sticky=W)
+            dialog.tag_buttons.append(tag_btn)
+        
+        # Live preview section
+        preview_frame, preview_text = self._create_preview_frame(main_container, wraplength=550)
+        dialog.preview_text = preview_text
+        
+        # Store dialog state
         dialog.editing_structure_index = None  # Track which structure is being edited (None = new structure)
+        dialog.editing_default_structure = False  # Track if editing a default structure
         
         # Load current structure if it's a custom one (unless force_new is True)
         current_value = self.folder_structure_var.get()
-        initial_structure = None
-        if not force_new and hasattr(self, 'custom_structures') and self.custom_structures:
-            # Check if current selection is a custom structure (not a standard structure)
+        initial_template = None  # Initialize to None, not empty string
+        
+        # Check if it's a default structure
+        found_default = False
+        if current_value in self.FOLDER_STRUCTURES.values():
+            # Find the key for this default
+            for key, value in self.FOLDER_STRUCTURES.items():
+                if value == current_value:
+                    if key in self.FOLDER_STRUCTURE_TEMPLATES:
+                        template_data = self.FOLDER_STRUCTURE_TEMPLATES[key]
+                        initial_template = template_data.get("template", "")  # Can be "" for Root Directory
+                        dialog.editing_default_structure = True
+                        found_default = True
+                        break
+        
+        # Check custom structures (old format - will be migrated)
+        # Only check if we haven't found a default structure yet
+        if not found_default and not force_new and hasattr(self, 'custom_structures') and self.custom_structures:
             if current_value not in self.FOLDER_STRUCTURES.values():
-                # This is a custom structure, find it using multiple strategies for robustness
-                found_match = False
-                
-                # Strategy 1: Try to get structure object directly from _extract_structure_choice
-                # and find it by reference (fastest and most reliable)
+                # This is a custom structure, find it
                 structure_choice = self._extract_structure_choice(current_value)
                 if isinstance(structure_choice, list):
-                    # Check if it's the same object reference as one in custom_structures
+                    # Migrate old format to template
+                    initial_template = self._migrate_structure_to_template(structure_choice)
+                    # Find index for editing
                     for idx, structure in enumerate(self.custom_structures):
-                        if structure is structure_choice:  # Identity comparison (same object)
-                            initial_structure = self._normalize_structure(structure)
-                            dialog.editing_structure_index = idx
-                            found_match = True
-                            break
-                
-                # Strategy 2: Match by formatted string (what user sees in dropdown)
-                if not found_match:
-                    for idx, structure in enumerate(self.custom_structures):
-                        formatted = self._format_custom_structure(structure)
-                        if formatted == current_value:
-                            initial_structure = self._normalize_structure(structure)
-                            dialog.editing_structure_index = idx
-                            found_match = True
-                            break
-                
-                # Strategy 3: Match by normalized structure content (deep comparison)
-                # This handles edge cases where formatting or references differ
-                if not found_match and isinstance(structure_choice, list):
-                    normalized_choice = self._normalize_structure(structure_choice)
-                    for idx, structure in enumerate(self.custom_structures):
-                        normalized_structure = self._normalize_structure(structure)
-                        # Compare normalized structures (deep comparison)
-                        if normalized_choice == normalized_structure:
-                            initial_structure = normalized_structure
+                        if structure is structure_choice or self._normalize_structure(structure) == self._normalize_structure(structure_choice):
                             dialog.editing_structure_index = idx
                             break
         
-        # Always create 4 fixed slots
-        # IMPORTANT: Create deep copies of structure items to prevent modifying originals in custom_structures
-        import copy
-        for i in range(4):
-            if initial_structure and i < len(initial_structure):
-                # Deep copy to prevent modifications from affecting the original structure
-                slot_value = copy.deepcopy(initial_structure[i])
-            else:
-                slot_value = None
-            self._create_level_slot(dialog, levels_frame, i, slot_value)
+        # Check custom structure templates (new format)
+        # Only check if we haven't found anything yet
+        if not found_default and initial_template is None and not force_new and hasattr(self, 'custom_structure_templates') and self.custom_structure_templates:
+            if current_value not in self.FOLDER_STRUCTURES.values():
+                # This is a custom template structure, find it
+                for idx, template_data in enumerate(self.custom_structure_templates):
+                    formatted = self._format_custom_structure_template(template_data)
+                    if formatted == current_value:
+                        initial_template = template_data.get("template", "")
+                        dialog.editing_structure_index = idx
+                        break
         
-        # Update preview after slots are created
-        self._update_preview(dialog)
+        # Set initial template
+        # initial_template can be None (not found), "" (Root Directory), or a string (other defaults/custom)
+        if initial_template is not None:  # None means not found, "" or string means found
+            template_text.insert('1.0', initial_template)
+        else:
+            # Default template (only if not editing a default and not found)
+            if not getattr(dialog, 'editing_default_structure', False):
+                template_text.insert('1.0', "Artist / Album")
         
-        # Force update to ensure slots are visible
-        levels_frame.update_idletasks()
-        dialog.update_idletasks()
+        # Process initial template to detect and style tags
+        self._process_folder_template_tags(dialog)
+        
+        # Debounce tag processing to avoid cursor issues
+        dialog.tag_process_timer = None
+        dialog.is_processing_tags = False
+        
+        def on_template_change(event=None):
+            # Don't process if we're already processing
+            if dialog.is_processing_tags:
+                return
+            
+            # Save content state for undo/redo immediately (for granular character-by-character undo)
+            self._save_folder_template_state(dialog, immediate=True)
+            
+            # Cancel previous timer
+            if dialog.tag_process_timer:
+                dialog.after_cancel(dialog.tag_process_timer)
+            
+            # Update preview immediately (doesn't need tag processing)
+            self._update_folder_preview(dialog)
+            self._check_folder_structure_changes(dialog)
+            
+            # Schedule tag processing after user stops typing (keep this debounced for performance)
+            dialog.tag_process_timer = dialog.after(300, lambda: self._process_folder_template_tags(dialog))
+        
+        template_text.bind('<KeyRelease>', on_template_change)
+        template_text.bind('<Button-1>', lambda e: dialog.after(200, lambda: self._process_folder_template_tags(dialog)))
+        
+        # Bind undo/redo keyboard shortcuts
+        template_text.bind('<Control-z>', lambda e: self._handle_folder_template_undo(dialog, e))
+        template_text.bind('<Control-Shift-Z>', lambda e: self._handle_folder_template_redo(dialog, e))
+        template_text.bind('<Control-y>', lambda e: self._handle_folder_template_redo(dialog, e))
+        
+        # Create right-click context menu for tag deletion
+        tag_context_menu = Menu(template_text, tearoff=0, bg='#252526', fg='#D4D4D4',
+                                activebackground='#3E3E42', activeforeground='#FFFFFF')
+        
+        def show_tag_context_menu(event):
+            """Show context menu when right-clicking on a tag."""
+            # Find which tag was clicked (if any)
+            click_pos = template_text.index(f"@{event.x},{event.y}")
+            clicked_tag_id = None
+            
+            for tag_id, (start_pos, end_pos) in dialog.tag_positions.items():
+                try:
+                    if template_text.compare(click_pos, ">=", start_pos) and template_text.compare(click_pos, "<=", end_pos):
+                        clicked_tag_id = tag_id
+                        break
+                except:
+                    pass
+            
+            # Clear existing menu items
+            tag_context_menu.delete(0, END)
+            
+            if clicked_tag_id:
+                # Add delete option for the clicked tag
+                tag_context_menu.add_command(
+                    label="Delete Tag",
+                    command=lambda tid=clicked_tag_id: self._remove_folder_tag_from_template(dialog, tid)
+                )
+                tag_context_menu.post(event.x_root, event.y_root)
+        
+        template_text.bind('<Button-3>', show_tag_context_menu)  # Right-click
+        
+        # Handle backspace/delete to remove entire tags
+        def handle_backspace(event):
+            # Process tags first to ensure positions are current
+            self._process_folder_template_tags(dialog)
+            
+            cursor_pos = template_text.index(INSERT)
+            # Check if cursor is inside or at the start of a tag
+            for tag_id, (start, end) in list(dialog.tag_positions.items()):
+                try:
+                    if template_text.compare(cursor_pos, ">=", start) and template_text.compare(cursor_pos, "<=", end):
+                        # Cursor is inside the tag, delete the entire tag
+                        self._remove_folder_tag_from_template(dialog, tag_id)
+                        return "break"
+                except:
+                    pass
+            return None
+        
+        def handle_delete(event):
+            # Process tags first to ensure positions are current
+            self._process_folder_template_tags(dialog)
+            
+            cursor_pos = template_text.index(INSERT)
+            # Check if cursor is inside or at the start of a tag
+            for tag_id, (start, end) in list(dialog.tag_positions.items()):
+                try:
+                    if template_text.compare(cursor_pos, ">=", start) and template_text.compare(cursor_pos, "<=", end):
+                        # Cursor is inside the tag, delete the entire tag
+                        self._remove_folder_tag_from_template(dialog, tag_id)
+                        return "break"
+                except:
+                    pass
+            return None
+        
+        template_text.bind('<BackSpace>', handle_backspace, add='+')
+        template_text.bind('<Delete>', handle_delete, add='+')
+        
+        # Initial preview update
+        self._update_folder_preview(dialog)
         
         # Buttons frame
         buttons_frame = Frame(main_container, bg='#1E1E1E')
-        buttons_frame.pack(pady=(3, 5))  # Add bottom padding so buttons aren't cut off
+        buttons_frame.pack(pady=(3, 5))
         
         # Show different buttons when editing existing structure vs creating new
         if dialog.editing_structure_index is not None:
             # Editing existing structure - show multiple options
-            # Create New button
-            create_new_btn = ttk.Button(
-                buttons_frame,
-                text="Create New",
-                command=lambda: self._create_new_structure_in_dialog(dialog)
-            )
-            create_new_btn.pack(side=LEFT, padx=5)
-            
             # Update Existing button (primary action) - initially disabled
             update_btn = ttk.Button(
                 buttons_frame,
-                text="Save Existing",
-                command=lambda: self._save_custom_structure_from_dialog(dialog, update_existing=True),
+                text="Overwrite Existing",
+                command=lambda: self._save_custom_folder_structure_from_dialog(dialog, update_existing=True),
                 state='disabled'
             )
             update_btn.pack(side=LEFT, padx=5)
-            dialog.update_btn = update_btn  # Store reference
+            dialog.update_btn = update_btn
             
             # Save As New button - initially disabled
             save_as_new_btn = ttk.Button(
                 buttons_frame,
                 text="Save As New",
-                command=lambda: self._save_custom_structure_from_dialog(dialog, update_existing=False),
+                command=lambda: self._save_custom_folder_structure_from_dialog(dialog, update_existing=False),
                 state='disabled'
             )
             save_as_new_btn.pack(side=LEFT, padx=5)
-            dialog.save_as_new_btn = save_as_new_btn  # Store reference
+            dialog.save_as_new_btn = save_as_new_btn
         else:
-            # Creating new structure - show simple Save button
+            # Creating new structure or editing default - show simple Save button
+            # If editing default, disable until changes are made
+            save_btn_state = 'disabled' if getattr(dialog, 'editing_default_structure', False) else 'normal'
             save_btn = ttk.Button(
                 buttons_frame,
                 text="Save Structure",
-                command=lambda: self._save_custom_structure_from_dialog(dialog, update_existing=False)
+                command=lambda: self._save_custom_folder_structure_from_dialog(dialog, update_existing=False),
+                state=save_btn_state
             )
             save_btn.pack(side=LEFT, padx=5)
+            dialog.save_btn = save_btn  # Store reference for enabling/disabling
         
         # Cancel button (always shown)
         cancel_btn = ttk.Button(
@@ -10351,12 +11386,473 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         )
         cancel_btn.pack(side=LEFT, padx=5)
         
-        # Store initial structure state for change detection (after dialog is fully set up)
-        if dialog.editing_structure_index is not None:
-            dialog.initial_structure = self._get_structure_from_dialog(dialog)
+        # Store initial template state for change detection (after dialog is fully set up)
+        if dialog.editing_structure_index is not None or getattr(dialog, 'editing_default_structure', False):
+            dialog.initial_template = template_text.get('1.0', END).strip()
         
         # Close on ESC
         dialog.bind('<Escape>', lambda e: dialog.destroy())
+        
+        # Focus template text
+        template_text.focus_set()
+        
+        # Monitor changes to enable/disable buttons
+        dialog.after(100, lambda: self._check_folder_structure_changes(dialog))
+    
+    def _process_folder_template_tags(self, dialog):
+        """Process folder template text to detect and style tags.
+        Similar to _process_template_tags but uses FOLDER_TAG_NAMES.
+        """
+        if not hasattr(dialog, 'template_text'):
+            return
+        
+        # Set flag to prevent re-entry
+        if hasattr(dialog, 'is_processing_tags') and dialog.is_processing_tags:
+            return
+        
+        dialog.is_processing_tags = True
+        
+        try:
+            text_widget = dialog.template_text
+            
+            # Get current cursor position to restore later
+            try:
+                cursor_pos = text_widget.index(INSERT)
+            except:
+                cursor_pos = '1.0'
+            
+            # Get the current text content
+            content = text_widget.get('1.0', END).rstrip('\n')
+            
+            # Clear all existing tag styling
+            for tag_id in list(dialog.tag_positions.keys()):
+                try:
+                    text_widget.tag_delete(f"tag_{tag_id}")
+                except:
+                    pass
+            dialog.tag_positions.clear()
+            
+            # Find all tags by matching known tag names (without curly brackets)
+            # Also match "/" and "\" as separator tags
+            # Match whole words only to avoid partial matches
+            import re
+            matches = []
+            
+            # Sort tag names by length (longest first) to match "Album Artist" before "Album"
+            tag_names_sorted = sorted(self.FOLDER_TAG_NAMES, key=len, reverse=True)
+            
+            # Build regex pattern for whole word matching
+            pattern_parts = []
+            for tag_name in tag_names_sorted:
+                escaped = re.escape(tag_name)
+                if ' ' in tag_name:
+                    pattern_parts.append(rf'\b{escaped}\b')
+                else:
+                    pattern_parts.append(rf'\b{escaped}\b')
+            
+            # Add separator characters as tags (escape them for regex)
+            pattern_parts.append(r'/')  # Forward slash
+            pattern_parts.append(r'\\')  # Backslash (escaped)
+            
+            # Combine patterns with alternation
+            pattern = '|'.join(pattern_parts)
+            
+            # Find all matches
+            all_matches = list(re.finditer(pattern, content, re.IGNORECASE))
+            
+            # Filter out overlapping matches (prefer longer matches)
+            valid_matches = []
+            used_ranges = []
+            for match in sorted(all_matches, key=lambda m: (m.end() - m.start(), m.start()), reverse=True):
+                start, end = match.span()
+                overlaps = False
+                for used_start, used_end in used_ranges:
+                    if not (end <= used_start or start >= used_end):
+                        overlaps = True
+                        break
+                if not overlaps:
+                    valid_matches.append(match)
+                    used_ranges.append((start, end))
+            
+            # Sort matches by position
+            valid_matches.sort(key=lambda m: m.start())
+            matches = valid_matches
+            
+            if not matches:
+                # No tags found, just restore cursor
+                try:
+                    text_widget.mark_set(INSERT, cursor_pos)
+                    text_widget.see(INSERT)
+                except:
+                    pass
+                return
+            
+            # Process matches and style them
+            for match in matches:
+                start_idx = match.start()
+                end_idx = match.end()
+                tag_text = match.group(0)
+                tag_name = tag_text
+                
+                # Convert character positions to line.column format
+                start_pos = text_widget.index(f'1.0 + {start_idx} chars')
+                end_pos = text_widget.index(f'1.0 + {end_idx} chars')
+                
+                # Store tag position
+                tag_id = f"{start_idx}_{end_idx}"
+                dialog.tag_positions[tag_id] = (start_pos, end_pos)
+                
+                # Style the tag text
+                text_widget.tag_add(f"tag_{tag_id}", start_pos, end_pos)
+                text_widget.tag_config(f"tag_{tag_id}", 
+                                     background='#007ACC', 
+                                     foreground='#FFFFFF',
+                                     font=("Segoe UI", 9, "bold"),
+                                     relief='flat',
+                                     borderwidth=0)
+            
+            # Restore cursor position
+            try:
+                text_widget.mark_set(INSERT, cursor_pos)
+                text_widget.see(INSERT)
+            except:
+                pass
+        finally:
+            # Clear processing flag
+            dialog.is_processing_tags = False
+    
+    def _insert_folder_tag_into_template(self, dialog, tag):
+        """Insert a tag into the folder template text at cursor position."""
+        if not hasattr(dialog, 'template_text'):
+            return
+        
+        text_widget = dialog.template_text
+        cursor_pos = text_widget.index(INSERT)
+        
+        # Get text before and after cursor to check if we need a space
+        text_before = text_widget.get('1.0', cursor_pos)
+        text_after = text_widget.get(cursor_pos, END)
+        
+        # For "/" separator, add spaces around it
+        if tag == "/":
+            space_before = " " if text_before and not text_before[-1].isspace() else ""
+            space_after = " " if text_after and len(text_after) > 1 and not text_after[0].isspace() else ""
+            insert_text = space_before + tag + space_after
+        else:
+            # For regular tags, add space before if needed
+            space_before = " " if text_before and not text_before[-1].isspace() and text_before[-1] != "/" else ""
+            space_after = " " if text_after and len(text_after) > 1 and not text_after[0].isspace() and text_after[0] != "/" else ""
+            insert_text = space_before + tag + space_after
+        
+        # Insert tag with proper spacing
+        text_widget.insert(cursor_pos, insert_text)
+        
+        # Move cursor after inserted tag
+        new_cursor_pos = text_widget.index(f"{cursor_pos} + {len(insert_text)} chars")
+        text_widget.mark_set(INSERT, new_cursor_pos)
+        text_widget.see(INSERT)
+        
+        # Save content state before inserting tag
+        self._save_folder_template_state(dialog, immediate=True)
+        
+        # Process tags immediately to style the new one
+        self._process_folder_template_tags(dialog)
+        
+        # Update preview
+        self._update_folder_preview(dialog)
+        
+        # Check for changes to enable/disable save button
+        self._check_folder_structure_changes(dialog)
+    
+    def _remove_folder_tag_from_template(self, dialog, tag_id):
+        """Remove a tag from the folder template when backspace/delete is used or right-click delete."""
+        if tag_id not in dialog.tag_positions:
+            return
+        
+        start_pos, end_pos = dialog.tag_positions[tag_id]
+        text_widget = dialog.template_text
+        
+        # Delete the tag text
+        try:
+            text_widget.delete(start_pos, end_pos)
+        except:
+            return
+        
+        # Clean up references
+        if tag_id in dialog.tag_positions:
+            del dialog.tag_positions[tag_id]
+        
+        # Set cursor to where tag was
+        try:
+            text_widget.mark_set(INSERT, start_pos)
+            text_widget.see(INSERT)
+        except:
+            pass
+        
+        # Reprocess tags to update styling
+        self._process_folder_template_tags(dialog)
+        self._update_folder_preview(dialog)
+        self._check_folder_structure_changes(dialog)
+        
+        # Focus back to text widget
+        text_widget.focus_set()
+    
+    def _save_folder_template_state(self, dialog, immediate=False, debounce_ms=50):
+        """Save current folder template content state to history for undo/redo."""
+        if not hasattr(dialog, 'template_text') or not hasattr(dialog, 'template_history'):
+            return
+        
+        def save_state():
+            try:
+                # Get current content
+                current_content = dialog.template_text.get('1.0', END).rstrip('\n')
+                
+                # Only save if content is different from current history position
+                if (dialog.template_history_index < 0 or 
+                    dialog.template_history_index >= len(dialog.template_history) or
+                    dialog.template_history[dialog.template_history_index] != current_content):
+                    
+                    # Remove any future history (if we're not at the end)
+                    if dialog.template_history_index < len(dialog.template_history) - 1:
+                        dialog.template_history = dialog.template_history[:dialog.template_history_index + 1]
+                    
+                    # Add new state
+                    dialog.template_history.append(current_content)
+                    dialog.template_history_index = len(dialog.template_history) - 1
+                    
+                    # Limit history size (keep last 100 states)
+                    if len(dialog.template_history) > 100:
+                        dialog.template_history = dialog.template_history[-100:]
+                        dialog.template_history_index = len(dialog.template_history) - 1
+            except Exception:
+                pass
+        
+        if immediate:
+            # Cancel any pending timer and save immediately
+            if dialog.template_save_timer:
+                dialog.after_cancel(dialog.template_save_timer)
+                dialog.template_save_timer = None
+            save_state()
+        else:
+            # Debounce the save
+            if dialog.template_save_timer:
+                dialog.after_cancel(dialog.template_save_timer)
+            dialog.template_save_timer = dialog.after(debounce_ms, save_state)
+    
+    def _handle_folder_template_undo(self, dialog, event):
+        """Handle undo (Ctrl+Z) in folder template Text widget."""
+        if event.state & 0x1:  # Shift key is pressed
+            return self._handle_folder_template_redo(dialog, event)
+        
+        if not hasattr(dialog, 'template_history') or not dialog.template_history or not hasattr(dialog, 'template_text'):
+            return "break"
+        
+        # Cancel any pending timers
+        if dialog.tag_process_timer:
+            dialog.after_cancel(dialog.tag_process_timer)
+            dialog.tag_process_timer = None
+        if dialog.template_save_timer:
+            dialog.after_cancel(dialog.template_save_timer)
+            dialog.template_save_timer = None
+        
+        # Save current content to history before undoing
+        self._save_folder_template_state(dialog, immediate=True)
+        
+        # Move back in history
+        if dialog.template_history_index > 0:
+            dialog.template_history_index -= 1
+            previous_content = dialog.template_history[dialog.template_history_index]
+            
+            # Replace current content with previous state
+            dialog.template_text.delete(1.0, END)
+            dialog.template_text.insert(1.0, previous_content)
+            
+            # Process tags and update preview
+            self._process_folder_template_tags(dialog)
+            self._update_folder_preview(dialog)
+            self._check_folder_structure_changes(dialog)
+        else:
+            # At the beginning of history
+            if dialog.template_history and dialog.template_history[0] != "":
+                dialog.template_history.insert(0, "")
+                dialog.template_history_index = 0
+            elif not dialog.template_history:
+                dialog.template_history = [""]
+                dialog.template_history_index = 0
+            
+            # Clear the field
+            dialog.template_text.delete(1.0, END)
+            self._process_folder_template_tags(dialog)
+            self._update_folder_preview(dialog)
+            self._check_folder_structure_changes(dialog)
+        
+        return "break"
+    
+    def _handle_folder_template_redo(self, dialog, event):
+        """Handle redo (Ctrl+Shift+Z or Ctrl+Y) in folder template Text widget."""
+        if not hasattr(dialog, 'template_history') or not dialog.template_history or not hasattr(dialog, 'template_text'):
+            return "break"
+        
+        # Cancel any pending timers
+        if dialog.tag_process_timer:
+            dialog.after_cancel(dialog.tag_process_timer)
+            dialog.tag_process_timer = None
+        if dialog.template_save_timer:
+            dialog.after_cancel(dialog.template_save_timer)
+            dialog.template_save_timer = None
+        
+        # Save current content to history before redoing
+        self._save_folder_template_state(dialog, immediate=True)
+        
+        # Move forward in history
+        if dialog.template_history_index < len(dialog.template_history) - 1:
+            dialog.template_history_index += 1
+            next_content = dialog.template_history[dialog.template_history_index]
+            
+            # Replace current content with next state
+            dialog.template_text.delete(1.0, END)
+            dialog.template_text.insert(1.0, next_content)
+            
+            # Process tags and update preview
+            self._process_folder_template_tags(dialog)
+            self._update_folder_preview(dialog)
+            self._check_folder_structure_changes(dialog)
+        
+        return "break"
+    
+    def _update_folder_preview(self, dialog):
+        """Update preview text in folder dialog."""
+        if not hasattr(dialog, 'preview_text') or not hasattr(dialog, 'template_text'):
+            return
+        
+        template = dialog.template_text.get('1.0', END).strip()
+        if not template:
+            dialog.preview_text.config(text="")
+            return
+        
+        # Generate preview using template (preview_mode=True shows field names)
+        base_path = Path(self.path_var.get() if self.path_var.get() else "Downloads")
+        path_parts = self._generate_path_from_template(template, preview_mode=True)
+        if path_parts:
+            path_parts = [str(base_path)] + path_parts + ["Track.mp3"]
+            preview_path = "\\".join(path_parts)
+        else:
+            preview_path = str(base_path / "Track.mp3")
+        
+        dialog.preview_text.config(text=preview_path)
+    
+    def _check_folder_structure_changes(self, dialog):
+        """Check if folder structure template has changed and enable/disable save buttons accordingly."""
+        if not hasattr(dialog, 'template_text'):
+            return
+        
+        current_template = dialog.template_text.get('1.0', END).strip()
+        initial_template = getattr(dialog, 'initial_template', "")
+        
+        has_changes = current_template != initial_template
+        
+        # Enable/disable buttons based on changes
+        if hasattr(dialog, 'update_btn') and hasattr(dialog, 'save_as_new_btn'):
+            # Editing existing structure
+            if has_changes:
+                dialog.update_btn.config(state='normal')
+                dialog.save_as_new_btn.config(state='normal')
+            else:
+                dialog.update_btn.config(state='disabled')
+                dialog.save_as_new_btn.config(state='disabled')
+        elif hasattr(dialog, 'save_btn'):
+            # Creating new or editing default
+            if has_changes or not getattr(dialog, 'editing_default_structure', False):
+                dialog.save_btn.config(state='normal')
+            else:
+                dialog.save_btn.config(state='disabled')
+    
+    def _format_custom_structure_template(self, template_data):
+        """Format a custom folder structure template for display."""
+        if not isinstance(template_data, dict) or "template" not in template_data:
+            return ""
+        template = template_data.get("template", "").strip()
+        if not template:
+            return ""
+        # For display, just return the template as-is (it's already readable)
+        return template
+    
+    def _save_custom_folder_structure_from_dialog(self, dialog, update_existing=False):
+        """Save the custom folder structure from the dialog (template-based)."""
+        if not hasattr(dialog, 'template_text'):
+            return
+        
+        template = dialog.template_text.get('1.0', END).strip()
+        # Allow empty template for Root Directory (empty string is valid)
+        # Only reject if template is None (shouldn't happen) or if it's not a default being edited
+        if template is None:
+            messagebox.showwarning("Invalid Structure", "Please enter a folder structure template.")
+            return
+        
+        # Create template data structure
+        template_data = {"template": template}
+        
+        # Format for display
+        formatted = self._format_custom_structure_template(template_data)
+        
+        # Check for duplicates (compare against all existing structures)
+        # First check default structures (but allow if editing a default - user can create a custom copy)
+        is_editing_default = getattr(dialog, 'editing_default_structure', False)
+        if not is_editing_default:
+            for key, default_template_data in self.FOLDER_STRUCTURE_TEMPLATES.items():
+                if default_template_data.get("template", "").strip() == template:
+                    messagebox.showwarning("Duplicate Structure", f"This structure already exists as a default option.")
+                    return
+        
+        # Check custom structure templates
+        if hasattr(self, 'custom_structure_templates'):
+            for existing_template_data in self.custom_structure_templates:
+                if existing_template_data.get("template", "").strip() == template:
+                    if not update_existing or dialog.editing_structure_index is None:
+                        messagebox.showwarning("Duplicate Structure", f"This structure already exists.\n\nPlease create a different structure.")
+                        return
+        
+        # Determine if we should update existing or save as new
+        editing_index = getattr(dialog, 'editing_structure_index', None)
+        
+        if update_existing and editing_index is not None and hasattr(self, 'custom_structure_templates') and 0 <= editing_index < len(self.custom_structure_templates):
+            # Update existing template structure
+            self.custom_structure_templates[editing_index] = template_data
+        else:
+            # Create new template structure
+            if not hasattr(self, 'custom_structure_templates'):
+                self.custom_structure_templates = []
+            self.custom_structure_templates.append(template_data)
+        
+        # Save settings
+        self._save_custom_structure_templates()
+        
+        # Update dropdown
+        self._update_structure_dropdown()
+        
+        # Select this structure in dropdown
+        self.folder_structure_var.set(formatted)
+        
+        # Save the selection to persist it across sessions
+        self._save_settings()
+        
+        # Update preview
+        self.update_preview()
+        
+        # Close dialog (always close, even if there were errors above)
+        try:
+            dialog.destroy()
+        except:
+            pass
+    
+    def _save_custom_structure_templates(self):
+        """Save custom folder structure templates to settings."""
+        settings = self._load_settings()
+        if hasattr(self, 'custom_structure_templates'):
+            settings["custom_structure_templates"] = self.custom_structure_templates
+        else:
+            settings["custom_structure_templates"] = []
+        self._save_settings(settings)
     
     def _create_level_slot(self, dialog, parent_frame, slot_index, initial_value=None):
         """Create a level slot - either filled with a level or empty with + Add Level button."""
@@ -10697,10 +12193,23 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             separators[separator_index] = new_separator  # Preserve spaces as-is
         
         level_data["separators"] = separators
-        self._update_preview(dialog)
+        
+        # Update appropriate preview based on dialog type
+        # Filename dialog has editing_format_index, folder dialog has level_slots
+        if hasattr(dialog, 'editing_format_index'):
+            # Filename format dialog
+            self._update_filename_preview(dialog)
+        else:
+            # Folder structure dialog
+            self._update_preview(dialog)
         
         # Check for changes and update button states
-        self._check_structure_changes(dialog)
+        if hasattr(dialog, 'editing_format_index'):
+            # Filename format dialog
+            self._check_filename_changes(dialog)
+        else:
+            # Folder structure dialog
+            self._check_structure_changes(dialog)
     
     def _validate_separator_input(self, dialog, slot_frame, separator_index, separator_var, separator_entry):
         """Validate separator input: max 5 chars, no invalid Windows filesystem characters."""
@@ -11332,8 +12841,11 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         dialog.destroy()
     
     def _show_manage_dialog(self):
-        """Show modal dialog to manage custom folder structures."""
-        if not hasattr(self, 'custom_structures') or not self.custom_structures:
+        """Show modal dialog to manage custom folder structures (templates and old format)."""
+        has_templates = hasattr(self, 'custom_structure_templates') and self.custom_structure_templates
+        has_old_structures = hasattr(self, 'custom_structures') and self.custom_structures
+        
+        if not has_templates and not has_old_structures:
             messagebox.showinfo("No Custom Structures", "No custom folder structures have been saved yet.\n\nCreate one using the Customize button (🎨).")
             return
         
@@ -11367,30 +12879,60 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         list_frame.pack(pady=10, padx=20, fill=BOTH, expand=True)
         
         # Create list of structures with delete buttons
-        for structure in self.custom_structures:
-            structure_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
-            structure_frame.pack(fill=X, pady=2, padx=5)
-            
-            # Structure label
-            formatted = self._format_custom_structure(structure)
-            structure_label = Label(
-                structure_frame,
-                text=formatted,
-                font=("Segoe UI", 9),
-                bg='#1E1E1E',
-                fg='#D4D4D4',
-                anchor=W
-            )
-            structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
-            
-            # Delete button
-            delete_btn = ttk.Button(
-                structure_frame,
-                text="X",
-                width=3,
-                command=lambda s=structure: self._delete_custom_structure(dialog, s)
-            )
-            delete_btn.pack(side=RIGHT, padx=5)
+        # Order matches dropdown menu: old format first, then templates (newest at end)
+        # First show old format structures
+        if has_old_structures:
+            for structure in self.custom_structures:
+                structure_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+                structure_frame.pack(fill=X, pady=2, padx=5)
+                
+                # Structure label
+                formatted = self._format_custom_structure(structure)
+                structure_label = Label(
+                    structure_frame,
+                    text=formatted,
+                    font=("Segoe UI", 9),
+                    bg='#1E1E1E',
+                    fg='#D4D4D4',
+                    anchor=W
+                )
+                structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
+                
+                # Delete button
+                delete_btn = ttk.Button(
+                    structure_frame,
+                    text="X",
+                    width=3,
+                    command=lambda s=structure: self._delete_custom_structure(dialog, s)
+                )
+                delete_btn.pack(side=RIGHT, padx=5)
+        
+        # Then show template structures (new format) - newest at end
+        if has_templates:
+            for template_data in self.custom_structure_templates:
+                structure_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+                structure_frame.pack(fill=X, pady=2, padx=5)
+                
+                # Structure label
+                formatted = self._format_custom_structure_template(template_data)
+                structure_label = Label(
+                    structure_frame,
+                    text=formatted,
+                    font=("Segoe UI", 9),
+                    bg='#1E1E1E',
+                    fg='#D4D4D4',
+                    anchor=W
+                )
+                structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
+                
+                # Delete button
+                delete_btn = ttk.Button(
+                    structure_frame,
+                    text="X",
+                    width=3,
+                    command=lambda t=template_data: self._delete_custom_folder_structure_template(dialog, t)
+                )
+                delete_btn.pack(side=RIGHT, padx=5)
         
         # Close button
         close_btn = ttk.Button(
@@ -11427,11 +12969,1471 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 self.update_preview()
             
             # Rebuild dialog if structures remain, otherwise close
-            if self.custom_structures:
+            has_remaining = (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates) or self.custom_structures
+            if has_remaining:
                 dialog.destroy()
                 self._show_manage_dialog()  # Reopen with updated list
             else:
                 dialog.destroy()
+    
+    def _delete_custom_folder_structure_template(self, dialog, template_data):
+        """Delete a custom folder structure template."""
+        if hasattr(self, 'custom_structure_templates') and template_data in self.custom_structure_templates:
+            # Check if this is the currently selected structure
+            formatted = self._format_custom_structure_template(template_data)
+            current_value = self.folder_structure_var.get()
+            
+            # Remove from list
+            self.custom_structure_templates.remove(template_data)
+            
+            # Save settings
+            self._save_custom_structure_templates()
+            
+            # Update dropdown
+            self._update_structure_dropdown()
+            
+            # If deleted structure was selected, switch to default
+            if current_value == formatted:
+                default_display = self.FOLDER_STRUCTURES.get(self.DEFAULT_STRUCTURE, "Artist / Album")
+                self.folder_structure_var.set(default_display)
+                # Menu button text is automatically updated via textvariable binding
+                self.update_preview()
+            
+            # Rebuild dialog if structures remain, otherwise close
+            has_remaining = (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates) or (hasattr(self, 'custom_structures') and self.custom_structures)
+            if has_remaining:
+                dialog.destroy()
+                self._show_manage_dialog()  # Reopen with updated list
+            else:
+                dialog.destroy()
+    
+    # ============================================================================
+    # FILENAME FORMAT DIALOG METHODS
+    # ============================================================================
+    def _show_customize_filename_dialog(self, force_new=False):
+        """Show modal dialog to customize filename format using template system.
+        
+        Args:
+            force_new: If True, open in "new format" mode regardless of current selection.
+        """
+        dialog = self._create_dialog_base("Customize Filename Format", 580, 350)
+        
+        # Main container for all content
+        main_container = Frame(dialog, bg='#1E1E1E')
+        main_container.pack(fill=BOTH, expand=True, padx=10, pady=5)
+        
+        # Title
+        title_label = Label(
+            main_container,
+            text="Customize Filename Format",
+            font=("Segoe UI", 10, "bold"),
+            bg='#1E1E1E',
+            fg='#D4D4D4'
+        )
+        title_label.pack(pady=(3, 2))
+        
+        # Instructions
+        instructions = Label(
+            main_container,
+            text="Type a template using tags like 01, Track, Artist, etc. (tags are automatically detected)",
+            font=("Segoe UI", 8),
+            bg='#1E1E1E',
+            fg='#808080'
+        )
+        instructions.pack(pady=(0, 5))
+        
+        # Template input section
+        template_frame = Frame(main_container, bg='#1E1E1E')
+        template_frame.pack(fill=X, pady=(0, 5))
+        
+        # Label row (horizontal frame for label + warning)
+        label_row = Frame(template_frame, bg='#1E1E1E')
+        label_row.pack(anchor=W, pady=(0, 3))
+        
+        # Label for template input
+        template_label = Label(
+            label_row,
+            text="Filename format:",
+            font=("Segoe UI", 9),
+            bg='#1E1E1E',
+            fg='#D4D4D4'
+        )
+        template_label.pack(side=LEFT)
+        
+        # Template input field (Text widget for tag visualization)
+        template_text = Text(
+            template_frame,
+            font=("Segoe UI", 9),
+            bg='#252526',
+            fg='#CCCCCC',
+            insertbackground='#D4D4D4',
+            relief='flat',
+            borderwidth=1,
+            highlightthickness=2,
+            highlightbackground='#3E3E42',
+            highlightcolor='#007ACC',
+            height=3,
+            wrap=WORD,
+            padx=5,
+            pady=5
+        )
+        template_text.pack(fill=X, pady=(0, 8))
+        dialog.template_text = template_text
+        
+        # Add character filtering for filename (blocks: \ / : * ? " < > |)
+        self._setup_filename_character_filter(dialog, template_text, template_frame)
+        
+        # Configure tag styling
+        template_text.tag_configure("tag", background='#007ACC', foreground='#FFFFFF', 
+                                   relief='flat', borderwidth=0, 
+                                   font=("Segoe UI", 9))
+        template_text.tag_configure("tag_bg", background='#007ACC', foreground='#FFFFFF')
+        
+        # Store tag positions for deletion handling
+        dialog.tag_positions = {}  # {tag_id: (start, end)}
+        
+        # Content history for undo/redo functionality
+        dialog.template_history = []  # List of content states
+        dialog.template_history_index = -1  # Current position in history (-1 = most recent)
+        dialog.template_save_timer = None  # Timer for debounced content state saving
+        
+        # Save initial state
+        initial_content = template_text.get('1.0', END).rstrip('\n')
+        dialog.template_history = [initial_content]
+        dialog.template_history_index = 0
+        
+        # Tag buttons section
+        tags_label = Label(
+            template_frame,
+            text="Quick insert:",
+            font=("Segoe UI", 8),
+            bg='#1E1E1E',
+            fg='#808080'
+        )
+        tags_label.pack(anchor=W, pady=(0, 3))
+        
+        # Container for tag buttons (will wrap using grid)
+        tags_container = Frame(template_frame, bg='#1E1E1E')
+        tags_container.pack(fill=X, pady=(0, 5))
+        
+        # Create tag buttons with wrapping (no curly brackets)
+        tag_order = ["01", "1", "Track", "Artist", "Album", "Year", "Genre", "Label", "Album Artist", "Catalog Number"]
+        dialog.tag_buttons = []
+        max_cols = 5  # Number of buttons per row
+        for idx, tag in enumerate(tag_order):
+            row = idx // max_cols
+            col = idx % max_cols
+            tag_btn = ttk.Button(
+                tags_container,
+                text=tag,
+                width=len(tag) + 2,
+                command=lambda t=tag: self._insert_tag_into_template(dialog, t)
+            )
+            tag_btn.grid(row=row, column=col, padx=2, pady=2, sticky=W)
+            dialog.tag_buttons.append(tag_btn)
+        
+        # Live preview section
+        preview_frame, preview_text = self._create_preview_frame(main_container, wraplength=550)
+        dialog.preview_text = preview_text
+        
+        # Store dialog state
+        dialog.editing_format_index = None  # Track which format is being edited (None = new format)
+        dialog.editing_default_format = False  # Track if editing a default format
+        
+        # Load current format if it's a custom one (unless force_new is True)
+        current_value = self.numbering_var.get()
+        initial_template = ""
+        if not force_new and hasattr(self, 'custom_filename_formats') and self.custom_filename_formats:
+            # Check if current selection is a custom format (not a standard format)
+            if current_value not in ["Track", "01. Track", "Artist - Track", "01. Artist - Track"]:
+                # This is a custom format, find it
+                for idx, format_data in enumerate(self.custom_filename_formats):
+                    formatted = self._format_custom_filename(format_data)
+                    if formatted == current_value:
+                        normalized = self._normalize_filename_format(format_data)
+                        if normalized:
+                            initial_template = normalized.get("template", "")
+                            dialog.editing_format_index = idx
+                            break
+        
+        # If no custom format found, check if it's a default format
+        if not initial_template and current_value in self.FILENAME_FORMATS:
+            format_data = self.FILENAME_FORMATS[current_value]
+            if format_data:
+                initial_template = format_data.get("template", "")
+                dialog.editing_default_format = True  # Mark that we're editing a default format
+        
+        # Set initial template
+        if initial_template:
+            # Remove curly brackets if present (for backward compatibility)
+            import re
+            initial_template = re.sub(r'\{([^}]+)\}', r'\1', initial_template)
+            template_text.insert('1.0', initial_template)
+        else:
+            # Default template (no curly brackets)
+            template_text.insert('1.0', "01. Track")
+        
+        # Process initial template to detect and style tags
+        self._process_template_tags(dialog)
+        
+        # Debounce tag processing to avoid cursor issues
+        dialog.tag_process_timer = None
+        dialog.is_processing_tags = False
+        
+        def on_template_change(event=None):
+            # Don't process if we're already processing
+            if dialog.is_processing_tags:
+                return
+            
+            # Save content state for undo/redo immediately (for granular character-by-character undo)
+            # Save immediately to capture each character change precisely
+            self._save_template_state(dialog, immediate=True)
+            
+            # Cancel previous timer
+            if dialog.tag_process_timer:
+                dialog.after_cancel(dialog.tag_process_timer)
+            
+            # Update preview immediately (doesn't need tag processing)
+            self._update_filename_preview(dialog)
+            self._check_filename_changes(dialog)
+            
+            # Schedule tag processing after user stops typing (keep this debounced for performance)
+            dialog.tag_process_timer = dialog.after(300, lambda: self._process_template_tags(dialog))
+        
+        template_text.bind('<KeyRelease>', on_template_change)
+        template_text.bind('<Button-1>', lambda e: dialog.after(200, lambda: self._process_template_tags(dialog)))
+        
+        # Bind undo/redo keyboard shortcuts
+        template_text.bind('<Control-z>', lambda e: self._handle_template_undo(dialog, e))
+        template_text.bind('<Control-Shift-Z>', lambda e: self._handle_template_redo(dialog, e))
+        template_text.bind('<Control-y>', lambda e: self._handle_template_redo(dialog, e))
+        
+        # Create right-click context menu for tag deletion
+        tag_context_menu = Menu(template_text, tearoff=0, bg='#252526', fg='#D4D4D4',
+                                activebackground='#3E3E42', activeforeground='#FFFFFF')
+        
+        def show_tag_context_menu(event):
+            """Show context menu when right-clicking on a tag."""
+            # Find which tag was clicked (if any)
+            click_pos = template_text.index(f"@{event.x},{event.y}")
+            clicked_tag_id = None
+            
+            for tag_id, (start_pos, end_pos) in dialog.tag_positions.items():
+                try:
+                    if template_text.compare(click_pos, ">=", start_pos) and template_text.compare(click_pos, "<=", end_pos):
+                        clicked_tag_id = tag_id
+                        break
+                except:
+                    pass
+            
+            # Clear existing menu items
+            tag_context_menu.delete(0, END)
+            
+            if clicked_tag_id:
+                # Add delete option for the clicked tag
+                tag_context_menu.add_command(
+                    label="Delete Tag",
+                    command=lambda tid=clicked_tag_id: self._remove_tag_from_template(dialog, tid)
+                )
+                tag_context_menu.post(event.x_root, event.y_root)
+        
+        template_text.bind('<Button-3>', show_tag_context_menu)  # Right-click
+        
+        # Handle backspace/delete to remove entire tags
+        def handle_backspace(event):
+            # Process tags first to ensure positions are current
+            self._process_template_tags(dialog)
+            
+            cursor_pos = template_text.index(INSERT)
+            # Check if cursor is inside or at the start of a tag
+            for tag_id, (start, end) in list(dialog.tag_positions.items()):
+                # Compare positions: check if cursor is between start and end
+                try:
+                    if template_text.compare(cursor_pos, ">=", start) and template_text.compare(cursor_pos, "<=", end):
+                        # Cursor is inside the tag, delete the entire tag
+                        self._remove_tag_from_template(dialog, tag_id)
+                        return "break"
+                except:
+                    pass
+            return None
+        
+        def handle_delete(event):
+            # Process tags first to ensure positions are current
+            self._process_template_tags(dialog)
+            
+            cursor_pos = template_text.index(INSERT)
+            # Check if cursor is inside or at the start of a tag
+            for tag_id, (start, end) in list(dialog.tag_positions.items()):
+                # Compare positions: check if cursor is between start and end
+                try:
+                    if template_text.compare(cursor_pos, ">=", start) and template_text.compare(cursor_pos, "<=", end):
+                        # Cursor is inside the tag, delete the entire tag
+                        self._remove_tag_from_template(dialog, tag_id)
+                        return "break"
+                except:
+                    pass
+            return None
+        
+        template_text.bind('<BackSpace>', handle_backspace, add='+')
+        template_text.bind('<Delete>', handle_delete, add='+')
+        
+        # Initial preview update
+        self._update_filename_preview(dialog)
+        
+        # Buttons frame
+        buttons_frame = Frame(main_container, bg='#1E1E1E')
+        buttons_frame.pack(pady=(3, 5))
+        
+        # Show different buttons when editing existing format vs creating new
+        if dialog.editing_format_index is not None:
+            # Editing existing format - show multiple options
+            # Update Existing button (primary action) - initially disabled
+            update_btn = ttk.Button(
+                buttons_frame,
+                text="Overwrite Existing",
+                command=lambda: self._save_custom_filename_from_dialog(dialog, update_existing=True),
+                state='disabled'
+            )
+            update_btn.pack(side=LEFT, padx=5)
+            dialog.update_btn = update_btn
+            
+            # Save As New button - initially disabled
+            save_as_new_btn = ttk.Button(
+                buttons_frame,
+                text="Save As New",
+                command=lambda: self._save_custom_filename_from_dialog(dialog, update_existing=False),
+                state='disabled'
+            )
+            save_as_new_btn.pack(side=LEFT, padx=5)
+            dialog.save_as_new_btn = save_as_new_btn
+        else:
+            # Creating new format or editing default - show simple Save button
+            # If editing default, disable until changes are made
+            save_btn_state = 'disabled' if getattr(dialog, 'editing_default_format', False) else 'normal'
+            save_btn = ttk.Button(
+                buttons_frame,
+                text="Save Format",
+                command=lambda: self._save_custom_filename_from_dialog(dialog, update_existing=False),
+                state=save_btn_state
+            )
+            save_btn.pack(side=LEFT, padx=5)
+            dialog.save_btn = save_btn  # Store reference for enabling/disabling
+        
+        # Cancel button (always shown)
+        cancel_btn = ttk.Button(
+            buttons_frame,
+            text="Cancel",
+            command=dialog.destroy
+        )
+        cancel_btn.pack(side=LEFT, padx=5)
+        
+        # Store initial format state for change detection (after dialog is fully set up)
+        # Store for both custom formats and default formats
+        if dialog.editing_format_index is not None or getattr(dialog, 'editing_default_format', False):
+            dialog.initial_template = template_text.get('1.0', END).strip()
+        
+        # Close on ESC
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+        
+        # Focus template text
+        template_text.focus_set()
+        
+        # Monitor changes to enable/disable buttons
+        dialog.after(100, lambda: self._check_filename_changes(dialog))
+    
+    def _process_template_tags(self, dialog):
+        """Process template text to detect and style tags.
+        Simplified approach: Just style the tag text, no embedded widgets.
+        """
+        if not hasattr(dialog, 'template_text'):
+            return
+        
+        # Set flag to prevent re-entry
+        if hasattr(dialog, 'is_processing_tags') and dialog.is_processing_tags:
+            return
+        
+        dialog.is_processing_tags = True
+        
+        try:
+            text_widget = dialog.template_text
+            
+            # Get current cursor position to restore later
+            try:
+                cursor_pos = text_widget.index(INSERT)
+            except:
+                cursor_pos = '1.0'
+            
+            # Get the current text content
+            content = text_widget.get('1.0', END).rstrip('\n')
+            
+            # Clear all existing tag styling
+            for tag_id in list(dialog.tag_positions.keys()):
+                try:
+                    text_widget.tag_delete(f"tag_{tag_id}")
+                except:
+                    pass
+            dialog.tag_positions.clear()
+            
+            # Find all tags by matching known tag names (without curly brackets)
+            # Match whole words only to avoid partial matches
+            import re
+            matches = []
+            
+            # Sort tag names by length (longest first) to match "Album Artist" before "Album"
+            tag_names_sorted = sorted(self.FILENAME_TAG_NAMES, key=len, reverse=True)
+            
+            # Build regex pattern for whole word matching
+            # Escape special regex characters and match word boundaries
+            pattern_parts = []
+            for tag_name in tag_names_sorted:
+                # Escape special regex characters
+                escaped = re.escape(tag_name)
+                # For multi-word tags like "Album Artist", match as a phrase
+                if ' ' in tag_name:
+                    # Match the phrase with word boundaries on both sides
+                    pattern_parts.append(rf'\b{escaped}\b')
+                else:
+                    # Single word tags - match with word boundaries
+                    pattern_parts.append(rf'\b{escaped}\b')
+            
+            # Combine patterns with alternation
+            pattern = '|'.join(pattern_parts)
+            
+            # Find all matches
+            all_matches = list(re.finditer(pattern, content, re.IGNORECASE))
+            
+            # Filter out overlapping matches (prefer longer matches)
+            valid_matches = []
+            used_ranges = []
+            for match in sorted(all_matches, key=lambda m: (m.end() - m.start(), m.start()), reverse=True):
+                start, end = match.span()
+                # Check if this range overlaps with any already used
+                overlaps = False
+                for used_start, used_end in used_ranges:
+                    if not (end <= used_start or start >= used_end):
+                        overlaps = True
+                        break
+                if not overlaps:
+                    valid_matches.append(match)
+                    used_ranges.append((start, end))
+            
+            # Sort matches by position
+            valid_matches.sort(key=lambda m: m.start())
+            matches = valid_matches
+            
+            if not matches:
+                # No tags found, just restore cursor
+                try:
+                    text_widget.mark_set(INSERT, cursor_pos)
+                    text_widget.see(INSERT)
+                except:
+                    pass
+                return
+            
+            # Process matches and style them
+            for match in matches:
+                start_idx = match.start()
+                end_idx = match.end()
+                tag_text = match.group(0)  # The matched tag name
+                tag_name = tag_text  # Same as tag_text now (no braces)
+                
+                # Convert character positions to line.column format
+                start_pos = text_widget.index(f'1.0 + {start_idx} chars')
+                end_pos = text_widget.index(f'1.0 + {end_idx} chars')
+                
+                # Check if we need to add padding spaces around the tag
+                # Get characters before and after the tag
+                char_before = content[start_idx - 1] if start_idx > 0 else ''
+                char_after = content[end_idx] if end_idx < len(content) else ''
+                
+                # Add padding spaces if needed (only for visual display, we'll handle in getter)
+                padding_before = ' ' if start_idx > 0 and not char_before.isspace() and char_before not in ['(', '[', '{'] else ''
+                padding_after = ' ' if end_idx < len(content) and not char_after.isspace() and char_after not in [')', ']', '}', '.', ',', ';', ':'] else ''
+                
+                # Store tag position (with padding consideration)
+                tag_id = f"{start_idx}_{end_idx}"
+                dialog.tag_positions[tag_id] = (start_pos, end_pos)
+                
+                # Style the tag text with rounded appearance
+                # Note: We can't add true padding, but we can style the text itself
+                text_widget.tag_add(f"tag_{tag_id}", start_pos, end_pos)
+                text_widget.tag_config(f"tag_{tag_id}", 
+                                     background='#007ACC', 
+                                     foreground='#FFFFFF',
+                                     font=("Segoe UI", 9, "bold"),
+                                     relief='flat',
+                                     borderwidth=0)
+            
+            # Restore cursor position
+            try:
+                text_widget.mark_set(INSERT, cursor_pos)
+                text_widget.see(INSERT)
+            except:
+                pass
+        finally:
+            # Clear processing flag
+            dialog.is_processing_tags = False
+    
+    def _remove_tag_from_template(self, dialog, tag_id):
+        """Remove a tag from the template when backspace/delete is used or right-click delete."""
+        if tag_id not in dialog.tag_positions:
+            return
+        
+        start_pos, end_pos = dialog.tag_positions[tag_id]
+        text_widget = dialog.template_text
+        
+        # Delete the tag text
+        try:
+            text_widget.delete(start_pos, end_pos)
+        except:
+            return
+        
+        # Clean up references
+        if tag_id in dialog.tag_positions:
+            del dialog.tag_positions[tag_id]
+        
+        # Set cursor to where tag was
+        try:
+            text_widget.mark_set(INSERT, start_pos)
+            text_widget.see(INSERT)
+        except:
+            pass
+        
+        # Reprocess tags to update styling
+        self._process_template_tags(dialog)
+        self._update_filename_preview(dialog)
+        self._check_filename_changes(dialog)
+        
+        # Focus back to text widget
+        text_widget.focus_set()
+    
+    def _insert_tag_into_template(self, dialog, tag):
+        """Insert a tag into the template text at cursor position."""
+        if not hasattr(dialog, 'template_text'):
+            return
+        
+        text_widget = dialog.template_text
+        cursor_pos = text_widget.index(INSERT)
+        
+        # Get text before and after cursor to check if we need a space
+        text_before = text_widget.get('1.0', cursor_pos)
+        text_after = text_widget.get(cursor_pos, END)
+        
+        # Add space before tag if cursor is not at start and previous char is not space
+        space_before = ""
+        if text_before and not text_before[-1].isspace():
+            space_before = " "
+        
+        # Add space after tag if next char is not space
+        space_after = " "
+        if text_after and len(text_after) > 1:
+            next_char = text_after[0]
+            if next_char.isspace():
+                space_after = ""
+        
+        # Insert tag with proper spacing
+        text_widget.insert(cursor_pos, space_before + tag + space_after)
+        
+        # Move cursor after inserted tag
+        new_cursor_pos = text_widget.index(f"{cursor_pos} + {len(space_before + tag + space_after)} chars")
+        text_widget.mark_set(INSERT, new_cursor_pos)
+        text_widget.see(INSERT)
+        
+        # Store the full template text for later retrieval
+        if not hasattr(dialog, 'last_template_text'):
+            dialog.last_template_text = ""
+        dialog.last_template_text = text_widget.get('1.0', END).rstrip('\n')
+        
+        # Save content state before inserting tag
+        self._save_template_state(dialog, immediate=True)
+        
+        # Process tags immediately to style the new one (don't wait for debounce)
+        self._process_template_tags(dialog)
+        
+        # Update preview
+        self._update_filename_preview(dialog)
+        
+        # Check for changes to enable/disable save button
+        self._check_filename_changes(dialog)
+    
+    def _save_template_state(self, dialog, immediate=False, debounce_ms=300):
+        """Save current template content state to history for undo/redo.
+        
+        Args:
+            dialog: The customize dialog
+            immediate: If True, save immediately. If False, debounce the save.
+            debounce_ms: Debounce delay in milliseconds (default 300ms, use 50ms for granular undo)
+        """
+        if not hasattr(dialog, 'template_text') or not hasattr(dialog, 'template_history'):
+            return
+        
+        def save_state():
+            try:
+                # Get current content
+                current_content = dialog.template_text.get('1.0', END).rstrip('\n')
+                
+                # Only save if content is different from current history position
+                if (dialog.template_history_index < 0 or 
+                    dialog.template_history_index >= len(dialog.template_history) or
+                    dialog.template_history[dialog.template_history_index] != current_content):
+                    # Remove any future history if we're not at the end
+                    if dialog.template_history_index < len(dialog.template_history) - 1:
+                        dialog.template_history = dialog.template_history[:dialog.template_history_index + 1]
+                    # Add new content state to history
+                    dialog.template_history.append(current_content)
+                    dialog.template_history_index = len(dialog.template_history) - 1
+                    # Limit history size to 50 items
+                    if len(dialog.template_history) > 50:
+                        dialog.template_history = dialog.template_history[-50:]
+                        dialog.template_history_index = len(dialog.template_history) - 1
+            except Exception:
+                pass
+        
+        if immediate:
+            # Cancel any pending timer and save immediately
+            if dialog.template_save_timer:
+                dialog.after_cancel(dialog.template_save_timer)
+                dialog.template_save_timer = None
+            save_state()
+        else:
+            # Debounce the save (use provided debounce_ms, default 300ms)
+            if dialog.template_save_timer:
+                dialog.after_cancel(dialog.template_save_timer)
+            dialog.template_save_timer = dialog.after(debounce_ms, save_state)
+    
+    def _handle_template_undo(self, dialog, event):
+        """Handle undo (Ctrl+Z) in template Text widget - cycle to previous content state."""
+        # Check if Shift is pressed (Ctrl+Shift+Z = redo)
+        if event.state & 0x1:  # Shift key is pressed
+            return self._handle_template_redo(dialog, event)
+        
+        if not hasattr(dialog, 'template_history') or not dialog.template_history or not hasattr(dialog, 'template_text'):
+            return "break"  # No history, prevent default behavior
+        
+        # Cancel any pending timers
+        if dialog.tag_process_timer:
+            dialog.after_cancel(dialog.tag_process_timer)
+            dialog.tag_process_timer = None
+        if dialog.template_save_timer:
+            dialog.after_cancel(dialog.template_save_timer)
+            dialog.template_save_timer = None
+        
+        # Save current content to history before undoing (so we can redo back to it)
+        self._save_template_state(dialog, immediate=True)
+        
+        # Move back in history
+        if dialog.template_history_index > 0:
+            dialog.template_history_index -= 1
+            previous_content = dialog.template_history[dialog.template_history_index]
+            
+            # Replace current content with previous state
+            dialog.template_text.delete(1.0, END)
+            dialog.template_text.insert(1.0, previous_content)
+            
+            # Process tags and update preview
+            self._process_template_tags(dialog)
+            self._update_filename_preview(dialog)
+            self._check_filename_changes(dialog)
+        else:
+            # At the beginning of history - insert empty state at position 0 so we can redo
+            if dialog.template_history and dialog.template_history[0] != "":
+                dialog.template_history.insert(0, "")
+                dialog.template_history_index = 0
+            elif not dialog.template_history:
+                dialog.template_history = [""]
+                dialog.template_history_index = 0
+            
+            # Clear the field
+            dialog.template_text.delete(1.0, END)
+            self._process_template_tags(dialog)
+            self._update_filename_preview(dialog)
+            self._check_filename_changes(dialog)
+        
+        return "break"  # Prevent default undo behavior
+    
+    def _handle_template_redo(self, dialog, event):
+        """Handle redo (Ctrl+Shift+Z or Ctrl+Y) in template Text widget - cycle to next content state."""
+        if not hasattr(dialog, 'template_history') or not dialog.template_history or not hasattr(dialog, 'template_text'):
+            return "break"  # No history, prevent default behavior
+        
+        # Cancel any pending timers
+        if dialog.tag_process_timer:
+            dialog.after_cancel(dialog.tag_process_timer)
+            dialog.tag_process_timer = None
+        if dialog.template_save_timer:
+            dialog.after_cancel(dialog.template_save_timer)
+            dialog.template_save_timer = None
+        
+        # Save current content to history before redoing (so we can undo back to it)
+        self._save_template_state(dialog, immediate=True)
+        
+        # Move forward in history
+        if dialog.template_history_index < len(dialog.template_history) - 1:
+            dialog.template_history_index += 1
+            next_content = dialog.template_history[dialog.template_history_index]
+            
+            # Replace current content with next state
+            dialog.template_text.delete(1.0, END)
+            dialog.template_text.insert(1.0, next_content)
+            
+            # Process tags and update preview
+            self._process_template_tags(dialog)
+            self._update_filename_preview(dialog)
+            self._check_filename_changes(dialog)
+        
+        return "break"  # Prevent default redo behavior
+    
+    def _create_filename_slot(self, dialog, parent_frame, initial_value=None):
+        """Create a filename format slot with fields and separators.
+        
+        Args:
+            dialog: The customize dialog
+            parent_frame: Parent frame for the slot
+            initial_value: Initial format data dict or None
+        """
+        slot_frame = Frame(parent_frame, bg='#1E1E1E', relief='flat', bd=1, 
+                          highlightbackground='#3E3E42', highlightthickness=1)
+        slot_frame.pack(fill=X, pady=2, padx=5, anchor='nw')
+        
+        # Normalize initial value
+        if initial_value:
+            level_data = self._normalize_filename_format(initial_value)
+        else:
+            # Default: start with "01" and "Track"
+            level_data = {"fields": ["01", "Track"], "separators": ["", ". ", ""]}
+        
+        slot_frame.level_data = level_data
+        slot_frame.is_filled = True
+        
+        # Fields container
+        fields_container = Frame(slot_frame, bg='#1E1E1E')
+        fields_container.pack(fill=X, padx=5, pady=5)
+        slot_frame.fields_container = fields_container
+        dialog.fields_container = fields_container  # Store reference
+        
+        # Rebuild UI for fields
+        self._rebuild_filename_fields_ui(dialog, slot_frame)
+    
+    def _rebuild_filename_fields_ui(self, dialog, slot_frame):
+        """Rebuild the UI for fields and separators in filename format."""
+        # Clear existing field widgets
+        if hasattr(slot_frame, 'fields_container'):
+            for widget in slot_frame.fields_container.winfo_children():
+                widget.destroy()
+        
+        slot_frame.field_widgets = []
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        separators = level_data.get("separators", [])
+        
+        if not fields:
+            # No fields, add default
+            fields = ["01", "Track"]
+            level_data["fields"] = fields
+        
+        # Ensure separators list matches: prefix + between fields + suffix (fields + 1 total)
+        num_separators = len(fields) + 1
+        while len(separators) < num_separators:
+            separators.append("")
+        separators = separators[:num_separators]
+        level_data["separators"] = separators
+        
+        # Build UI: [Prefix Sep] [Field1 ▼] [Between Sep] [Field2 ▼] ... [Suffix Sep] [+ Add Field]
+        for i, field in enumerate(fields):
+            # Prefix separator (before first field)
+            if i == 0:
+                prefix_separator = separators[0] if separators else ""
+                prefix_var = StringVar(value=prefix_separator if prefix_separator else "")
+                prefix_entry = self._create_separator_entry(
+                    slot_frame.fields_container, prefix_var, dialog, slot_frame, 0, is_prefix=True
+                )
+            else:
+                prefix_entry = None
+                prefix_var = None
+            
+            # Field dropdown
+            field_var = StringVar(value=field)
+            available_fields = self._get_available_filename_fields_for_slot(dialog, slot_frame, field)
+            field_combo = ttk.Combobox(
+                slot_frame.fields_container,
+                textvariable=field_var,
+                values=available_fields,
+                state="readonly",
+                width=12
+            )
+            field_combo.pack(side=LEFT, padx=2)
+            field_combo.bind("<<ComboboxSelected>>", lambda e, idx=i: self._on_filename_field_change(dialog, slot_frame, idx))
+            
+            # Between-fields separator (after each field except last)
+            separator_entry = None
+            separator_var = None
+            if i < len(fields) - 1:
+                gap_separator = separators[i + 1] if i + 1 < len(separators) else " "
+                if gap_separator == "None" or gap_separator is None:
+                    gap_separator = " "
+                separator_var = StringVar(value=gap_separator)
+                separator_entry = self._create_separator_entry(
+                    slot_frame.fields_container, separator_var, dialog, slot_frame, i + 1, is_prefix=False
+                )
+            
+            # Suffix separator (after last field)
+            suffix_entry = None
+            suffix_var = None
+            if i == len(fields) - 1:
+                suffix_separator = separators[len(fields)] if len(fields) < len(separators) else ""
+                suffix_var = StringVar(value=suffix_separator if suffix_separator else "")
+                suffix_entry = self._create_separator_entry(
+                    slot_frame.fields_container, suffix_var, dialog, slot_frame, len(fields), is_prefix=False
+                )
+            
+            # Store widget references
+            slot_frame.field_widgets.append((
+                field_combo, prefix_entry, separator_entry, suffix_entry,
+                field_var, prefix_var, separator_var, suffix_var
+            ))
+        
+        # Add Field button (if under max)
+        if len(fields) < 4:
+            add_field_btn = ttk.Button(
+                slot_frame.fields_container,
+                text="+ Add Field",
+                command=lambda: self._add_filename_field(dialog, slot_frame)
+            )
+            add_field_btn.pack(side=LEFT, padx=5)
+            slot_frame.add_field_btn = add_field_btn
+        
+        # Update preview
+        self._update_filename_preview(dialog)
+    
+    def _get_available_filename_fields_for_slot(self, dialog, slot_frame, exclude_field=None):
+        """Get available fields for filename format (allows current field + unused fields)."""
+        # All filename field options
+        all_fields = self.FILENAME_FIELD_OPTIONS.copy()
+        
+        # Get used fields (excluding current field)
+        used_fields = set()
+        if hasattr(slot_frame, 'field_widgets'):
+            for field_combo, _, _, _, field_var, _, _, _ in slot_frame.field_widgets:
+                current_field = field_var.get()
+                if current_field != exclude_field:
+                    used_fields.add(current_field)
+        
+        # Return available fields (including current field if it's not exclude_field)
+        available = []
+        for field in all_fields:
+            if field not in used_fields or (exclude_field and field == exclude_field):
+                available.append(field)
+        
+        return available
+    
+    def _on_filename_field_change(self, dialog, slot_frame, field_index):
+        """Handle filename field dropdown change."""
+        field_combo, prefix_entry, separator_entry, suffix_entry, field_var, prefix_var, separator_var, suffix_var = slot_frame.field_widgets[field_index]
+        
+        # Update level data
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        if field_index < len(fields):
+            fields[field_index] = field_var.get()
+        
+        # Rebuild UI to update available fields
+        self._rebuild_filename_fields_ui(dialog, slot_frame)
+        
+        # Update preview after field change
+        self._update_filename_preview(dialog)
+    
+    def _add_filename_field(self, dialog, slot_frame):
+        """Add a new field to filename format (max 4 fields)."""
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        
+        if len(fields) >= 4:
+            return  # Max 4 fields
+        
+        # Get available fields
+        available = self._get_available_filename_fields_for_slot(dialog, slot_frame)
+        if available:
+            new_field = available[0]
+            fields.append(new_field)
+            
+            # Add separator for new field
+            separators = level_data.get("separators", [])
+            # Insert separator before new field (between previous last field and new field)
+            separators.insert(len(fields) - 1, " ")  # Default space separator
+            # Ensure suffix separator exists
+            while len(separators) < len(fields) + 1:
+                separators.append("")
+            level_data["separators"] = separators[:len(fields) + 1]
+        
+        # Rebuild UI
+        self._rebuild_filename_fields_ui(dialog, slot_frame)
+        
+        # Update preview after adding field
+        self._update_filename_preview(dialog)
+    
+    def _remove_filename_field(self, dialog, slot_frame, field_index):
+        """Remove a field from filename format."""
+        level_data = slot_frame.level_data
+        fields = level_data.get("fields", [])
+        separators = level_data.get("separators", [])
+        
+        if len(fields) <= 1:
+            return  # Must have at least one field
+        
+        # Remove field
+        fields.pop(field_index)
+        
+        # Remove corresponding separators
+        # Remove separator before field (if not first field) and separator after field
+        if field_index > 0:
+            # Remove separator before this field
+            separators.pop(field_index)
+        else:
+            # First field - remove prefix separator
+            if separators:
+                separators.pop(0)
+        
+        # Ensure separators list is correct length
+        num_separators = len(fields) + 1
+        while len(separators) < num_separators:
+            separators.append("")
+        separators = separators[:num_separators]
+        level_data["separators"] = separators
+        
+        # Rebuild UI
+        self._rebuild_filename_fields_ui(dialog, slot_frame)
+        
+        # Update preview after removing field
+        self._update_filename_preview(dialog)
+    
+    def _update_filename_preview(self, dialog):
+        """Update preview text in filename dialog."""
+        if not hasattr(dialog, 'preview_text') or not hasattr(dialog, 'template_text'):
+            return
+        
+        template = dialog.template_text.get('1.0', END).strip()
+        if not template:
+            dialog.preview_text.config(text="")
+            return
+        
+        # Generate preview using template
+        preview = self._generate_filename_from_template(template, track_number=1, preview_mode=True)
+        dialog.preview_text.config(text=preview)
+    
+    def _parse_template(self, template):
+        """Parse template string to extract tags and literal text.
+        
+        Args:
+            template: Template string like "01 - Artist - Track" (no curly brackets)
+            
+        Returns:
+            List of tuples: (type, value) where type is 'tag' or 'literal'
+        """
+        if not template:
+            return []
+        
+        import re
+        parts = []
+        
+        # Sort tag names by length (longest first) to match "Album Artist" before "Album"
+        tag_names_sorted = sorted(self.FILENAME_TAG_NAMES, key=len, reverse=True)
+        
+        # Build regex pattern for whole word matching
+        pattern_parts = []
+        for tag_name in tag_names_sorted:
+            escaped = re.escape(tag_name)
+            if ' ' in tag_name:
+                # Multi-word tags like "Album Artist"
+                pattern_parts.append(rf'\b{escaped}\b')
+            else:
+                # Single word tags
+                pattern_parts.append(rf'\b{escaped}\b')
+        
+        # Combine patterns with alternation
+        pattern = '|'.join(pattern_parts)
+        
+        # Find all matches
+        all_matches = list(re.finditer(pattern, template, re.IGNORECASE))
+        
+        # Filter out overlapping matches (prefer longer matches)
+        valid_matches = []
+        used_ranges = []
+        for match in sorted(all_matches, key=lambda m: (m.end() - m.start(), m.start()), reverse=True):
+            start, end = match.span()
+            # Check if this range overlaps with any already used
+            overlaps = False
+            for used_start, used_end in used_ranges:
+                if not (end <= used_start or start >= used_end):
+                    overlaps = True
+                    break
+            if not overlaps:
+                valid_matches.append(match)
+                used_ranges.append((start, end))
+        
+        # Sort matches by position
+        valid_matches.sort(key=lambda m: m.start())
+        
+        last_end = 0
+        for match in valid_matches:
+            # Add literal text before this tag
+            if match.start() > last_end:
+                literal = template[last_end:match.start()]
+                if literal:
+                    parts.append(('literal', literal))
+            
+            # Add the tag
+            tag_name = match.group(0)  # The matched text
+            parts.append(('tag', tag_name))
+            
+            last_end = match.end()
+        
+        # Add remaining literal text
+        if last_end < len(template):
+            literal = template[last_end:]
+            if literal:
+                parts.append(('literal', literal))
+        
+        return parts
+    
+    def _generate_filename_from_template(self, template, track_number=1, metadata=None, preview_mode=False):
+        """Generate filename from template string.
+        
+        Args:
+            template: Template string like "{01} - {Artist} - {Track}"
+            track_number: Track number (integer)
+            metadata: Dict with metadata values (artist, album, etc.)
+            preview_mode: If True, use field names for preview; if False, use actual values
+            
+        Returns:
+            Generated filename string
+        """
+        if not template:
+            return ""
+        
+        # Parse template
+        parts = self._parse_template(template)
+        if not parts:
+            return ""
+        
+        # Default metadata if not provided
+        if metadata is None:
+            metadata = {}
+        
+        # Tag to value mapping
+        if preview_mode:
+            # Use field names for preview
+            tag_values = {
+                "01": f"{track_number:02d}",
+                "1": str(track_number),
+                "Track": "Track",
+                "Artist": "Artist",
+                "Album": "Album",
+                "Year": "Year",
+                "Genre": "Genre",
+                "Label": "Label",
+                "Album Artist": "Album Artist",
+                "Catalog Number": "Catalog Number"
+            }
+        else:
+            # Use actual values for file renaming
+            tag_values = {
+                "01": f"{track_number:02d}",
+                "1": str(track_number),
+                "Track": self.sanitize_filename(metadata.get("title", "") or "Track"),
+                "Artist": self.sanitize_filename(metadata.get("artist", "") or "Artist"),
+                "Album": self.sanitize_filename(metadata.get("album", "") or "Album"),
+                "Year": str(metadata.get("year", "") or "Year"),
+                "Genre": self.sanitize_filename(metadata.get("genre", "") or "Genre"),
+                "Label": self.sanitize_filename(metadata.get("label") or metadata.get("publisher", "") or "Label"),
+                "Album Artist": self.sanitize_filename(metadata.get("album_artist") or metadata.get("albumartist", "") or "Album Artist"),
+                "Catalog Number": self.sanitize_filename(metadata.get("catalog_number") or metadata.get("catalognumber", "") or "Catalog Number")
+            }
+        
+        # Build result
+        result_parts = []
+        for part_type, part_value in parts:
+            if part_type == 'tag':
+                # Replace tag with value (part_value is the tag name without curly brackets)
+                value = tag_values.get(part_value, part_value)  # Keep unknown tags as-is
+                result_parts.append(value)
+            else:
+                # Literal text - keep as-is
+                result_parts.append(part_value)
+        
+        result = "".join(result_parts)
+        
+        # Sanitize the entire result (in case tags introduced invalid chars)
+        if not preview_mode:
+            result = self.sanitize_filename(result)
+        
+        return result
+    
+    def _generate_filename_preview(self, format_data, track_number=1):
+        """Generate preview filename from format data.
+        
+        Args:
+            format_data: Format dict with "template" string
+            track_number: Track number to use in preview
+            
+        Returns:
+            Preview filename string
+        """
+        normalized = self._normalize_filename_format(format_data)
+        if not normalized:
+            return ""
+        
+        template = normalized.get("template", "")
+        if not template:
+            return ""
+        
+        # Generate preview using template
+        return self._generate_filename_from_template(template, track_number, preview_mode=True)
+    
+    def _get_filename_from_dialog(self, dialog):
+        """Get the current filename format from the dialog without saving.
+        
+        Args:
+            dialog: The customize dialog
+            
+        Returns:
+            Format dict with template string (normalized)
+        """
+        if not hasattr(dialog, 'template_text'):
+            return None
+        
+        # Get text content, removing any widget markers
+        template = dialog.template_text.get('1.0', END).strip()
+        if not template:
+            return None
+        
+        # Remove any widget placeholders (they appear as empty strings in the text)
+        # The actual tag text should remain
+        format_data = {"template": template}
+        return self._normalize_filename_format(format_data)
+    
+    def _check_filename_changes(self, dialog):
+        """Check if filename format has changed and enable/disable save buttons accordingly."""
+        # Check if we're editing (either custom format or default format)
+        is_editing_custom = hasattr(dialog, 'editing_format_index') and dialog.editing_format_index is not None
+        is_editing_default = getattr(dialog, 'editing_default_format', False)
+        
+        if not is_editing_custom and not is_editing_default:
+            return  # Not editing, no need to check
+        
+        if not hasattr(dialog, 'initial_template'):
+            return  # Initial template not set yet
+        
+        if not hasattr(dialog, 'template_text'):
+            return
+        
+        current_template = dialog.template_text.get('1.0', END).strip()
+        initial_template = dialog.initial_template.strip()
+        
+        # Compare templates
+        has_changes = current_template != initial_template
+        
+        # Enable/disable buttons based on changes
+        if has_changes:
+            if hasattr(dialog, 'update_btn'):
+                dialog.update_btn.config(state='normal')
+            if hasattr(dialog, 'save_as_new_btn'):
+                dialog.save_as_new_btn.config(state='normal')
+            if hasattr(dialog, 'save_btn'):
+                dialog.save_btn.config(state='normal')
+        else:
+            if hasattr(dialog, 'update_btn'):
+                dialog.update_btn.config(state='disabled')
+            if hasattr(dialog, 'save_as_new_btn'):
+                dialog.save_as_new_btn.config(state='disabled')
+            if hasattr(dialog, 'save_btn'):
+                dialog.save_btn.config(state='disabled')
+    
+    def _create_new_filename_in_dialog(self, dialog):
+        """Create new filename format from current dialog (clears editing state)."""
+        dialog.editing_format_index = None
+        dialog.initial_format = None
+        
+        # Hide update buttons, show save button
+        for widget in dialog.winfo_children():
+            if isinstance(widget, Frame):
+                for child in widget.winfo_children():
+                    if isinstance(child, Frame):  # buttons_frame
+                        for btn in child.winfo_children():
+                            if isinstance(btn, ttk.Button):
+                                btn.destroy()
+        
+        # Recreate buttons frame with just Save and Cancel
+        buttons_frame = Frame(dialog.winfo_children()[0], bg='#1E1E1E')
+        buttons_frame.pack(pady=(3, 5))
+        
+        save_btn = ttk.Button(
+            buttons_frame,
+            text="Save Format",
+            command=lambda: self._save_custom_filename_from_dialog(dialog, update_existing=False)
+        )
+        save_btn.pack(side=LEFT, padx=5)
+        
+        cancel_btn = ttk.Button(
+            buttons_frame,
+            text="Cancel",
+            command=dialog.destroy
+        )
+        cancel_btn.pack(side=LEFT, padx=5)
+    
+    def _save_custom_filename_from_dialog(self, dialog, update_existing=None):
+        """Save filename format from dialog to custom_filename_formats.
+        
+        Args:
+            dialog: The customize dialog
+            update_existing: If True, update existing format. If False, create new. If None, determine automatically.
+        """
+        format_data = self._get_filename_from_dialog(dialog)
+        if not format_data:
+            messagebox.showerror("Error", "Invalid filename format. Please enter a template.")
+            return
+        
+        template = format_data.get("template", "").strip()
+        if not template:
+            messagebox.showerror("Error", "Template cannot be empty.")
+            return
+        
+        editing_index = getattr(dialog, 'editing_format_index', None)
+        
+        # If update_existing is None, determine automatically based on editing_index
+        if update_existing is None:
+            update_existing = (editing_index is not None and 0 <= editing_index < len(self.custom_filename_formats))
+        
+        if update_existing and editing_index is not None and 0 <= editing_index < len(self.custom_filename_formats):
+            # We're updating an existing format - replace it
+            self.custom_filename_formats[editing_index] = format_data
+        else:
+            # We're creating a new format - check if it already exists to avoid duplicates
+            format_exists = False
+            formatted_new = self._format_custom_filename(format_data)
+            
+            # Check against custom formats
+            for existing in self.custom_filename_formats:
+                formatted_existing = self._format_custom_filename(existing)
+                if formatted_new == formatted_existing:
+                    format_exists = True
+                    break
+            
+            # Also check against default formats
+            if not format_exists:
+                for default_key, default_data in self.FILENAME_FORMATS.items():
+                    if default_data and default_data.get("template") == template:
+                        format_exists = True
+                        break
+            
+            if format_exists:
+                messagebox.showwarning("Duplicate Format", "A filename format with this configuration already exists.")
+                return
+            
+            # Add new format
+            self.custom_filename_formats.append(format_data)
+        
+        # Save to settings
+        self._save_custom_filename_formats()
+        
+        # Update dropdown
+        self._update_filename_dropdown()
+        
+        # Set current selection to the saved format
+        formatted = self._format_custom_filename(format_data)
+        self.numbering_var.set(formatted)
+        self.on_numbering_change()
+        self.update_preview()
+        
+        # Close dialog
+        dialog.destroy()
+    
+    def _show_manage_filename_dialog(self):
+        """Show modal dialog to manage custom filename formats."""
+        if not hasattr(self, 'custom_filename_formats') or not self.custom_filename_formats:
+            messagebox.showinfo("No Custom Formats", "No custom filename formats have been saved yet.\n\nCreate one using the Customize button (✏️).")
+            return
+        
+        dialog = Toplevel(self.root)
+        dialog.title("Delete Custom Filename Formats")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 200
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 150
+        dialog.geometry(f"400x300+{x}+{y}")
+        
+        # Configure dialog background
+        dialog.configure(bg='#1E1E1E')
+        
+        # Title
+        title_label = Label(
+            dialog,
+            text="Delete Custom Filename Formats",
+            font=("Segoe UI", 10, "bold"),
+            bg='#1E1E1E',
+            fg='#D4D4D4'
+        )
+        title_label.pack(pady=(10, 10))
+        
+        # Container for format list
+        list_frame = Frame(dialog, bg='#1E1E1E')
+        list_frame.pack(pady=10, padx=20, fill=BOTH, expand=True)
+        
+        # Create list of formats with delete buttons
+        for format_data in self.custom_filename_formats:
+            format_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+            format_frame.pack(fill=X, pady=2, padx=5)
+            
+            # Format label
+            formatted = self._format_custom_filename(format_data)
+            format_label = Label(
+                format_frame,
+                text=formatted,
+                font=("Segoe UI", 9),
+                bg='#1E1E1E',
+                fg='#D4D4D4',
+                anchor=W
+            )
+            format_label.pack(side=LEFT, padx=10, fill=X, expand=True)
+            
+            # Delete button
+            delete_btn = ttk.Button(
+                format_frame,
+                text="X",
+                width=3,
+                command=lambda f=format_data: self._delete_custom_filename(dialog, f)
+            )
+            delete_btn.pack(side=RIGHT, padx=5)
+        
+        # Close button
+        close_btn = ttk.Button(
+            dialog,
+            text="Close",
+            command=dialog.destroy
+        )
+        close_btn.pack(pady=10)
+        
+        # Close on ESC
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+    
+    def _delete_custom_filename(self, dialog, format_data):
+        """Delete a custom filename format."""
+        if format_data in self.custom_filename_formats:
+            # Check if this is the currently selected format
+            formatted = self._format_custom_filename(format_data)
+            current_value = self.numbering_var.get()
+            
+            # Remove from list
+            self.custom_filename_formats.remove(format_data)
+            
+            # Save settings
+            self._save_custom_filename_formats()
+            
+            # Update dropdown
+            self._update_filename_dropdown()
+            
+            # Update manage button state
+            self._update_filename_manage_button()
+            
+            # If deleted format was selected, switch to default
+            if current_value == formatted:
+                self.numbering_var.set(self.DEFAULT_NUMBERING)
+                self.on_numbering_change()
+                self.update_preview()
+            
+            # Rebuild dialog if formats remain, otherwise close
+            if self.custom_filename_formats:
+                dialog.destroy()
+                self._show_manage_filename_dialog()  # Reopen with updated list
+            else:
+                dialog.destroy()
+    
+    def _update_filename_manage_button(self):
+        """Update filename manage button state based on whether custom formats exist."""
+        if hasattr(self, 'filename_manage_btn'):
+            has_custom = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
+            if has_custom:
+                self.filename_manage_btn.config(fg='#808080', cursor='hand2')
+                # Rebind events
+                self.filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog())
+                self.filename_manage_btn.bind("<Enter>", lambda e: self.filename_manage_btn.config(fg='#D4D4D4'))
+                self.filename_manage_btn.bind("<Leave>", lambda e: self.filename_manage_btn.config(fg='#808080'))
+            else:
+                self.filename_manage_btn.config(fg='#404040', cursor='arrow')
+                # Unbind events
+                try:
+                    self.filename_manage_btn.unbind("<Button-1>")
+                    self.filename_manage_btn.unbind("<Enter>")
+                    self.filename_manage_btn.unbind("<Leave>")
+                except:
+                    pass
+    
+    def _get_all_filename_options(self):
+        """Get all filename format options including custom formats."""
+        # Start with standard options
+        options = ["Track", "01. Track", "Artist - Track", "01. Artist - Track"]
+        # Add custom formats (if they exist)
+        if hasattr(self, 'custom_filename_formats') and self.custom_filename_formats:
+            for format_data in self.custom_filename_formats:
+                formatted = self._format_custom_filename(format_data)
+                if formatted and formatted not in options:
+                    options.append(formatted)
+        return options
+    
+    def _build_filename_menu(self, menu):
+        """Build filename menu with standard and custom formats."""
+        menu.delete(0, END)
+        
+        # Add standard formats
+        for format_key in ["Track", "01. Track", "Artist - Track", "01. Artist - Track"]:
+            padded_label = f" {format_key}      "
+            menu.add_command(
+                label=padded_label,
+                command=lambda val=format_key: self._on_filename_menu_select(val)
+            )
+        
+        # Add separator if there are custom formats
+        if hasattr(self, 'custom_filename_formats') and self.custom_filename_formats:
+            menu.add_separator()
+            # Add custom formats
+            for format_data in self.custom_filename_formats:
+                formatted = self._format_custom_filename(format_data)
+                if formatted:
+                    padded_label = f" {formatted}      "
+                    menu.add_command(
+                        label=padded_label,
+                        command=lambda f=format_data: self._on_filename_menu_select(f)
+                    )
+    
+    def _on_filename_menu_select(self, choice):
+        """Handle filename format menu selection.
+        
+        Args:
+            choice: Either a string key ("None", "01. Track", etc.) or a format dict
+        """
+        if isinstance(choice, str):
+            # Standard format
+            self.numbering_var.set(choice)
+        elif isinstance(choice, dict):
+            # Custom format
+            formatted = self._format_custom_filename(choice)
+            if formatted:
+                self.numbering_var.set(formatted)
+        
+        # Save the selection and update preview
+        self.on_numbering_change()
+        self.update_preview()
+    
+    def _update_filename_dropdown(self):
+        """Update filename dropdown menu to include custom formats."""
+        if hasattr(self, 'filename_menu'):
+            self._build_filename_menu(self.filename_menu)
+        
+        # Update manage button state
+        self._update_filename_manage_button()
     
     def _format_error_message(self, error_str, is_unexpected=False):
         """Format error messages to be more user-friendly."""
@@ -11523,6 +14525,157 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 self.log("")
                 self.log(f"[X] {message}")
                 messagebox.showerror("Error", message)
+    
+    def _setup_filename_character_filter(self, dialog, text_widget, parent_frame):
+        """Setup character filtering for filename customizer.
+        Blocks: \ / : * ? " < > |
+        """
+        # Illegal characters for filenames
+        illegal_chars = set('\\/:*?"<>|')
+        
+        # Find the label row frame (should be the first Frame in parent_frame)
+        label_row = None
+        for widget in parent_frame.winfo_children():
+            if isinstance(widget, Frame):
+                label_row = widget
+                break
+        
+        # Create warning label (initially hidden) - single line, inline with label
+        warning_label = Label(
+            label_row if label_row else parent_frame,
+            text="Invalid characters: \\ / : * ? \" < > |",
+            font=("Segoe UI", 8),
+            bg='#1E1E1E',
+            fg='#17a0c4'
+        )
+        warning_label.pack_forget()  # Hidden initially
+        dialog.warning_label = warning_label
+        dialog.warning_timer = None
+        
+        def show_warning():
+            """Show warning label briefly."""
+            # Show the warning label if not already visible
+            if not warning_label.winfo_viewable():
+                if label_row:
+                    warning_label.pack(side=LEFT, padx=(8, 0))
+                else:
+                    warning_label.pack(anchor=W, pady=(0, 5))
+            # Hide after 4 seconds
+            if dialog.warning_timer:
+                dialog.after_cancel(dialog.warning_timer)
+            dialog.warning_timer = dialog.after(4000, lambda: warning_label.pack_forget())
+        
+        def filter_key(event):
+            """Filter illegal characters on key press."""
+            # Allow special keys (backspace, delete, arrows, etc.)
+            if len(event.char) == 0 or event.keysym in ['BackSpace', 'Delete', 'Left', 'Right', 'Up', 'Down', 'Home', 'End', 'Tab']:
+                return None
+            
+            # Check if character is illegal
+            if event.char in illegal_chars:
+                show_warning()
+                return "break"  # Prevent insertion
+            return None
+        
+        def filter_paste(event):
+            """Filter illegal characters from pasted content."""
+            try:
+                # Get clipboard content
+                clipboard_text = dialog.clipboard_get()
+                # Filter out illegal characters
+                filtered = ''.join(c for c in clipboard_text if c not in illegal_chars)
+                if filtered != clipboard_text:
+                    # Some characters were filtered, show warning
+                    show_warning()
+                    # Insert filtered content
+                    text_widget.insert(INSERT, filtered)
+                    return "break"  # Prevent default paste
+            except:
+                pass
+            return None
+        
+        # Bind key press and paste events
+        text_widget.bind('<KeyPress>', filter_key)
+        text_widget.bind('<Control-v>', filter_paste)
+        text_widget.bind('<Shift-Insert>', filter_paste)
+        # Note: Right-click paste is handled by the system menu, which we can't easily intercept
+        # Users will see the warning if they paste illegal characters via right-click
+    
+    def _setup_folder_character_filter(self, dialog, text_widget, parent_frame):
+        """Setup character filtering for folder customizer.
+        Blocks: : * ? " < > |
+        Allows: \ / (used as folder separators)
+        """
+        # Illegal characters for folders (excluding \ and / which are allowed)
+        illegal_chars = set(':*?"<>|')
+        
+        # Find the label row frame (should be the first Frame in parent_frame)
+        label_row = None
+        for widget in parent_frame.winfo_children():
+            if isinstance(widget, Frame):
+                label_row = widget
+                break
+        
+        # Create warning label (initially hidden) - single line, inline with label
+        warning_label = Label(
+            label_row if label_row else parent_frame,
+            text="Invalid characters: : * ? \" < > |",
+            font=("Segoe UI", 8),
+            bg='#1E1E1E',
+            fg='#17a0c4'
+        )
+        warning_label.pack_forget()  # Hidden initially
+        dialog.warning_label = warning_label
+        dialog.warning_timer = None
+        
+        def show_warning():
+            """Show warning label briefly."""
+            # Show the warning label if not already visible
+            if not warning_label.winfo_viewable():
+                if label_row:
+                    warning_label.pack(side=LEFT, padx=(8, 0))
+                else:
+                    warning_label.pack(anchor=W, pady=(0, 5))
+            # Hide after 4 seconds
+            if dialog.warning_timer:
+                dialog.after_cancel(dialog.warning_timer)
+            dialog.warning_timer = dialog.after(4000, lambda: warning_label.pack_forget())
+        
+        def filter_key(event):
+            """Filter illegal characters on key press."""
+            # Allow special keys (backspace, delete, arrows, etc.)
+            if len(event.char) == 0 or event.keysym in ['BackSpace', 'Delete', 'Left', 'Right', 'Up', 'Down', 'Home', 'End', 'Tab']:
+                return None
+            
+            # Check if character is illegal
+            if event.char in illegal_chars:
+                show_warning()
+                return "break"  # Prevent insertion
+            return None
+        
+        def filter_paste(event):
+            """Filter illegal characters from pasted content."""
+            try:
+                # Get clipboard content
+                clipboard_text = dialog.clipboard_get()
+                # Filter out illegal characters (but keep \ and /)
+                filtered = ''.join(c for c in clipboard_text if c not in illegal_chars)
+                if filtered != clipboard_text:
+                    # Some characters were filtered, show warning
+                    show_warning()
+                    # Insert filtered content
+                    text_widget.insert(INSERT, filtered)
+                    return "break"  # Prevent default paste
+            except:
+                pass
+            return None
+        
+        # Bind key press and paste events
+        text_widget.bind('<KeyPress>', filter_key)
+        text_widget.bind('<Control-v>', filter_paste)
+        text_widget.bind('<Shift-Insert>', filter_paste)
+        # Note: Right-click paste is handled by the system menu, which we can't easily intercept
+        # Users will see the warning if they paste illegal characters via right-click
 
 
 def main():
