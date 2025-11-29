@@ -103,7 +103,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 - Download the latest release and copy the DLLs to the following locations:
   - x86 → C:\Windows\SysWOW64
   - x64 → C:\Windows\System32 (Admin rights may be needed)
-- Restart your PC and relaunch the app.
+- Launch the app!
 - Thanks to @alabx for this [fix](https://github.com/kameryn1811/Bandcamp-Downloader/issues/6)! 
 
 **"ffmpeg.exe not found"**
