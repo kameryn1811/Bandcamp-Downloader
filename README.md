@@ -27,7 +27,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 * **Flexible Interface** - Adjust window size and expand/resize URL field height as needed
 * **Batch Downloads** - Download multiple albums at once by pasting multiple URLs
 * **Discography Support** - Download entire artist discographies with a single click
-* **Organization** - Fully customizable folder structure (e.g. Artist/Album etc.) and file Numbering options
+* **Organization** - Fully customizable folder structure (e.g. Artist/Album etc.) and filename format (e.g. 01. Artist - Track.mp3)
 * **Metadata** - Automatically tags files with artist, album, track number, and date
 * **Cover Art** - Embeds artwork into files and optionally includes a copy in dowloaded files
 * **Format Flexibility** - Output files provided by Bandcamp (very fast) or re-encode files as: MP3, FLAC, OGG, or WAV (note: converted formats use 128 kbps source)
