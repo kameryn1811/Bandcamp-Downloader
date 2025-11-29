@@ -101,7 +101,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 **Windows 7: Missing DLL or Failed to load Python Errors**
 - If the app won’t launch on Windows 7 and you see errors like “api-ms-win-core-path-l1-1-0.dll not found” or “Failed to load Python DLL,” Windows 7 is missing a DLL required by Python 3.11+.
 - Fix it with the latest compatibility patch from nalexandru: https://github.com/nalexandru/api-ms-win-core-path-HACK/releases
-- Copy the DLLs:
+- Download the latest release and copy the DLLs to the following locations:
   - x86 → C:\Windows\SysWOW64
   - x64 → C:\Windows\System32 (Admin rights may be needed)
 - Restart your PC and relaunch the app.
