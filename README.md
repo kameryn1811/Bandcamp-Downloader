@@ -32,6 +32,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 * **Cover Art** - Embeds artwork into files and optionally includes a copy in dowloaded files.
 * **Format Flexibility** - Download original files provided by Bandcamp (very fast) or re-encode files as: MP3, FLAC, OGG, or WAV (note: converted formats use 128 kbps source and do not improve quality).
 * **Playlist Generation** - Create .m3u playlists automatically.
+* **Preview Path Link** - previews path and file that will be created, and opens windows explorer to the closest existing folder and directly to the album folder after download.
 * **Status Log** - Searchable status log with Ctrl+F, word wrap toggle, and clear with undo.
 * **Debug Mode** - Toggle visibility of debug information to troubleshoot issues. 
 * **Supported URLs:**
