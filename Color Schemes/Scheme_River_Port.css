@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Humber Color Scheme
+====================================================================*/
+
+:root {
+  --color-01: #0077CF; --text-01: var(--white); /* GH Blue */
+  --color-02: #000033; --text-02: var(--white); /* GH Dark Blue */
+  --color-03: #3E5C84; --text-03: var(--white); /* GH Blue Gray */
+  --color-04: #D5204E; --text-04: var(--white); /* GH Red */
+  --color-05: #6B7280; --text-05: var(--white); /* Modern Gray */
+  --color-06: #374151; --text-06: var(--white); /* Dark Gray */
+  --color-07: #0077CF; --text-07: var(--white); /* GH Blue */
+  --color-08: #DBEAFE; --text-08: #1e6ba4; /* GH Light Blue */
+  --color-09: #FFFFFF; --text-09: #0077CF; /* Pro White */
+ 

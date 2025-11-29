@@ -103,6 +103,18 @@
       "filename": "Scheme_Easter_Basket.css",
       "description": "Spring pastel colors",
       "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "River Port",
+      "filename": "Scheme_River_Port.css",
+      "description": "Artic travel olors",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Hospice",
+      "filename": "Scheme_Hospice.css",
+      "description": "Soothing Calm colors",
+      "author": "Bandcamp Downloader"
     }
   ]
 }
