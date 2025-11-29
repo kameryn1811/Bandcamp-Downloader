@@ -22,18 +22,18 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 
 ## Key Features
 
-* **Automated-Setup** - Checks dependencies and guides you through installation
-* **Simple GUI** - No command-line knowledge required
-* **Flexible Interface** - Adjust window size and expand/resize URL field height as needed
-* **Batch Downloads** - Download multiple albums at once by pasting multiple URLs
-* **Discography Support** - Download entire artist discographies with a single click
-* **Organization** - Fully customizable folder structure (e.g. Artist/Album etc.) and filename format (e.g. 01. Artist - Track.mp3)
-* **Metadata** - Automatically tags files with artist, album, track number, and date
-* **Cover Art** - Embeds artwork into files and optionally includes a copy in dowloaded files
-* **Format Flexibility** - Output files provided by Bandcamp (very fast) or re-encode files as: MP3, FLAC, OGG, or WAV (note: converted formats use 128 kbps source)
-* **Playlist Generation** - Create .m3u playlists automatically
-* **Status Log** - Searchable status log with Ctrl+F, word wrap toggle, and clear with undo
-* **Debug Mode** - Toggle visibility of debug information to troubleshoot issues 
+* **Executable** - Available in. exe format, simply download and run.
+* **Automatic Updates** - Select automatic updates or check now to be notified when there is a new update and accept to install it automatically.
+* **Intuitive Interface** - No command-line knowledge required, easy to use. 
+* **Batch Downloads** - Download multiple albums at once by pasting multiple URLs.
+* **Discography Support** - Download entire artist discographies with a single click.
+* **Organization** - Fully customizable folder structure (e.g. Artist/Album etc.) and filename format (e.g. 01. Artist - Track.mp3).
+* **Metadata** - Automatically tags files with artist, album, track number, and date.
+* **Cover Art** - Embeds artwork into files and optionally includes a copy in dowloaded files.
+* **Format Flexibility** - Download original files provided by Bandcamp (very fast) or re-encode files as: MP3, FLAC, OGG, or WAV (note: converted formats use 128 kbps source and do not improve quality).
+* **Playlist Generation** - Create .m3u playlists automatically.
+* **Status Log** - Searchable status log with Ctrl+F, word wrap toggle, and clear with undo.
+* **Debug Mode** - Toggle visibility of debug information to troubleshoot issues. 
 * **Supported URLs:**
    * Album pages: `https://[artist].bandcamp.com/album/[album]`
    * Track pages: `https://[artist].bandcamp.com/track/[track]`
@@ -44,8 +44,6 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 
 
 ### Option 1: Launcher (Recommended)
-
-**For users who want everything bundled:**
 
 **Installation**
 
@@ -88,10 +86,10 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 ## Troubleshooting
 
 **Windows SmartScreen Warning**
-- When you open BandcampDownloader.exe, Windows might say: "Windows protected your PC"
+- When you open BandcampDownloader.exe for the first time, Windows might say: "Windows protected your PC"
 - This happens because the app isn’t code-signed (certificates are pricey, and this is a free open-source project).
 - No worries, it’s safe to run. The EXE is the same code you can read on GitHub.
-- **To continue:** Click "More info" amd "Run anyway"
+- **To continue:** Click "More info" amd "Run anyway", Windows won't nag you again for the same. exe. 
 - **Want extra peace of mind?** - You can review the code, build it yourself, or use the standalone Python script like in Option 2.
 
 **"Python not found"**
@@ -122,7 +120,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
   
 **Album art and path previews slow to load or not showing at all**
 - VPNs, proxies, or ISP “secure connection” features can block or slow the CDN requests used to fetch artwork. Try turning these off or switching to a faster VPN location.
-- Antivirus software with HTTPS/SSL scanning (Kaspersky, ESET, Dr.Web, etc.) may interfere with image requests — temporarily disable these features to test.
+- Antivirus software with HTTPS/SSL scanning (Kaspersky, ESET, Dr.Web, etc.) may interfere with image requests — temporarily disable these features to test.If it helps, whitelist BandcampDownloader.exe and bandcamp.com.
 - Bad DNS routing can also cause slow or missing images. Switching to 1.1.1.1, 8.8.8.8, or 9.9.9.9 may help.
 
 
@@ -130,7 +128,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 
 **⚠️ About Quality**
 
-This tool downloads the **128 kbps MP3 streams** that Bandcamp makes available for free listening. These are the same quality files you hear when streaming on the website.
+This tool downloads the free **128 kbps MP3 streams** that Bandcamp makes available for previewing music. These are the same quality files you hear when streaming on the website.
 
 **Converting to FLAC, OGG, or WAV does NOT improve quality** - it only changes the file format. The source remains 128 kbps.
 
