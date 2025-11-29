@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Dimension Color Scheme - Inspired by HTML5 UP's Dimension
+====================================================================*/
+
+:root {
+/* Dimension Color Palette - Modern Geometric Teals & Greens */
+  --color-01: #0D9488; --text-01: var(--white); /* Teal */
+  --color-02: #059669; --text-02: var(--white); /* Emerald */
+  --color-03: #0891B2; --text-03: var(--white); /* Cyan */
+  --color-04: #10B981; --text-04: var(--white); /* Green */
+  --color-05: #06D6A0; --text-05: var(--black); /* Mint */
+  --color-06: #134E4A; --text-06: var(--white); /* Dark Teal */
+  --color-07: #B5FFC5; --text-07: #258357; /* Green Beer */
+  --color-08: #9AEBFF; --text-08: #007BEC; /* Foamy Blue */
+  --color-09: #A9D8D4; --text-09: #0F5848; /* Leprechaun Path */	

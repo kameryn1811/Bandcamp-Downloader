@@ -1,0 +1,17 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Smoothie Color Scheme (CE)
+====================================================================*/
+
+:root {
+  --color-01: #FF869E; --text-01: var(--white); /* Barbie Pink */
+  --color-02: #E65959; --text-02: var(--white); /* Staccato Mauve */
+  --color-03: #AD87EE; --text-03: var(--white); /* Hot Purple */
+  --color-04: #FFBE89; --text-04: var(--black); /* Creamsicle */
+  --color-05: #80F7E9; --text-05: var(--black); /* Teal Turnkey */
+  --color-06: #2FA4B1; --text-06: var(--white); /* Wallet */
+  --color-07: #FCEDE4; --text-07: #1D9B60; /* Sandy Orange */
+  --color-08: #D1E8FF; --text-08: #097FEB; /* Ocean Blue */
+  --color-09: #DFD5FF; --text-09: #1D1182; /* Purple Cloud */

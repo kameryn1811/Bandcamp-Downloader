@@ -1,0 +1,17 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Smoothie Color Scheme
+====================================================================*/
+
+:root {
+  --color-01: #6CD1EA; --text-01: var(--black); /* Blue Raspberry */
+  --color-02: #7A9DD1; --text-02: var(--white); /* Blueberry */
+  --color-03: #C9D062; --text-03: var(--black); /* Avocado */
+  --color-04: #AEA7D3; --text-04: var(--black); /* Grape */
+  --color-05: #94B894; --text-05: var(--black); /* Greens */
+  --color-06: #A06E95; --text-06: var(--white); /* Strawberry */
+  --color-07: #B6F1FF; --text-07: #4A91CB; /* Blueberry Yogurt */
+  --color-08: #E8E4FF; --text-08: #6E88AE; /* Grape Yogurt */
+  --color-09: #FAFFB8; --text-09: #A29320; /* Avocado Toast */

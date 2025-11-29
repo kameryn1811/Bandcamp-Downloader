@@ -1,0 +1,17 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Businessman Color Scheme
+====================================================================*/
+
+:root {
+  --color-01: #627DAC; --text-01: var(--white); /* Overcoat Blue */
+  --color-02: #5558BE; --text-02: var(--white); /* Tie Blue */
+  --color-03: #629C9D; --text-03: var(--white); /* Pants Green */
+  --color-04: #656F81; --text-04: var(--white); /* Laptop Gray */
+  --color-05: #939698; --text-05: var(--white); /* Watch Silver */
+  --color-06: #C79E9E; --text-06: var(--white); /* Handshake */
+  --color-07: #CFE0FF; --text-07: #226683; /* Denim Blue */
+  --color-08: #5C5FC2; --text-08: #ffffff; /* Tie Blue */
+  --color-09: #A5E8E9; --text-09: #295E8F; /* Business Card Teal */

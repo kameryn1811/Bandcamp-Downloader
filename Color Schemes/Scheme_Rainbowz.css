@@ -1,0 +1,17 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Sunset Color Scheme
+====================================================================*/
+
+:root {
+  --color-01: #CF3A91; --text-01: var(--white); /* Strawberry */
+  --color-02: #F59A32; --text-02: var(--white); /* Orange */
+  --color-03: #FFE438; --text-03: var(--black); /* Lemon */
+  --color-04: #63C563; --text-04: var(--black); /* Lime */
+  --color-05: #38B1C7; --text-05: var(--black); /* Blue Raspberry */
+  --color-06: #752791; --text-06: var(--white); /* Grape */
+  --color-07: #FFBBE2; --text-07: #F55959; /* Raspberry Yogurt */
+  --color-08: #FFE7CB; --text-08: #D88B21; /* Orange Creamsicle */
+  --color-09: #FFF6BF; --text-09: #8A7A12; /* Lemon Sherbert */	

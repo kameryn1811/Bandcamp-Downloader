@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Hospice Color Scheme
+====================================================================*/
+
+:root {
+  --color-01: #4C689A; --text-01: var(--white); /* Purply-Blue-Gray */
+  --color-02: #A41E58; --text-02: var(--white); /* Plum */
+  --color-03: #2C6348; --text-03: var(--white); /* Dark-Teal */
+  --color-04: #798EB3; --text-04: var(--white); /* Light-Blue-Gray */
+  --color-05: #939698; --text-05: var(--white); /* Guelph-Grey */
+  --color-06: #444444; --text-06: var(--white); /* Guelph-Grey-Dark */
+  --color-07: #C0D0FD; --text-07: #4C689A; /* Purple Clouds */
+  --color-08: #DEEAF6; --text-08: #4C68AB; /* Silver Lining */
+  --color-09: #D7FFE2; --text-09: #37539B; /* Cleansing Green */
+ 

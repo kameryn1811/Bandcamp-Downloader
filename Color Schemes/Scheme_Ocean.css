@@ -1,0 +1,19 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Ocean Color Scheme
+====================================================================*/
+
+:root {
+/* Ocean Color Palette - Blues and Teals */
+  --color-01: #0077BE; --text-01: var(--white); /* Deep Ocean Blue */
+  --color-02: #005F8A; --text-02: var(--white); /* Navy Blue */
+  --color-03: #00A0B0; --text-03: var(--white); /* Teal */
+  --color-04: #40C4E0; --text-04: var(--black); /* Light Blue */
+  --color-05: #87CEEB; --text-05: var(--black); /* Sky Blue */
+  --color-06: #2F4F4F; --text-06: var(--white); /* Dark Slate Gray */
+  --color-07: #1481C2; --text-07: #ffffff; /* Inky Depths */
+  --color-08: #E0F6FF; --text-08: #004B87; /* Icy Blue */
+  --color-09: #E0F8F8; --text-09: #008B8B; /* Sunny Blue */
+ 

@@ -1,0 +1,19 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Monochrome Color Scheme
+====================================================================*/
+
+:root {
+/* Monochrome Color Palette - Blacks, Whites, and Grays */
+  --color-01: #2C2C2C; --text-01: var(--white); /* Dark Gray */
+  --color-02: #1A1A1A; --text-02: var(--white); /* Very Dark Gray */
+  --color-03: #4A4A4A; --text-03: var(--white); /* Medium Dark Gray */
+  --color-04: #808080; --text-04: var(--white); /* Gray */
+  --color-05: #B0B0B0; --text-05: var(--black); /* Light Gray */
+  --color-06: #000000; --text-06: var(--white); /* Black */
+  --color-07: #585858; --text-07: #ffffff; /* Charcoal */
+  --color-08: #F5F5F5; --text-08: #5A5A5A; /* Dusty Grey */
+  --color-09: #E9E9E9; --text-09: #505050; /* Happy Grey */
+ 

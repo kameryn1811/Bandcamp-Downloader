@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Forest Color Scheme
+====================================================================*/
+
+:root {
+/* Forest Color Palette - Greens and Earth Tones */
+  --color-01: #228B22; --text-01: var(--white); /* Forest Green */
+  --color-02: #006400; --text-02: var(--white); /* Dark Green */
+  --color-03: #32CD32; --text-03: var(--black); /* Lime Green */
+  --color-04: #90EE90; --text-04: var(--black); /* Light Green */
+  --color-05: #8FBC8F; --text-05: var(--black); /* Dark Sea Green */
+  --color-06: #2F4F2F; --text-06: var(--white); /* Dark Olive Green */
+  --color-07: #F0FFF0; --text-07: #488B22; /* Sky Green */
+  --color-08: #C5FFC5; --text-08: #228B22; /* Mushroom Green */
+  --color-09: #006400; --text-09: #ffffff; /* Mossy Green */

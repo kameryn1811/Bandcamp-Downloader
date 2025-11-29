@@ -1,0 +1,17 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Pier at Dawn Color Scheme
+====================================================================*/
+
+:root {
+  --color-01: #56AFCD; --text-01: var(--white); /* Teal */
+  --color-02: #80BCC6; --text-02: var(--white); /* Shale */
+  --color-03: #207D9D; --text-03: var(--white); /* Frigid Blue */
+  --color-04: #967BA3; --text-04: var(--white); /* Twilight */
+  --color-05: #6B6B6B; --text-05: var(--white); /* Gravel Gray */
+  --color-06: #444444; --text-06: var(--white); /* Dusk Gray */
+  --color-07: #BAEEFF; --text-07: #3195B6; /* Icy Blue */
+  --color-08: #F1D4FF; --text-08: #3681C6; /* Pretty Pink */
+  --color-09: #A37AB6; --text-09: #ffffff; /* Twilight */

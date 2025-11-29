@@ -1,0 +1,21 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Sunset Color Scheme
+====================================================================*/
+
+:root {
+/* Sunset Color Palette - Oranges, Reds, and Warm Tones */
+  --color-01: #FF4500; --text-01: var(--white); /* Orange Red */
+  --color-02: #DC143C; --text-02: var(--white); /* Crimson */
+  --color-03: #FF8C00; --text-03: var(--white); /* Dark Orange */
+  --color-04: #FFB347; --text-04: var(--black); /* Peach */
+  --color-05: #F4A460; --text-05: var(--black); /* Sandy Brown */
+  --color-06: #8B4513; --text-06: var(--white); /* Saddle Brown */
+  --color-07: #FF9372; --text-07: #ffffff; /* Lava Red */
+  --color-08: #FFE1E1; --text-08: #D42B2B; /* Burnt Red */
+  --color-09: #FFF4C8; --text-09: #997A2E; /* Dusty Yellow */
+
+
+ 

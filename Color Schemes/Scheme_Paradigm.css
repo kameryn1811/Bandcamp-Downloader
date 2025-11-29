@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Paradigm Color Scheme - Inspired by HTML5 UP's Paradigm Shift
+====================================================================*/
+
+:root {
+/* Paradigm Color Palette - Modern Tech Blues with Electric Accents */
+  --color-01: #1E3A8A; --text-01: var(--white); /* Deep Tech Blue */
+  --color-02: #3B82F6; --text-02: var(--white); /* Electric Blue */
+  --color-03: #06B6D4; --text-03: var(--white); /* Cyan Accent */
+  --color-04: #8B5CF6; --text-04: var(--white); /* Purple Accent */
+  --color-05: #F59E0B; --text-05: var(--black); /* Amber Highlight */
+  --color-06: #1F2937; --text-06: var(--white); /* Dark Slate */
+  --color-07: #ECFDF5; --text-07: #37B48A; /* Plasma Green */
+  --color-08: #DEF7FF; --text-08: #467EFA; /* Tech Blue */
+  --color-09: #EEDEFF; --text-09: #7C3AED; /* Neon Purple */

@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Ethereal Color Scheme - Inspired by HTML5 UP's Ethereal
+====================================================================*/
+
+:root {
+/* Ethereal Color Palette - Soft Pastels & Dreamy Tones */
+  --color-01: #8B5A96; --text-01: var(--white); /* Soft Purple */
+  --color-02: #A855F7; --text-02: var(--white); /* Lavender Purple */
+  --color-03: #EC4899; --text-03: var(--white); /* Rose Pink */
+  --color-04: #06B6D4; --text-04: var(--white); /* Sky Blue */
+  --color-05: #F472B6; --text-05: var(--black); /* Light Pink */
+  --color-06: #6366F1; --text-06: var(--white); /* Indigo */
+  --color-07: #FF6AB4; --text-07: #ffffff; /* Bubblegum Pink */
+  --color-08: #878AFF; --text-08: #ffffff; /* Cosmo Purple */
+  --color-09: #DFD5FF; --text-09: #574BB6; /* Soft Lavender */

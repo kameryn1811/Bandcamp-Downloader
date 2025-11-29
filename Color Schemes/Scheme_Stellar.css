@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Stellar Color Scheme - Inspired by HTML5 UP's Stellar
+====================================================================*/
+
+:root {
+/* Stellar Color Palette - Cosmic Blues & Galactic Purples */
+  --color-01: #1E1B4B; --text-01: var(--white); /* Deep Space */
+  --color-02: #3730A3; --text-02: var(--white); /* Cosmic Blue */
+  --color-03: #7C3AED; --text-03: var(--white); /* Stellar Purple */
+  --color-04: #2563EB; --text-04: var(--white); /* Nebula Blue */
+  --color-05: #8B5CF6; --text-05: var(--white); /* Galaxy Purple */
+  --color-06: #0F0F23; --text-06: var(--white); /* Void Black */
+  --color-07: #8178FF; --text-07: #ffffff; /* Gateway Purple */
+  --color-08: #CFDEFF; --text-08: #6E39C9; /* Water Planet Blue */
+  --color-09: #F3F0FF; --text-09: #6759DC; /* Shiny Star */

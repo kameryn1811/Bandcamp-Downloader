@@ -1,0 +1,18 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Editorial Color Scheme - Inspired by HTML5 UP's Editorial
+====================================================================*/
+
+:root {
+/* Editorial Color Palette - Professional Publishing Tones */
+  --color-01: #92400E; --text-01: var(--white); /* Warm Brown */
+  --color-02: #7C2D12; --text-02: var(--white); /* Deep Brown */
+  --color-03: #B91C1C; --text-03: var(--white); /* Editorial Red */
+  --color-04: #D97706; --text-04: var(--white); /* Amber */
+  --color-05: #F59E0B; --text-05: var(--black); /* Golden Yellow */
+  --color-06: #451A03; --text-06: var(--white); /* Dark Brown */
+  --color-07: #EABA9E; --text-07: #484235; /* Mochachino */
+  --color-08: #FFF4DB; --text-08: #6E5853; /* Parchment */
+  --color-09: #FFE0A6; --text-09: #4D3D36; /* Headline */

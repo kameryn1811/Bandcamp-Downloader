@@ -1,0 +1,17 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Easter Basket Color Scheme (CE)
+====================================================================*/
+
+:root {
+  --color-01: #7887B5; --text-01: var(--white); /* Painterly Purple */
+  --color-02: #5D8BD5; --text-02: var(--white); /* Tea Cozy Blue */
+  --color-03: #72CADA; --text-03: var(--white); /* Springtime Air */
+  --color-04: #8976B7; --text-04: var(--white); /* Purple Smoothie */
+  --color-05: #FFD080; --text-05: var(--black); /* Hay Yellow */
+  --color-06: #4D6689; --text-06: var(--white); /* Cobblestone Gray */
+  --color-07: #D3F8FF; --text-07: #3BB8B2; /* Robin Egg Blue */
+  --color-08: #FFE5B9; --text-08: #B59715; /* Chick Yellow */
+  --color-09: #EAE4FF; --text-09: #766BD0; /* Violet */	

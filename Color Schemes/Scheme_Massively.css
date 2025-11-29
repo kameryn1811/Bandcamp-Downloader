@@ -1,0 +1,19 @@
+@charset "utf-8";
+/* CSS Document */
+
+/*====================================================================
+  Massively Color Scheme - Inspired by HTML5 UP's Massively
+====================================================================*/
+
+:root {
+/* Massively Color Palette - Dark & Dramatic with Rich Reds */
+  --color-01: #DC2626; --text-01: var(--white); /* Bold Red */
+  --color-02: #991B1B; --text-02: var(--white); /* Deep Red */
+  --color-03: #1F2937; --text-03: var(--white); /* Charcoal */
+  --color-04: #374151; --text-04: var(--white); /* Dark Gray */
+  --color-05: #6B7280; --text-05: var(--white); /* Medium Gray */
+  --color-06: #111827; --text-06: var(--white); /* Near Black */
+  --color-07: #FEF2F2; --text-07: #B91C1C; /* Mass Well Red Background */
+  --color-08: #F9FAFB; --text-08: #1F2937; /* Mass Well Dark Background */
+  --color-09: #F9FAFB; --text-09: #4B5563; /* Mass Well Gray Background */
+ 
