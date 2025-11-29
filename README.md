@@ -98,6 +98,15 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 - Reinstall Python and ensure "Add Python to PATH" is checked
 - Or manually add Python to your system PATH
 
+**Windows 7: Missing DLL or Failed to load Python Errors**
+- If the app won’t launch on Windows 7 and you see errors like “api-ms-win-core-path-l1-1-0.dll not found” or “Failed to load Python DLL,” Windows 7 is missing a DLL required by Python 3.11+.
+- Fix it with the latest compatibility patch: https://github.com/nalexandru/api-ms-win-core-path-HACK/releases
+- Copy the DLLs:
+  - x86 → C:\Windows\SysWOW64
+  - x64 → C:\Windows\System32 (Admin rights may be needed)
+- Restart your PC and relaunch the app.
+- Thanks to @alabx for this [fix](https://github.com/kameryn1811/Bandcamp-Downloader/issues/6)! 
+
 **"ffmpeg.exe not found"**
 - Download from https://www.gyan.dev/ffmpeg/builds/
 - Place `ffmpeg.exe` in the same folder as the script
