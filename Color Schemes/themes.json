@@ -1,0 +1,109 @@
+{
+  "version": "1.0",
+  "description": "Color scheme themes for Bandcamp Downloader URL tags",
+  "themes": [
+    {
+      "name": "Ocean",
+      "filename": "Scheme_Ocean.css",
+      "description": "Blues and teals inspired by ocean depths",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Sunset",
+      "filename": "Scheme_Rainbowz.css",
+      "description": "Vibrant sunset colors - oranges, pinks, and warm tones",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Forest",
+      "filename": "Scheme_Forest.css",
+      "description": "Greens and earth tones like a forest",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Monochrome",
+      "filename": "Scheme_Monochrome.css",
+      "description": "Elegant black, white, and gray palette",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Stellar",
+      "filename": "Scheme_Stellar.css",
+      "description": "Cosmic blues and galactic purples",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Paradigm",
+      "filename": "Scheme_Paradigm.css",
+      "description": "Modern tech blues with electric accents",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Ethereal",
+      "filename": "Scheme_Ethereal.css",
+      "description": "Soft pastels and dreamy tones",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Editorial",
+      "filename": "Scheme_Editorial.css",
+      "description": "Professional publishing tones",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Dimension",
+      "filename": "Scheme_Dimension.css",
+      "description": "Modern geometric teals and greens",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Massively",
+      "filename": "Scheme_Massively.css",
+      "description": "Dark and dramatic with rich reds",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Hospice",
+      "filename": "Scheme_Hospice.css",
+      "description": "Calming purples and blues",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Estuary",
+      "filename": "Scheme_Estuary.css",
+      "description": "University-inspired blues and grays",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Businessman",
+      "filename": "Scheme_Businessman.css",
+      "description": "Professional business tones",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Miami Beach",
+      "filename": "Scheme_MiamiBeach.css",
+      "description": "Tropical beach vibes",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Pier at Dawn",
+      "filename": "Scheme_Pier_at_Dawn.css",
+      "description": "Soft morning colors",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Smoothie",
+      "filename": "Scheme_Smoothie.css",
+      "description": "Fresh fruit smoothie colors",
+      "author": "Bandcamp Downloader"
+    },
+    {
+      "name": "Easter Basket",
+      "filename": "Scheme_Easter_Basket.css",
+      "description": "Spring pastel colors",
+      "author": "Bandcamp Downloader"
+    }
+  ]
+}
+
