@@ -12721,8 +12721,15 @@ class BandcampDownloaderGUI:
             PhotoImage object showing scheme name and colored squares, or None if PIL unavailable
         """
         try:
-            from PIL import Image, ImageDraw, ImageFont
-            from PIL import ImageTk
+            # Import PIL modules - ensure all are available
+            try:
+                from PIL import Image, ImageDraw, ImageFont, ImageTk
+            except ImportError:
+                # Fallback: try importing individually
+                import PIL.Image as Image
+                import PIL.ImageDraw as ImageDraw
+                import PIL.ImageFont as ImageFont
+                import PIL.ImageTk as ImageTk
             
             # Create display name
             if scheme_name == "default":
@@ -12736,17 +12743,41 @@ class BandcampDownloaderGUI:
             num_to_show = min(num_colors, len(colors))
             squares_width = (square_size * num_to_show) + (spacing * (num_to_show - 1))
             
-            # Estimate text width (will be adjusted based on actual rendering)
-            # Use a reasonable font size for menu items
+            # Font loading - more robust for PyInstaller bundles
+            font = None
             try:
-                # Try to use a system font
-                font = ImageFont.truetype("arial.ttf", 10)
+                # Try Windows system fonts with full paths (works in PyInstaller)
+                import sys
+                if sys.platform == 'win32':
+                    # Try common Windows font paths
+                    font_paths = [
+                        r"C:\Windows\Fonts\arial.ttf",
+                        r"C:\Windows\Fonts\segoeui.ttf",
+                        r"C:\Windows\Fonts\calibri.ttf",
+                    ]
+                    for font_path in font_paths:
+                        try:
+                            if Path(font_path).exists():
+                                font = ImageFont.truetype(font_path, 10)
+                                break
+                        except:
+                            continue
+                
+                # If Windows paths failed, try direct font name (may work in some cases)
+                if font is None:
+                    try:
+                        font = ImageFont.truetype("arial.ttf", 10)
+                    except:
+                        try:
+                            font = ImageFont.truetype("segoeui.ttf", 10)
+                        except:
+                            pass
             except:
-                try:
-                    font = ImageFont.truetype("segoeui.ttf", 10)
-                except:
-                    # Fallback to default font
-                    font = ImageFont.load_default()
+                pass
+            
+            # Final fallback to default font (always works)
+            if font is None:
+                font = ImageFont.load_default()
             
             # Create a temporary image to measure text width
             temp_img = Image.new('RGB', (1, 1))
@@ -12768,7 +12799,11 @@ class BandcampDownloaderGUI:
             # Draw scheme name text (left side)
             text_x = text_padding
             text_y = (total_height - text_height) // 2
-            draw.text((text_x, text_y), display_name, fill='#CCCCCC', font=font)
+            if font:
+                draw.text((text_x, text_y), display_name, fill='#CCCCCC', font=font)
+            else:
+                # Fallback: draw text without font (basic rendering)
+                draw.text((text_x, text_y), display_name, fill='#CCCCCC')
             
             # Draw colored squares (right side)
             squares_x = text_padding + text_width + gap
@@ -12797,7 +12832,13 @@ class BandcampDownloaderGUI:
             # Convert to PhotoImage
             photo = ImageTk.PhotoImage(img)
             return photo
-        except Exception:
+        except Exception as e:
+            # Log error for debugging (only in debug mode or if logging is available)
+            if hasattr(self, 'log'):
+                try:
+                    self.log(f"DEBUG: Failed to create preview image for {scheme_name}: {str(e)}")
+                except:
+                    pass
             # Fallback: return None if image creation fails
             return None
     
@@ -12834,8 +12875,13 @@ class BandcampDownloaderGUI:
                         preview_image = self._create_color_scheme_preview_image(scheme_name, colors, num_colors=6)
                         if preview_image:
                             self._color_scheme_preview_images.append(preview_image)  # Keep reference
-                    except Exception:
-                        # If image creation fails, continue without preview
+                    except Exception as e:
+                        # If image creation fails, log for debugging and continue without preview
+                        if hasattr(self, 'log'):
+                            try:
+                                self.log(f"DEBUG: Preview image creation failed for {scheme_name}: {str(e)}")
+                            except:
+                                pass
                         pass
                     
                     # Create display name for fallback
