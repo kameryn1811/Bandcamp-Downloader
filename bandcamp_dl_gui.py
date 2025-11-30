@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 
 import sys
 import subprocess
@@ -194,6 +194,147 @@ class BandcampDownloaderGUI:
         '#B91C1C',  # Crimson (additional variety)
     ]
     
+    @staticmethod
+    def _parse_css_color_scheme(css_content):
+        """Parse CSS content to extract color scheme.
+        
+        Extracts --color-01 through --color-09 from CSS :root variables.
+        
+        Args:
+            css_content: String content of CSS file
+            
+        Returns:
+            List of 9 hex color strings, or None if parsing fails
+        """
+        import re
+        colors = {}
+        # Pattern to match --color-XX: #HEX; format (handles both 3 and 6 digit hex)
+        # Matches: --color-01: #0077BE; or --color-01: #ABC;
+        pattern = r'--color-0([1-9]):\s*(#[0-9A-Fa-f]{3,6})'
+        matches = re.findall(pattern, css_content, re.IGNORECASE)
+        
+        if not matches:
+            return None
+        
+        # Store colors by index
+        for match in matches:
+            color_num = int(match[0])
+            hex_color = match[1]
+            # Convert 3-digit hex to 6-digit if needed
+            if len(hex_color) == 4:  # #RGB format
+                hex_color = f"#{hex_color[1]}{hex_color[1]}{hex_color[2]}{hex_color[2]}{hex_color[3]}{hex_color[3]}"
+            colors[color_num] = hex_color.upper()
+        
+        # Check we have all 9 colors
+        if len(colors) != 9 or set(colors.keys()) != set(range(1, 10)):
+            return None
+        
+        # Return as list in order
+        return [colors[i] for i in range(1, 10)]
+    
+    @classmethod
+    def _load_color_schemes_from_css(cls):
+        """Load all color schemes from CSS files in Color Schemes folder.
+        
+        Returns:
+            Dictionary mapping scheme names to lists of colors
+        """
+        schemes = {}
+        script_dir = Path(__file__).resolve().parent
+        css_dir = script_dir / "Color Schemes"
+        
+        # Add default scheme (current palette)
+        schemes["default"] = cls.TAG_COLORS.copy()
+        
+        if not css_dir.exists():
+            return schemes
+        
+        # Process each CSS file
+        for css_file in css_dir.glob("Scheme_*.css"):
+            try:
+                with open(css_file, 'r', encoding='utf-8') as f:
+                    css_content = f.read()
+                
+                colors = cls._parse_css_color_scheme(css_content)
+                if colors:
+                    # Extract scheme name from filename
+                    # "Scheme_Ocean.css" -> "Ocean"
+                    # "Scheme_Rainbowz-EE.css" -> "Rainbowz"
+                    scheme_name = css_file.stem.replace("Scheme_", "")
+                    # Remove suffixes like "-CE", "-EE"
+                    scheme_name = scheme_name.split("-")[0]
+                    # Clean up: "Pier_at_Dawn" -> "Pier at Dawn"
+                    scheme_name = scheme_name.replace("_", " ")
+                    
+                    # Expand 9 colors to 16 by cycling (for better variety with many URLs)
+                    expanded_colors = []
+                    for i in range(16):
+                        expanded_colors.append(colors[i % 9])
+                    schemes[scheme_name] = expanded_colors
+            except Exception:
+                # Skip files that can't be parsed
+                continue
+        
+        return schemes
+    
+    @staticmethod
+    def _calculate_luminance(hex_color):
+        """Calculate relative luminance of a color (WCAG formula).
+        
+        Args:
+            hex_color: Hex color string (e.g., '#FF0000')
+            
+        Returns:
+            Luminance value between 0.0 (dark) and 1.0 (light)
+        """
+        # Remove # if present
+        hex_color = hex_color.lstrip('#')
+        
+        # Convert to RGB
+        r = int(hex_color[0:2], 16) / 255.0
+        g = int(hex_color[2:4], 16) / 255.0
+        b = int(hex_color[4:6], 16) / 255.0
+        
+        # Apply gamma correction
+        def gamma_correct(c):
+            if c <= 0.03928:
+                return c / 12.92
+            return ((c + 0.055) / 1.055) ** 2.4
+        
+        r = gamma_correct(r)
+        g = gamma_correct(g)
+        b = gamma_correct(b)
+        
+        # Calculate relative luminance (WCAG formula)
+        luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        return luminance
+    
+    @classmethod
+    def _get_text_color_for_background(cls, bg_color):
+        """Determine whether to use black or white text for a background color.
+        
+        Uses WCAG contrast guidelines - if background is light (luminance > 0.5),
+        use black text, otherwise use white.
+        
+        Args:
+            bg_color: Hex color string (e.g., '#FF0000')
+            
+        Returns:
+            '#000000' for light backgrounds, '#FFFFFF' for dark backgrounds
+        """
+        luminance = cls._calculate_luminance(bg_color)
+        return '#000000' if luminance > 0.5 else '#FFFFFF'
+    
+    # Load color schemes (will be populated on first access)
+    _TAG_COLOR_SCHEMES = None
+    
+    @classmethod
+    def _get_color_schemes(cls):
+        """Get color schemes dictionary, loading from CSS if not already loaded."""
+        if cls._TAG_COLOR_SCHEMES is None:
+            cls._TAG_COLOR_SCHEMES = cls._load_color_schemes_from_css()
+        return cls._TAG_COLOR_SCHEMES
+    
     def _extract_format(self, format_val):
         """Extract base format from display value (e.g., 'mp3 (128kbps)' -> 'mp3')."""
         if format_val == "Original":
@@ -324,6 +465,15 @@ class BandcampDownloaderGUI:
         self.download_discography_var = BooleanVar(value=False)  # Always default to off, not persistent
         self.auto_check_updates_var = BooleanVar(value=self.load_saved_auto_check_updates())
         
+        # Color scheme for URL tags
+        self.current_tag_color_scheme = self.load_saved_tag_color_scheme()
+        schemes = self._get_color_schemes()
+        if self.current_tag_color_scheme not in schemes:
+            self.current_tag_color_scheme = "default"
+        self.current_tag_colors = schemes.get(self.current_tag_color_scheme, schemes["default"])
+        # Initialize variable for menu (will be created when menu is first built)
+        self.tag_color_scheme_var = StringVar(value=self.current_tag_color_scheme)
+        
         # Batch URL mode tracking
         self.batch_mode = False  # Track if we're in batch mode (multiple URLs)
         self.url_entry_widget = None  # Store reference to Entry widget
@@ -348,11 +498,14 @@ class BandcampDownloaderGUI:
         self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
         self.url_check_timer = None  # For debouncing URL changes
         self.album_art_image = None  # Store reference to prevent garbage collection
+        self.preloaded_album_art_image = None  # Cache for preloaded album art (for instant display when switching from hidden)
+        self.preloaded_album_art_pil = None  # Store original PIL Image for blur effect
         self.album_art_fetching = False  # Flag to prevent multiple simultaneous fetches
         self.current_thumbnail_url = None  # Track current thumbnail to avoid re-downloading
+        self.current_bio_pic_url = None  # Track current bio pic URL to avoid re-downloading
         self.artwork_fetch_id = 0  # Track fetch requests to cancel stale ones
         self.current_url_being_processed = None  # Track URL currently being processed to avoid cancelling valid fetches
-        self.album_art_visible = True  # Track album art panel visibility
+        self.album_art_mode = "album_art"  # Track album art panel mode: "album_art", "bio_pic", or "hidden"
         
         # URL text widget resize state
         self.url_text_height = 1  # Default height in lines (collapsed)
@@ -732,13 +885,14 @@ class BandcampDownloaderGUI:
             except:
                 pass
         
-        # Migrate album art visibility
+        # Migrate album art visibility (old boolean format)
         old_file = self.script_dir / "album_art_visible.txt"
         if old_file.exists():
             try:
                 with open(old_file, 'r') as f:
                     value = f.read().strip().lower()
-                    settings["album_art_visible"] = (value == "true")
+                    # Migrate to new mode format
+                    settings["album_art_mode"] = "album_art" if (value == "true") else "hidden"
                     migrated = True
             except:
                 pass
@@ -833,7 +987,7 @@ class BandcampDownloaderGUI:
                 "create_playlist": self.create_playlist_var.get(),
                 "download_cover_art": self.download_cover_art_var.get(),
                 # download_discography is intentionally not saved - always defaults to off
-                "album_art_visible": self.album_art_visible,
+                "album_art_mode": self.album_art_mode,
                 "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False,
                 "auto_check_updates": self.auto_check_updates_var.get() if hasattr(self, 'auto_check_updates_var') else True,
                 "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else []),
@@ -1821,16 +1975,27 @@ class BandcampDownloaderGUI:
         self._save_settings()
     
     def load_saved_album_art_state(self):
-        """Load saved album art visibility state, default to visible if not found."""
+        """Load saved album art mode state, default to album_art if not found."""
         settings = self._load_settings()
-        self.album_art_visible = settings.get("album_art_visible", True)
+        # Migrate old boolean to new mode enum
+        old_visible = settings.get("album_art_visible")
+        if old_visible is not None:
+            # Migrate from old boolean format
+            self.album_art_mode = "album_art" if old_visible else "hidden"
+        else:
+            # Use new mode format, default to "album_art"
+            mode = settings.get("album_art_mode", "album_art")
+            if mode in ["album_art", "bio_pic", "hidden"]:
+                self.album_art_mode = mode
+            else:
+                self.album_art_mode = "album_art"
         # Apply state after UI is set up
-        if not self.album_art_visible:
+        if self.album_art_mode != "album_art":
             self.root.after(100, self._apply_saved_album_art_state)
     
     def _apply_saved_album_art_state(self):
         """Apply saved album art state after UI is set up."""
-        if not self.album_art_visible:
+        if self.album_art_mode == "hidden":
             if hasattr(self, 'album_art_frame'):
                 self.album_art_frame.grid_remove()
             if hasattr(self, 'settings_frame'):
@@ -1840,9 +2005,16 @@ class BandcampDownloaderGUI:
                 self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
                 self.show_album_art_btn.config(fg='#808080', cursor='hand2')
         else:
-            # Album art is visible, ensure eye icon is removed from grid
+            # Album art or bio pic is visible, ensure eye icon is removed from grid
+            if hasattr(self, 'album_art_frame'):
+                self.album_art_frame.grid()
+            if hasattr(self, 'settings_frame'):
+                self.settings_frame.grid_configure(columnspan=2)
             if hasattr(self, 'show_album_art_btn'):
                 self.show_album_art_btn.grid_remove()
+            # Fetch appropriate image based on mode
+            if self.album_art_mode == "bio_pic" and hasattr(self, 'current_bio_pic_url') and self.current_bio_pic_url:
+                self.root.after(200, lambda: self.fetch_and_display_bio_pic(self.current_bio_pic_url))
     
     def save_album_art_state(self):
         """Save album art visibility state."""
@@ -1852,6 +2024,10 @@ class BandcampDownloaderGUI:
         """Load saved track numbering preference, default to Track if not found."""
         settings = self._load_settings()
         numbering_val = settings.get("track_numbering", self.DEFAULT_NUMBERING)
+        
+        # Check if it's "Original" (preserve original filenames)
+        if numbering_val == "Original":
+            return "Original"
         
         # Check if it's a default format
         valid_options = ["Track", "01. Track", "Artist - Track", "01. Artist - Track"]
@@ -1929,6 +2105,22 @@ class BandcampDownloaderGUI:
     def on_auto_check_updates_change(self):
         """Handle auto-check for updates checkbox change."""
         self.save_auto_check_updates()
+    
+    def load_saved_tag_color_scheme(self):
+        """Load saved tag color scheme preference."""
+        settings = self._load_settings()
+        scheme = settings.get("tag_color_scheme", "default")
+        # Validate scheme exists
+        schemes = self._get_color_schemes()
+        if scheme not in schemes:
+            return "default"
+        return scheme
+    
+    def save_tag_color_scheme(self):
+        """Save tag color scheme preference."""
+        settings = self._load_settings()
+        settings["tag_color_scheme"] = self.current_tag_color_scheme
+        self._save_settings(settings)
     
     def save_download_discography(self):
         """Save download discography preference."""
@@ -2483,7 +2675,7 @@ class BandcampDownloaderGUI:
         )
         # Only add to grid if album art is hidden (will be shown/hidden by toggle_album_art)
         # If album art is visible by default, don't add to grid initially to save space
-        if not self.album_art_visible:
+        if self.album_art_mode == "hidden":
             self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
             self.show_album_art_btn.config(fg='#808080', cursor='hand2')
         # Always bind events (they'll work when the button is in grid)
@@ -2517,6 +2709,9 @@ class BandcampDownloaderGUI:
         # Build the menu with standard formats, separator, and custom formats
         self._build_filename_menu(numbering_menu)
         
+        # Update edit button state based on initial selection (after button is created)
+        # Will be called after button creation below
+        
         # Customize button (✏️) - matching folder structure style
         filename_customize_btn = Label(
             filename_frame,
@@ -2533,6 +2728,9 @@ class BandcampDownloaderGUI:
         filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg='#D4D4D4'))
         filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg='#808080'))
         self.filename_customize_btn = filename_customize_btn  # Store reference
+        
+        # Update edit button state based on initial selection
+        self.root.after(100, self._update_filename_edit_button)
         
         # Manage button (🗑️) - trash can icon for managing/deleting filename formats
         has_custom_filename = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
@@ -3417,6 +3615,9 @@ class BandcampDownloaderGUI:
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.format_suggestion_shown = False
             self.current_thumbnail_url = None
+            self.current_bio_pic_url = None
+            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
             self.album_art_fetching = False
             self.update_preview()
             self.clear_album_art()
@@ -3539,6 +3740,7 @@ class BandcampDownloaderGUI:
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
         self.format_suggestion_shown = False  # Reset format suggestion flag
         self.current_thumbnail_url = None
+        self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
         self.album_art_fetching = False
         self.update_preview()
         self.clear_album_art()
@@ -4026,6 +4228,9 @@ class BandcampDownloaderGUI:
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self.current_thumbnail_url = None
+                    self.current_bio_pic_url = None
+                    self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+                    self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
                     self.album_art_fetching = False
                     self.update_preview()
                     self.clear_album_art()
@@ -4052,6 +4257,9 @@ class BandcampDownloaderGUI:
             # Immediately clear preview and artwork
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.current_thumbnail_url = None
+            self.current_bio_pic_url = None
+            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
             self.album_art_fetching = False
             self.update_preview()
             self.clear_album_art()
@@ -4100,6 +4308,9 @@ class BandcampDownloaderGUI:
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self.current_thumbnail_url = None
+                    self.current_bio_pic_url = None
+                    self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+                    self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
                     self.album_art_fetching = False
                     self.update_preview()
                     self.clear_album_art()
@@ -4150,6 +4361,9 @@ class BandcampDownloaderGUI:
                 # Immediately clear preview and artwork
                 self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                 self.current_thumbnail_url = None
+                self.current_bio_pic_url = None
+                self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+                self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
                 self.album_art_fetching = False
                 self.update_preview()
                 self.clear_album_art()
@@ -4176,6 +4390,9 @@ class BandcampDownloaderGUI:
             # Immediately clear preview and artwork
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.current_thumbnail_url = None
+            self.current_bio_pic_url = None
+            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
             self.album_art_fetching = False
             self.update_preview()
             self.clear_album_art()
@@ -4218,6 +4435,9 @@ class BandcampDownloaderGUI:
                 # Immediately clear preview and artwork
                 self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                 self.current_thumbnail_url = None
+                self.current_bio_pic_url = None
+                self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+                self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
                 self.album_art_fetching = False
                 self.update_preview()
                 self.clear_album_art()
@@ -4628,9 +4848,20 @@ class BandcampDownloaderGUI:
         Returns:
             Hex color string (e.g., '#2E4A5C')
         """
-        # Use modulo to cycle through colors
-        color_index = index % len(self.TAG_COLORS)
-        return self.TAG_COLORS[color_index]
+        # Use modulo to cycle through colors from current scheme
+        color_index = index % len(self.current_tag_colors)
+        return self.current_tag_colors[color_index]
+    
+    def _get_tag_text_color(self, bg_color):
+        """Get appropriate text color (black or white) for a background color.
+        
+        Args:
+            bg_color: Hex color string for background
+            
+        Returns:
+            '#000000' or '#FFFFFF' based on background luminance
+        """
+        return self._get_text_color_for_background(bg_color)
     
     def _get_url_placeholder(self, url):
         """Get placeholder text for a URL tag before metadata is available.
@@ -4995,10 +5226,11 @@ class BandcampDownloaderGUI:
                     
                     # Style the tag text with sequential color assignment
                     tag_color = self._get_tag_color_sequential(tag_id_counter - 1)
+                    tag_text_color = self._get_tag_text_color(tag_color)
                     text_widget.tag_add(f"url_tag_{tag_id}", start_pos, end_pos)
                     text_widget.tag_config(f"url_tag_{tag_id}", 
                                          background=tag_color, 
-                                         foreground='#FFFFFF',
+                                         foreground=tag_text_color,
                                          font=("Segoe UI", 9, "bold"),
                                          relief='flat',
                                          borderwidth=0)
@@ -5408,6 +5640,9 @@ class BandcampDownloaderGUI:
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.format_suggestion_shown = False  # Reset format suggestion flag
             self.current_thumbnail_url = None
+            self.current_bio_pic_url = None
+            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
             self.album_art_fetching = False
             self.update_preview()
             self.clear_album_art()
@@ -5424,6 +5659,9 @@ class BandcampDownloaderGUI:
             self.artwork_fetch_id += 1
             self.current_url_being_processed = url
             self.current_thumbnail_url = None
+            self.current_bio_pic_url = None
+            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
             self.album_art_fetching = False
         
         # Fetch metadata in background thread (only for last URL for preview)
@@ -6140,6 +6378,7 @@ class BandcampDownloaderGUI:
                 
                 # Look for album art in various patterns Bandcamp uses
                 thumbnail_url = None
+                bio_pic_url = None
                 
                 # Pattern 1: Look for popupImage or main image in data attributes
                 patterns = [
@@ -6164,6 +6403,60 @@ class BandcampDownloaderGUI:
                             thumbnail_url = f"{parsed.scheme}://{parsed.netloc}{thumbnail_url}"
                         break
                 
+                # Look for bio pic in the bio-container section
+                # Pattern: <div class="artists-bio-pic"> ... <a class="popupImage" href="..."> or <img class="band-photo" src="...">
+                bio_pic_patterns = [
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
+                ]
+                
+                for pattern in bio_pic_patterns:
+                    match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        bio_pic_url = match.group(1)
+                        # Make sure it's a full URL
+                        if bio_pic_url.startswith('//'):
+                            bio_pic_url = 'https:' + bio_pic_url
+                        elif bio_pic_url.startswith('/'):
+                            # Extract base URL
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                        break
+                
+                # If bio pic not found with popupImage, try finding it in bio-container more broadly
+                if not bio_pic_url:
+                    # Look for bio-container and then find any image within it
+                    bio_container_match = re.search(r'<div[^>]*id=["\']bio-container["\'][^>]*>(.*?)</div>', html_content, re.IGNORECASE | re.DOTALL)
+                    if bio_container_match:
+                        bio_content = bio_container_match.group(1)
+                        # Look for any image URL in the bio container
+                        img_match = re.search(r'(?:href|src)=["\']([^"\']+\.(jpg|jpeg|png|webp))', bio_content, re.IGNORECASE)
+                        if img_match:
+                            bio_pic_url = img_match.group(1)
+                            if bio_pic_url.startswith('//'):
+                                bio_pic_url = 'https:' + bio_pic_url
+                            elif bio_pic_url.startswith('/'):
+                                from urllib.parse import urlparse
+                                parsed = urlparse(url)
+                                bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                
+                # Store bio pic URL if found
+                if bio_pic_url:
+                    # Try to get a larger/higher quality size for bio pic
+                    high_quality_bio_pic = bio_pic_url
+                    if '_' in bio_pic_url or 'bcbits.com' in bio_pic_url:
+                        # Try common larger sizes (in order of preference)
+                        for size in ['_500', '_300', '_200', '_100', '_64']:
+                            if size in bio_pic_url:
+                                break
+                            test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                            if test_url != bio_pic_url:
+                                high_quality_bio_pic = test_url
+                                break
+                    self.current_bio_pic_url = high_quality_bio_pic
+                
                 # If found, try to get a larger/higher quality size for better image quality
                 if thumbnail_url and not self.album_art_fetching:
                     # Try to get a larger thumbnail by modifying the URL
@@ -6185,7 +6478,11 @@ class BandcampDownloaderGUI:
                                 break
                     
                     self.current_thumbnail_url = high_quality_thumbnail
-                    self.root.after(0, lambda url=high_quality_thumbnail: self.fetch_and_display_album_art(url))
+                    # Display appropriate image based on current mode
+                    if self.album_art_mode == "album_art" or not hasattr(self, 'album_art_mode'):
+                        self.root.after(0, lambda url=high_quality_thumbnail: self.fetch_and_display_album_art(url))
+                    elif self.album_art_mode == "bio_pic" and self.current_bio_pic_url:
+                        self.root.after(0, lambda url=self.current_bio_pic_url: self.fetch_and_display_bio_pic(url))
                 else:
                     # Fallback to yt-dlp extraction if HTML method fails
                     if not self.album_art_fetching:
@@ -6398,6 +6695,170 @@ class BandcampDownloaderGUI:
             # Any error means file isn't ready
             return False
     
+    def fetch_and_display_bio_pic(self, bio_pic_url):
+        """Fetch and display bio pic asynchronously (similar to album art)."""
+        if not bio_pic_url:
+            self.clear_album_art()
+            return
+        
+        # Check if URL field is empty - if so, don't fetch/display artwork
+        if self._is_url_field_empty():
+            self.clear_album_art()
+            return
+        
+        # Only fetch if we're in bio_pic mode
+        if self.album_art_mode != "bio_pic":
+            return
+        
+        # Prevent multiple simultaneous fetches
+        if self.album_art_fetching:
+            if hasattr(self, '_artwork_fetch_start_time'):
+                import time
+                if time.time() - self._artwork_fetch_start_time > 30:
+                    self.album_art_fetching = False
+                else:
+                    return
+            else:
+                return
+        
+        # Increment fetch ID to cancel any in-flight fetches
+        self.artwork_fetch_id += 1
+        fetch_id = self.artwork_fetch_id
+        
+        # Track when fetch started (for timeout detection)
+        import time
+        self._artwork_fetch_start_time = time.time()
+        
+        self.album_art_fetching = True
+        
+        def download_and_display():
+            try:
+                # Check if this fetch was cancelled (new fetch started)
+                if fetch_id != self.artwork_fetch_id:
+                    def reset_flag():
+                        self.album_art_fetching = False
+                    self.root.after(0, reset_flag)
+                    return
+                
+                # Check again before downloading (field might have been cleared or mode changed)
+                if self._is_url_field_empty() or self.album_art_mode != "bio_pic":
+                    if fetch_id == self.artwork_fetch_id:
+                        self.root.after(0, self.clear_album_art)
+                    def reset_flag():
+                        self.album_art_fetching = False
+                        if hasattr(self, '_artwork_fetch_start_time'):
+                            del self._artwork_fetch_start_time
+                    self.root.after(0, reset_flag)
+                    return
+                
+                import io
+                from PIL import Image, ImageTk
+                
+                # Download the image with retry logic
+                image_data = self._fetch_with_retry(bio_pic_url, max_retries=3, timeout=15)
+                
+                # Check if this fetch was cancelled during download
+                if fetch_id != self.artwork_fetch_id or self.album_art_mode != "bio_pic":
+                    def reset_flag():
+                        self.album_art_fetching = False
+                    self.root.after(0, reset_flag)
+                    return
+                
+                # Check again after download
+                if self._is_url_field_empty() or self.album_art_mode != "bio_pic":
+                    if fetch_id == self.artwork_fetch_id:
+                        self.root.after(0, self.clear_album_art)
+                    def reset_flag():
+                        self.album_art_fetching = False
+                        if hasattr(self, '_artwork_fetch_start_time'):
+                            del self._artwork_fetch_start_time
+                    self.root.after(0, reset_flag)
+                    return
+                
+                # Open and resize image
+                img = Image.open(io.BytesIO(image_data))
+                
+                # Resize to fit canvas (150x150) while maintaining aspect ratio
+                img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                
+                # Convert to PhotoImage
+                photo = ImageTk.PhotoImage(img)
+                
+                # Update UI on main thread
+                def update_ui():
+                    # Check if this fetch was cancelled before updating UI
+                    if fetch_id != self.artwork_fetch_id or self.album_art_mode != "bio_pic":
+                        return
+                    
+                    # Final check before displaying
+                    if self._is_url_field_empty() or self.album_art_mode != "bio_pic":
+                        self.clear_album_art()
+                        return
+                    
+                    # Clear canvas
+                    self.album_art_canvas.delete("all")
+                    
+                    # Calculate position to center the image
+                    img_width = photo.width()
+                    img_height = photo.height()
+                    
+                    # Create blurred background if image doesn't fill the canvas
+                    blurred_bg = self._create_blurred_background(img)
+                    if blurred_bg:
+                        # Draw blurred background first (fills entire canvas)
+                        self.album_art_canvas.create_image(75, 75, image=blurred_bg, anchor='center')
+                    
+                    # Calculate center position for original image
+                    x = (150 - img_width) // 2
+                    y = (150 - img_height) // 2
+                    
+                    # Display original image on top (centered)
+                    self.album_art_canvas.create_image(x + img_width // 2, y + img_height // 2, image=photo, anchor='center')
+                    
+                    # Keep references to prevent garbage collection
+                    self.album_art_image = photo
+                    if blurred_bg:
+                        # Store blurred background reference (will be replaced on next update)
+                        if not hasattr(self, '_blurred_bg_image'):
+                            self._blurred_bg_image = None
+                        self._blurred_bg_image = blurred_bg
+                
+                if fetch_id == self.artwork_fetch_id:
+                    self.root.after(0, update_ui)
+                
+                # Always reset flag after completion
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
+                
+            except ImportError:
+                # PIL not available
+                if fetch_id == self.artwork_fetch_id:
+                    self.root.after(0, lambda: self.album_art_canvas.delete("all"))
+                    self.root.after(0, lambda: self.album_art_canvas.create_text(
+                        75, 75, text="PIL required\nfor bio pic\n\nInstall Pillow:\npip install Pillow", 
+                        fill='#808080', font=("Segoe UI", 7), justify='center'
+                    ))
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
+            except Exception as e:
+                # Failed to load image - clear and show placeholder
+                if fetch_id == self.artwork_fetch_id:
+                    self.root.after(0, self.clear_album_art)
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
+        
+        # Download in background thread
+        threading.Thread(target=download_and_display, daemon=True).start()
+    
     def fetch_and_display_album_art(self, thumbnail_url):
         """Fetch and display album art asynchronously (second phase - doesn't block preview)."""
         if not thumbnail_url:
@@ -6407,6 +6868,10 @@ class BandcampDownloaderGUI:
         # Check if URL field is empty - if so, don't fetch/display artwork
         if self._is_url_field_empty():
             self.clear_album_art()
+            return
+        
+        # Only fetch if we're in album_art mode
+        if self.album_art_mode != "album_art":
             return
         
         # Prevent multiple simultaneous fetches
@@ -6443,8 +6908,8 @@ class BandcampDownloaderGUI:
                     self.root.after(0, reset_flag)
                     return
                 
-                # Check again before downloading (field might have been cleared)
-                if self._is_url_field_empty():
+                # Check again before downloading (field might have been cleared or mode changed)
+                if self._is_url_field_empty() or self.album_art_mode != "album_art":
                     if fetch_id == self.artwork_fetch_id:  # Only clear if still current
                         self.root.after(0, self.clear_album_art)
                     # Reset flag in a thread-safe way
@@ -6461,16 +6926,16 @@ class BandcampDownloaderGUI:
                 # Download the image with retry logic
                 image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
                 
-                # Check if this fetch was cancelled during download
-                if fetch_id != self.artwork_fetch_id:
+                # Check if this fetch was cancelled during download or mode changed
+                if fetch_id != self.artwork_fetch_id or self.album_art_mode != "album_art":
                     # Reset flag in a thread-safe way
                     def reset_flag():
                         self.album_art_fetching = False
                     self.root.after(0, reset_flag)
                     return
                 
-                # Check again after download (field might have been cleared during download)
-                if self._is_url_field_empty():
+                # Check again after download (field might have been cleared or mode changed during download)
+                if self._is_url_field_empty() or self.album_art_mode != "album_art":
                     if fetch_id == self.artwork_fetch_id:  # Only clear if still current
                         self.root.after(0, self.clear_album_art)
                     # Reset flag in a thread-safe way
@@ -6492,12 +6957,12 @@ class BandcampDownloaderGUI:
                 
                 # Update UI on main thread
                 def update_ui():
-                    # Check if this fetch was cancelled before updating UI
-                    if fetch_id != self.artwork_fetch_id:
+                    # Check if this fetch was cancelled before updating UI or mode changed
+                    if fetch_id != self.artwork_fetch_id or self.album_art_mode != "album_art":
                         return
                     
-                    # Final check before displaying - field might have been cleared
-                    if self._is_url_field_empty():
+                    # Final check before displaying - field might have been cleared or mode changed
+                    if self._is_url_field_empty() or self.album_art_mode != "album_art":
                         self.clear_album_art()
                         return
                     
@@ -6507,14 +6972,27 @@ class BandcampDownloaderGUI:
                     # Calculate position to center the image
                     img_width = photo.width()
                     img_height = photo.height()
+                    
+                    # Create blurred background if image doesn't fill the canvas
+                    blurred_bg = self._create_blurred_background(img)
+                    if blurred_bg:
+                        # Draw blurred background first (fills entire canvas)
+                        self.album_art_canvas.create_image(75, 75, image=blurred_bg, anchor='center')
+                    
+                    # Calculate center position for original image
                     x = (150 - img_width) // 2
                     y = (150 - img_height) // 2
                     
-                    # Display image on canvas
+                    # Display original image on top (centered)
                     self.album_art_canvas.create_image(x + img_width // 2, y + img_height // 2, image=photo, anchor='center')
                     
-                    # Keep a reference to prevent garbage collection
+                    # Keep references to prevent garbage collection
                     self.album_art_image = photo
+                    if blurred_bg:
+                        # Store blurred background reference (will be replaced on next update)
+                        if not hasattr(self, '_blurred_bg_image'):
+                            self._blurred_bg_image = None
+                        self._blurred_bg_image = blurred_bg
                 
                 if fetch_id == self.artwork_fetch_id:  # Only update if still current
                     self.root.after(0, update_ui)
@@ -6554,13 +7032,135 @@ class BandcampDownloaderGUI:
         # Download in background thread
         threading.Thread(target=download_and_display, daemon=True).start()
     
+    def _preload_album_art(self, thumbnail_url):
+        """Preload album art in background without displaying (for instant display when switching from hidden)."""
+        if not thumbnail_url:
+            return
+        
+        # Check if URL field is empty
+        if self._is_url_field_empty():
+            return
+        
+        # Don't preload if already fetching or if we already have a preloaded image for this URL
+        if self.album_art_fetching:
+            return
+        
+        def preload():
+            try:
+                import io
+                from PIL import Image, ImageTk
+                
+                # Download the image with retry logic
+                image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
+                
+                # Check if URL field was cleared during download
+                if self._is_url_field_empty():
+                    return
+                
+                # Open and resize image
+                img = Image.open(io.BytesIO(image_data))
+                
+                # Resize to fit canvas (150x150) while maintaining aspect ratio
+                img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                
+                # Convert to PhotoImage
+                photo = ImageTk.PhotoImage(img)
+                
+                # Cache the preloaded image (only if we're still in hidden mode or album_art mode)
+                # Don't cache if mode changed to bio_pic
+                def cache_image():
+                    if self.album_art_mode in ["hidden", "album_art"] and not self._is_url_field_empty():
+                        self.preloaded_album_art_image = photo
+                        self.preloaded_album_art_pil = img  # Store PIL Image for blur effect
+                        # Keep a reference to prevent garbage collection
+                        # We'll transfer this to album_art_image when displaying
+                
+                self.root.after(0, cache_image)
+                
+            except Exception:
+                # Failed to preload - that's okay, we'll fetch normally when needed
+                pass
+        
+        # Preload in background thread
+        threading.Thread(target=preload, daemon=True).start()
+    
+    def _create_blurred_background(self, img):
+        """Create a blurred background version of an image that fills the entire 150x150 canvas.
+        
+        Args:
+            img: PIL Image object (already resized to fit within 150x150)
+            
+        Returns:
+            PhotoImage of the blurred background, or None if image already fills canvas
+        """
+        try:
+            from PIL import Image, ImageFilter, ImageTk
+            
+            # Check if image already fills the canvas (square and 150x150)
+            if img.width == 150 and img.height == 150:
+                return None  # No blur needed
+            
+            # Create a copy and scale to fill the entire canvas (crop center if needed)
+            # Use a larger size first to maintain quality, then resize down
+            canvas_size = 150
+            
+            # Calculate scale factor to fill canvas (crop to center)
+            scale_w = canvas_size / img.width
+            scale_h = canvas_size / img.height
+            scale = max(scale_w, scale_h)  # Use larger scale to ensure we fill the canvas
+            
+            # Resize image to fill canvas (may extend beyond, we'll crop)
+            new_width = int(img.width * scale)
+            new_height = int(img.height * scale)
+            blurred_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Crop to center 150x150 if needed
+            if new_width > canvas_size or new_height > canvas_size:
+                left = (new_width - canvas_size) // 2
+                top = (new_height - canvas_size) // 2
+                blurred_img = blurred_img.crop((left, top, left + canvas_size, top + canvas_size))
+            elif new_width < canvas_size or new_height < canvas_size:
+                # If smaller, resize to fill (shouldn't happen with max scale, but safety check)
+                blurred_img = blurred_img.resize((canvas_size, canvas_size), Image.Resampling.LANCZOS)
+            
+            # Apply stronger Gaussian blur for a more background-like effect
+            # Use a larger radius (12px) for a more pronounced blur that doesn't look like continuation
+            blurred_img = blurred_img.filter(ImageFilter.GaussianBlur(radius=12))
+            
+            # Optionally apply blur a second time for even smoother effect (creates more background-like appearance)
+            # This makes it less recognizable as the same image
+            blurred_img = blurred_img.filter(ImageFilter.GaussianBlur(radius=8))
+            
+            # Slightly darken and desaturate to make it more background-like
+            # This helps it blend without looking like a continuation of the photo
+            from PIL import ImageEnhance
+            # Darken slightly (0.85 = 15% darker)
+            enhancer = ImageEnhance.Brightness(blurred_img)
+            blurred_img = enhancer.enhance(0.85)
+            # Slightly desaturate (0.9 = 10% less saturation)
+            enhancer = ImageEnhance.Color(blurred_img)
+            blurred_img = enhancer.enhance(0.9)
+            
+            # Convert to PhotoImage
+            blurred_photo = ImageTk.PhotoImage(blurred_img)
+            return blurred_photo
+            
+        except Exception:
+            # If blur fails, return None (will display without blur)
+            return None
+    
     def clear_album_art(self):
-        """Clear the album art display."""
+        """Clear the album art display and show appropriate placeholder."""
         try:
             self.album_art_canvas.delete("all")
+            # Show appropriate placeholder text based on current mode
+            if self.album_art_mode == "bio_pic":
+                placeholder_text = "Artist Bio Pic"
+            else:
+                placeholder_text = "Album Art"
             self.album_art_canvas.create_text(
                 75, 75,
-                text="Album Art",
+                text=placeholder_text,
                 fill='#808080',
                 font=("Segoe UI", 8)
             )
@@ -6569,17 +7169,19 @@ class BandcampDownloaderGUI:
             pass
     
     def toggle_album_art(self):
-        """Toggle album art panel visibility."""
-        self.album_art_visible = not self.album_art_visible
+        """Cycle through album art panel modes: album_art → bio_pic → hidden → album_art."""
+        # Store previous mode to detect transitions
+        previous_mode = self.album_art_mode
         
-        if self.album_art_visible:
-            # Show album art panel
-            self.album_art_frame.grid()
-            # Update settings frame to span 2 columns (leaving room for album art)
-            self.settings_frame.grid_configure(columnspan=2)
-            # Remove the show album art button from grid to free up space
-            self.show_album_art_btn.grid_remove()
-        else:
+        # Cycle through states: album_art → bio_pic → hidden → album_art
+        if self.album_art_mode == "album_art":
+            self.album_art_mode = "bio_pic"
+        elif self.album_art_mode == "bio_pic":
+            self.album_art_mode = "hidden"
+        else:  # hidden
+            self.album_art_mode = "album_art"
+        
+        if self.album_art_mode == "hidden":
             # Hide album art panel
             self.album_art_frame.grid_remove()
             # Update settings frame to span 3 columns (full width)
@@ -6587,6 +7189,72 @@ class BandcampDownloaderGUI:
             # Show the show album art button by adding it back to grid
             self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
             self.show_album_art_btn.config(fg='#808080', cursor='hand2')  # Visible, hand cursor
+            
+            # If switching from bio_pic to hidden, clear canvas and preload album art
+            if previous_mode == "bio_pic":
+                # Clear the canvas immediately to remove bio pic
+                self.clear_album_art()
+                # Preload album art in background for instant display when switching back
+                if hasattr(self, 'current_thumbnail_url') and self.current_thumbnail_url:
+                    self._preload_album_art(self.current_thumbnail_url)
+        else:
+            # Show album art panel (either album_art or bio_pic mode)
+            self.album_art_frame.grid()
+            # Update settings frame to span 2 columns (leaving room for album art)
+            self.settings_frame.grid_configure(columnspan=2)
+            # Remove the show album art button from grid to free up space
+            self.show_album_art_btn.grid_remove()
+            
+            # Display appropriate image based on mode
+            if self.album_art_mode == "bio_pic":
+                # Try to fetch and display bio pic if available
+                if hasattr(self, 'current_bio_pic_url') and self.current_bio_pic_url:
+                    self.fetch_and_display_bio_pic(self.current_bio_pic_url)
+                else:
+                    # Show placeholder if bio pic not available
+                    self.clear_album_art()
+            else:  # album_art mode
+                # Check if we have a preloaded image first (for instant display)
+                if self.preloaded_album_art_image:
+                    # Display preloaded image immediately
+                    self.album_art_canvas.delete("all")
+                    img_width = self.preloaded_album_art_image.width()
+                    img_height = self.preloaded_album_art_image.height()
+                    
+                    # Create blurred background if image doesn't fill the canvas
+                    blurred_bg = None
+                    if self.preloaded_album_art_pil:
+                        blurred_bg = self._create_blurred_background(self.preloaded_album_art_pil)
+                    
+                    if blurred_bg:
+                        # Draw blurred background first (fills entire canvas)
+                        self.album_art_canvas.create_image(75, 75, image=blurred_bg, anchor='center')
+                    
+                    # Calculate center position for original image
+                    x = (150 - img_width) // 2
+                    y = (150 - img_height) // 2
+                    
+                    # Display original image on top (centered)
+                    self.album_art_canvas.create_image(x + img_width // 2, y + img_height // 2, 
+                                                       image=self.preloaded_album_art_image, anchor='center')
+                    
+                    # Use preloaded image as current image
+                    self.album_art_image = self.preloaded_album_art_image
+                    if blurred_bg:
+                        # Store blurred background reference
+                        if not hasattr(self, '_blurred_bg_image'):
+                            self._blurred_bg_image = None
+                        self._blurred_bg_image = blurred_bg
+                    
+                    # Clear preloaded cache (will be refreshed if needed)
+                    self.preloaded_album_art_image = None
+                    self.preloaded_album_art_pil = None
+                elif hasattr(self, 'current_thumbnail_url') and self.current_thumbnail_url:
+                    # No preloaded image, fetch normally
+                    self.fetch_and_display_album_art(self.current_thumbnail_url)
+                else:
+                    # Show placeholder if album art not available
+                    self.clear_album_art()
         
         # Save the state
         self.save_album_art_state()
@@ -8300,6 +8968,9 @@ class BandcampDownloaderGUI:
         import time
         
         numbering_style = self.numbering_var.get()
+        # Skip if "Original" - preserve original Bandcamp filenames
+        if numbering_style == "Original":
+            return
         # Skip if "None" (old format, no longer used but handle for backward compatibility)
         if numbering_style == "None":
             return
@@ -11969,6 +12640,30 @@ class BandcampDownloaderGUI:
             # Separator
             self.settings_menu.add_separator()
             
+            # URL Tag Color Scheme submenu
+            self.color_scheme_menu = Menu(
+                self.settings_menu,
+                tearoff=0,
+                bg='#252526',
+                fg='#CCCCCC',
+                activebackground='#007ACC',
+                activeforeground='#FFFFFF',
+                selectcolor='#007ACC',
+                borderwidth=1,
+                relief='flat'
+            )
+            self.settings_menu.add_cascade(
+                label="URL Tag Themes",
+                menu=self.color_scheme_menu
+            )
+            
+            # Populate color scheme menu (will be built dynamically)
+            # Note: "Get More Themes" is added in _build_color_scheme_menu()
+            self._build_color_scheme_menu()
+            
+            # Separator
+            self.settings_menu.add_separator()
+            
             # About
             self.settings_menu.add_command(
                 label="About",
@@ -11990,12 +12685,1064 @@ class BandcampDownloaderGUI:
                 command=lambda: webbrowser.open("https://github.com/kameryn1811/Bandcamp-Downloader/issues")
             )
         
+        # Rebuild color scheme menu to show current selection
+        try:
+            if hasattr(self, 'color_scheme_menu'):
+                self._build_color_scheme_menu()
+        except Exception:
+            # If rebuilding fails, continue anyway - menu should still work
+            pass
+        
         # Show menu at cursor position
         try:
             self.settings_menu.tk_popup(event.x_root, event.y_root)
+        except Exception as e:
+            # If menu fails to show, try to show error
+            try:
+                messagebox.showerror("Menu Error", f"Could not open settings menu:\n\n{str(e)}")
+            except Exception:
+                pass
         finally:
             # Make sure to release the grab (Tkinter quirk)
-            self.settings_menu.grab_release()
+            try:
+                self.settings_menu.grab_release()
+            except Exception:
+                pass
+    
+    def _create_color_scheme_preview_image(self, scheme_name, colors, num_colors=6):
+        """Create a composite preview image with scheme name text and color swatches.
+        
+        Args:
+            scheme_name: Name of the color scheme
+            colors: List of hex color strings
+            num_colors: Number of colors to show in preview (default 6)
+            
+        Returns:
+            PhotoImage object showing scheme name and colored squares, or None if PIL unavailable
+        """
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            from PIL import ImageTk
+            
+            # Create display name
+            if scheme_name == "default":
+                display_name = "Default"
+            else:
+                display_name = scheme_name.title()
+            
+            # Image dimensions
+            square_size = 12
+            spacing = 2
+            num_to_show = min(num_colors, len(colors))
+            squares_width = (square_size * num_to_show) + (spacing * (num_to_show - 1))
+            
+            # Estimate text width (will be adjusted based on actual rendering)
+            # Use a reasonable font size for menu items
+            try:
+                # Try to use a system font
+                font = ImageFont.truetype("arial.ttf", 10)
+            except:
+                try:
+                    font = ImageFont.truetype("segoeui.ttf", 10)
+                except:
+                    # Fallback to default font
+                    font = ImageFont.load_default()
+            
+            # Create a temporary image to measure text width
+            temp_img = Image.new('RGB', (1, 1))
+            temp_draw = ImageDraw.Draw(temp_img)
+            text_bbox = temp_draw.textbbox((0, 0), display_name, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            
+            # Add padding: text padding + gap + squares
+            text_padding = 8  # Left padding for text
+            gap = 12  # Gap between text and squares
+            total_width = text_padding + text_width + gap + squares_width + 8  # Right padding
+            total_height = max(square_size, text_height) + 4  # Add vertical padding
+            
+            # Create image with menu background color
+            img = Image.new('RGB', (total_width, total_height), color='#252526')
+            draw = ImageDraw.Draw(img)
+            
+            # Draw scheme name text (left side)
+            text_x = text_padding
+            text_y = (total_height - text_height) // 2
+            draw.text((text_x, text_y), display_name, fill='#CCCCCC', font=font)
+            
+            # Draw colored squares (right side)
+            squares_x = text_padding + text_width + gap
+            squares_y = (total_height - square_size) // 2
+            
+            for i in range(num_to_show):
+                color = colors[i]
+                # Convert hex to RGB tuple
+                hex_color = color.lstrip('#')
+                r = int(hex_color[0:2], 16)
+                g = int(hex_color[2:4], 16)
+                b = int(hex_color[4:6], 16)
+                
+                # Draw square
+                x1 = squares_x + (i * (square_size + spacing))
+                y1 = squares_y
+                x2 = x1 + square_size - 1
+                y2 = y1 + square_size - 1
+                draw.rectangle(
+                    [x1, y1, x2, y2],
+                    fill=(r, g, b),
+                    outline='#3E3E42',  # Subtle border
+                    width=1
+                )
+            
+            # Convert to PhotoImage
+            photo = ImageTk.PhotoImage(img)
+            return photo
+        except Exception:
+            # Fallback: return None if image creation fails
+            return None
+    
+    def _build_color_scheme_menu(self):
+        """Build the color scheme submenu with preview swatches."""
+        if not hasattr(self, 'color_scheme_menu'):
+            return
+        
+        try:
+            # Clear existing menu items
+            self.color_scheme_menu.delete(0, END)
+        except Exception:
+            # If delete fails, menu might be empty or not initialized properly
+            pass
+        
+        try:
+            # Store preview images to prevent garbage collection
+            if not hasattr(self, '_color_scheme_preview_images'):
+                self._color_scheme_preview_images = []
+            self._color_scheme_preview_images.clear()
+            
+            schemes = self._get_color_schemes()
+            # Sort schemes: default first, then alphabetically
+            scheme_names = sorted([name for name in schemes.keys() if name != "default"])
+            scheme_names.insert(0, "default")
+            
+            for scheme_name in scheme_names:
+                try:
+                    colors = schemes[scheme_name]
+                    
+                    # Create composite preview image with text and colors
+                    preview_image = None
+                    try:
+                        preview_image = self._create_color_scheme_preview_image(scheme_name, colors, num_colors=6)
+                        if preview_image:
+                            self._color_scheme_preview_images.append(preview_image)  # Keep reference
+                    except Exception:
+                        # If image creation fails, continue without preview
+                        pass
+                    
+                    # Create display name for fallback
+                    if scheme_name == "default":
+                        display_name = "Default"
+                    else:
+                        display_name = scheme_name.title()
+                    
+                    # Add radiobutton to show current selection
+                    def make_callback(name):
+                        return lambda: self._change_tag_color_scheme(name)
+                    
+                    # Add menu item with composite image (text + colors in one image)
+                    if preview_image:
+                        self.color_scheme_menu.add_radiobutton(
+                            label="",  # Empty label since text is in the image
+                            image=preview_image,
+                            variable=self.tag_color_scheme_var,
+                            value=scheme_name,
+                            command=make_callback(scheme_name)
+                        )
+                    else:
+                        # Fallback without image - use text with Unicode squares
+                        preview_chars = " ".join(["■"] * min(6, len(colors)))
+                        label = f"{display_name}  {preview_chars}"
+                        self.color_scheme_menu.add_radiobutton(
+                            label=label,
+                            variable=self.tag_color_scheme_var,
+                            value=scheme_name,
+                            command=make_callback(scheme_name)
+                        )
+                except Exception:
+                    # Skip this scheme if there's an error
+                    continue
+            
+            # Update variable to reflect current selection
+            if hasattr(self, 'tag_color_scheme_var'):
+                self.tag_color_scheme_var.set(self.current_tag_color_scheme)
+            
+            # Add "Get More Themes" separator and menu item
+            self.color_scheme_menu.add_separator()
+            self.color_scheme_menu.add_command(
+                label="Get More Themes...",
+                command=self._show_get_more_themes_dialog
+            )
+            
+            # Add refresh option
+            self.color_scheme_menu.add_command(
+                label="Refresh Themes",
+                command=self._refresh_color_schemes
+            )
+            
+            # Add open themes directory option
+            self.color_scheme_menu.add_command(
+                label="Open Themes Directory",
+                command=self._open_themes_directory
+            )
+        except Exception as e:
+            # If building fails completely, at least add a basic menu item
+            try:
+                self.color_scheme_menu.add_command(
+                    label="Error loading themes",
+                    state='disabled'
+                )
+                self.color_scheme_menu.add_separator()
+                self.color_scheme_menu.add_command(
+                    label="Get More Themes...",
+                    command=self._show_get_more_themes_dialog
+                )
+                self.color_scheme_menu.add_command(
+                    label="Refresh Themes",
+                    command=self._refresh_color_schemes
+                )
+                self.color_scheme_menu.add_command(
+                    label="Open Themes Directory",
+                    command=self._open_themes_directory
+                )
+            except Exception:
+                pass
+    
+    def _change_tag_color_scheme(self, scheme_name):
+        """Change the tag color scheme and reprocess tags.
+        
+        Args:
+            scheme_name: Name of the color scheme to use
+        """
+        schemes = self._get_color_schemes()
+        if scheme_name not in schemes:
+            return
+        
+        # Update current scheme
+        self.current_tag_color_scheme = scheme_name
+        self.current_tag_colors = schemes[scheme_name]
+        
+        # Update variable
+        if hasattr(self, 'tag_color_scheme_var'):
+            self.tag_color_scheme_var.set(scheme_name)
+        
+        # Save preference
+        self.save_tag_color_scheme()
+        
+        # Reprocess tags to apply new colors
+        if self.url_tag_mapping:
+            self.root.after(50, self._process_url_tags)
+    
+    def _refresh_color_schemes(self):
+        """Refresh color schemes by clearing cache and rebuilding menu."""
+        # Clear cached schemes to force reload from disk (class-level cache)
+        # Access the class variable directly
+        type(self)._TAG_COLOR_SCHEMES = None
+        
+        # Force reload by calling the load function directly (bypasses cache)
+        schemes = self._load_color_schemes_from_css()
+        # Update the cache with fresh data
+        type(self)._TAG_COLOR_SCHEMES = schemes
+        
+        # Reload current scheme
+        if self.current_tag_color_scheme not in schemes:
+            self.current_tag_color_scheme = "default"
+        self.current_tag_colors = schemes.get(self.current_tag_color_scheme, schemes["default"])
+        
+        # Update variable if it exists
+        if hasattr(self, 'tag_color_scheme_var'):
+            self.tag_color_scheme_var.set(self.current_tag_color_scheme)
+        
+        # Rebuild menu
+        if hasattr(self, 'color_scheme_menu'):
+            self._build_color_scheme_menu()
+        
+        # Count themes
+        theme_count = len([name for name in schemes.keys() if name != "default"])
+        messagebox.showinfo(
+            "Themes Refreshed", 
+            f"Color schemes have been refreshed.\n\n{theme_count} theme(s) are now available in the menu."
+        )
+    
+    def _open_themes_directory(self):
+        """Open the Color Schemes directory in Windows Explorer."""
+        css_dir = self.script_dir / "Color Schemes"
+        
+        # Create directory if it doesn't exist
+        css_dir.mkdir(exist_ok=True)
+        
+        try:
+            import platform
+            
+            # Use os.startfile on Windows, or subprocess on other platforms
+            if platform.system() == "Windows":
+                os.startfile(str(css_dir))
+            else:
+                # For macOS and Linux
+                if platform.system() == "Darwin":  # macOS
+                    subprocess.run(["open", str(css_dir)])
+                else:  # Linux
+                    subprocess.run(["xdg-open", str(css_dir)])
+        except Exception as e:
+            messagebox.showerror(
+                "Error",
+                f"Could not open themes directory:\n\n{str(e)}\n\n"
+                f"Directory location: {css_dir}"
+            )
+    
+    def _fetch_themes_manifest(self):
+        """Fetch themes.json manifest from GitHub.
+        
+        Returns:
+            Dictionary with themes data, or None if fetch fails
+        """
+        try:
+            import requests
+        except ImportError:
+            messagebox.showerror(
+                "Missing Dependency",
+                "The 'requests' library is required for downloading themes.\n\n"
+                "Please install it:\n"
+                "python -m pip install requests"
+            )
+            return None
+        
+        try:
+            repo_owner = "kameryn1811"
+            repo_name = "Bandcamp-Downloader"
+            manifest_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/Color%20Schemes/themes.json"
+            
+            response = requests.get(manifest_url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            messagebox.showerror(
+                "Download Failed",
+                f"Could not fetch themes from GitHub:\n\n{str(e)}\n\n"
+                "Please check your internet connection and try again."
+            )
+            return None
+        except json.JSONDecodeError:
+            messagebox.showerror(
+                "Invalid Manifest",
+                "The themes manifest file is invalid or corrupted.\n\n"
+                "Please try again later."
+            )
+            return None
+        except Exception as e:
+            messagebox.showerror(
+                "Error",
+                f"An unexpected error occurred:\n\n{str(e)}"
+            )
+            return None
+    
+    def _download_theme_file(self, filename):
+        """Download a single theme CSS file from GitHub.
+        
+        Args:
+            filename: Name of the CSS file to download
+            
+        Returns:
+            File content as string, or None if download fails
+        """
+        try:
+            import requests
+        except ImportError:
+            return None
+        
+        try:
+            repo_owner = "kameryn1811"
+            repo_name = "Bandcamp-Downloader"
+            # URL encode the filename
+            from urllib.parse import quote
+            encoded_filename = quote(filename)
+            file_url = f"https://raw.githubusercontent.com/{repo_owner}/{repo_name}/main/Color%20Schemes/{encoded_filename}"
+            
+            response = requests.get(file_url, timeout=10)
+            response.raise_for_status()
+            return response.text
+        except Exception:
+            return None
+    
+    def _get_theme_preview_colors(self, filename):
+        """Get preview colors from a theme CSS file (quick fetch for preview).
+        
+        Args:
+            filename: Name of the CSS file
+            
+        Returns:
+            List of 6 hex color strings, or empty list if fetch fails
+        """
+        try:
+            # Try to download just enough to get colors (first 500 chars should be enough)
+            content = self._download_theme_file(filename)
+            if content:
+                colors = self._parse_css_color_scheme(content)
+                if colors:
+                    return colors[:6]  # Return first 6 colors
+        except Exception:
+            pass
+        return []
+    
+    def _show_get_more_themes_dialog(self):
+        """Show dialog to browse and download themes from GitHub."""
+        # Fetch themes manifest
+        manifest = self._fetch_themes_manifest()
+        if not manifest:
+            return
+        
+        themes = manifest.get("themes", [])
+        if not themes:
+            messagebox.showinfo(
+                "No Themes Available",
+                "No themes are currently available for download."
+            )
+            return
+        
+        # Show loading dialog first
+        loading_dialog = self._create_dialog_base("Loading Themes", 400, 120)
+        loading_frame = Frame(loading_dialog, bg='#1E1E1E')
+        loading_frame.pack(fill=BOTH, expand=True, padx=20, pady=20)
+        
+        loading_label = Label(
+            loading_frame,
+            text="Loading theme previews...",
+            font=("Segoe UI", 10),
+            bg='#1E1E1E',
+            fg='#CCCCCC'
+        )
+        loading_label.pack(pady=(0, 10))
+        
+        loading_dialog.update()
+        
+        # Create main dialog (hidden initially)
+        dialog = self._create_dialog_base("Get More Themes", 650, 500)
+        dialog.withdraw()  # Hide until ready
+        
+        # Filter themes first (before fetching previews)
+        # Get existing schemes and normalize to lowercase for comparison
+        existing_schemes_raw = self._get_color_schemes().keys()
+        existing_schemes = set()
+        for scheme in existing_schemes_raw:
+            if scheme != "default":
+                # Normalize to lowercase for comparison (same as how we extract from filenames)
+                existing_schemes.add(scheme.lower())
+        
+        available_themes = []
+        for theme in themes:
+            # Extract and normalize scheme name the same way as _load_color_schemes_from_css does
+            scheme_name = theme["filename"].replace("Scheme_", "").replace(".css", "")
+            scheme_name = scheme_name.split("-")[0]  # Remove suffixes like "-CE", "-EE"
+            scheme_name = scheme_name.replace("_", " ").lower()  # Normalize to lowercase
+            
+            # Check if this theme is already installed (case-insensitive comparison)
+            if scheme_name not in existing_schemes:
+                available_themes.append(theme)
+        
+        if not available_themes:
+            loading_dialog.destroy()
+            dialog.destroy()  # Also destroy the hidden main dialog
+            messagebox.showinfo(
+                "All Themes Installed",
+                "All available themes are already installed!\n\n"
+                "You can create custom themes by adding CSS files to the Color Schemes folder."
+            )
+            return
+        
+        # Show dialog immediately with placeholder colors (lazy loading)
+        loading_dialog.destroy()
+        dialog.deiconify()  # Show dialog immediately
+        
+        # Placeholder colors for unloaded themes (neutral gray tones, not colorful)
+        placeholder_colors = ['#404040', '#505050', '#606060', '#505050', '#404040', '#505050']
+        
+        # Store preview frame references for updating
+        preview_frames = {}  # filename -> preview_frame widget
+        loaded_previews = set()  # Track which previews have been loaded
+        loading_queue = []  # Queue of themes to load
+        
+        def build_dialog_ui():
+            """Build the dialog UI with placeholder colors (lazy loading)."""
+            
+            # Main container
+            main_frame = Frame(dialog, bg='#1E1E1E')
+            main_frame.pack(fill=BOTH, expand=True, padx=8, pady=8)
+            
+            # Title
+            title_label = Label(
+                main_frame,
+                text="Available Themes",
+                font=("Segoe UI", 11, "bold"),
+                bg='#1E1E1E',
+                fg='#D4D4D4'
+            )
+            title_label.pack(pady=(0, 5))
+            
+            # Description - more compact
+            desc_label = Label(
+                main_frame,
+                text="Select themes to download. Your custom themes will be preserved.",
+                font=("Segoe UI", 8),
+                bg='#1E1E1E',
+                fg='#808080',
+                wraplength=630
+            )
+            desc_label.pack(pady=(0, 8))
+            
+            # Scrollable frame for theme list
+            list_container = Frame(main_frame, bg='#1E1E1E')
+            list_container.pack(fill=BOTH, expand=True, pady=(0, 10))
+            
+            canvas = Canvas(list_container, bg='#1E1E1E', highlightthickness=0)
+            scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview, style='Dark.Vertical.TScrollbar')
+            scrollable_frame = Frame(canvas, bg='#1E1E1E')
+            
+            def on_frame_configure(event):
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            
+            scrollable_frame.bind("<Configure>", on_frame_configure)
+            
+            canvas_frame = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            
+            def on_canvas_configure(event):
+                canvas_width = event.width
+                canvas.itemconfig(canvas_frame, width=canvas_width)
+            
+            # Store original configure handler
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            
+            # Pack canvas and scrollbar
+            canvas.pack(side=LEFT, fill=BOTH, expand=True)
+            scrollbar.pack(side=RIGHT, fill=Y)
+            
+            # Store theme data and checkboxes
+            dialog.theme_checkboxes = {}
+            dialog.theme_data = {}
+            
+            # Create theme items
+            for theme in available_themes:
+                theme_frame = Frame(scrollable_frame, bg='#252526', relief='flat', borderwidth=1)
+                theme_frame.pack(fill=X, padx=4, pady=3)
+                
+                # Checkbox
+                var = BooleanVar(value=True)  # Default to selected
+                checkbox = Checkbutton(
+                    theme_frame,
+                    variable=var,
+                    bg='#252526',
+                    fg='#CCCCCC',
+                    activebackground='#252526',
+                    activeforeground='#CCCCCC',
+                    selectcolor='#1E1E1E'
+                )
+                checkbox.pack(side=LEFT, padx=6, pady=6)
+                dialog.theme_checkboxes[theme["filename"]] = var
+                
+                # Color preview frame (store reference for lazy loading)
+                preview_frame = Frame(theme_frame, bg='#252526')
+                preview_frame.pack(side=LEFT, padx=(0, 8), pady=6)
+                preview_frames[theme["filename"]] = preview_frame  # Store for updating
+                
+                # Start with placeholder colors (will be updated when loaded)
+                for i, color in enumerate(placeholder_colors[:6]):
+                    try:
+                        color_label = Label(
+                            preview_frame,
+                            bg=color,
+                            width=1,
+                            height=1,
+                            relief='flat',
+                            borderwidth=0,
+                            highlightthickness=0
+                        )
+                        color_label.pack(side=LEFT, padx=0.5)
+                    except Exception:
+                        pass
+                
+                # Theme info frame
+                info_frame = Frame(theme_frame, bg='#252526')
+                info_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 6), pady=6)
+                
+                # Theme name and description
+                theme_name = theme.get("name", theme["filename"].replace("Scheme_", "").replace(".css", ""))
+                description = theme.get("description", "")
+                name_text = f"{theme_name} - {description}" if description else theme_name
+                
+                name_label = Label(
+                    info_frame,
+                    text=name_text,
+                    font=("Segoe UI", 9),
+                    bg='#252526',
+                    fg='#D4D4D4',
+                    anchor='w',
+                    wraplength=400
+                )
+                name_label.pack(anchor='w', fill=X)
+                
+                # Make entire row clickable to toggle checkbox
+                def make_toggle_callback(checkbox_var):
+                    def toggle_checkbox(event):
+                        checkbox_var.set(not checkbox_var.get())
+                    return toggle_checkbox
+                
+                toggle_callback = make_toggle_callback(var)
+                for widget in [theme_frame, preview_frame, info_frame]:
+                    widget.bind("<Button-1>", toggle_callback)
+                    for child in widget.winfo_children():
+                        try:
+                            child.bind("<Button-1>", toggle_callback)
+                        except:
+                            pass
+                
+                dialog.theme_data[theme["filename"]] = {"theme": theme, "conflict": False}
+            
+            # Buttons frame
+            buttons_frame = Frame(main_frame, bg='#1E1E1E')
+            buttons_frame.pack(fill=X, pady=(8, 0))
+            
+            # Select All / Deselect All buttons
+            def select_all():
+                for var in dialog.theme_checkboxes.values():
+                    var.set(True)
+            
+            def deselect_all():
+                for var in dialog.theme_checkboxes.values():
+                    var.set(False)
+            
+            select_all_btn = ttk.Button(
+                buttons_frame,
+                text="Select All",
+                command=select_all
+            )
+            select_all_btn.pack(side=LEFT, padx=(0, 5))
+            
+            deselect_all_btn = ttk.Button(
+                buttons_frame,
+                text="Deselect All",
+                command=deselect_all
+            )
+            deselect_all_btn.pack(side=LEFT, padx=(0, 8))
+            
+            # Install Selected button
+            def install_selected():
+                selected = [fname for fname, var in dialog.theme_checkboxes.items() if var.get()]
+                if not selected:
+                    messagebox.showwarning("No Selection", "Please select at least one theme to install.")
+                    return
+                self._install_themes(dialog, selected)
+            
+            install_btn = ttk.Button(
+                buttons_frame,
+                text="Install Selected",
+                command=install_selected,
+                style='Download.TButton'
+            )
+            install_btn.pack(side=LEFT, padx=(0, 8))
+            
+            # Cancel button
+            cancel_btn = ttk.Button(
+                buttons_frame,
+                text="Cancel",
+                command=dialog.destroy
+            )
+            cancel_btn.pack(side=RIGHT)
+            
+            # Function to update a single theme's preview colors
+            def update_theme_preview(filename, colors):
+                """Update preview colors for a specific theme."""
+                if filename not in preview_frames:
+                    return
+                
+                # If no colors were fetched, keep placeholder and mark as loaded
+                if not colors:
+                    loaded_previews.add(filename)
+                    return  # Don't update - keep the placeholder
+                
+                preview_frame = preview_frames[filename]
+                # Clear existing color labels
+                for widget in preview_frame.winfo_children():
+                    widget.destroy()
+                
+                # Create new color swatches with actual colors
+                for i, color in enumerate(colors[:6]):
+                    try:
+                        color_label = Label(
+                            preview_frame,
+                            bg=color,
+                            width=1,
+                            height=1,
+                            relief='flat',
+                            borderwidth=0,
+                            highlightthickness=0
+                        )
+                        color_label.pack(side=LEFT, padx=0.5)
+                    except Exception:
+                        pass
+                
+                loaded_previews.add(filename)
+            
+            # Function to get visible theme indices based on scroll position
+            def get_visible_themes():
+                """Get indices of themes currently visible in the viewport."""
+                try:
+                    # Get canvas viewport bounds
+                    canvas_top = canvas.canvasy(0)
+                    canvas_bottom = canvas.canvasy(canvas.winfo_height())
+                    
+                    visible_indices = []
+                    for i, theme in enumerate(available_themes):
+                        # Get theme frame position
+                        theme_frame = preview_frames[theme["filename"]].master
+                        frame_y = canvas.canvasy(theme_frame.winfo_y())
+                        frame_height = theme_frame.winfo_height()
+                        frame_bottom = frame_y + frame_height
+                        
+                        # Check if frame is visible (with some padding)
+                        if frame_bottom >= canvas_top - 50 and frame_y <= canvas_bottom + 50:
+                            visible_indices.append(i)
+                    
+                    return visible_indices
+                except Exception:
+                    # Fallback: return first 8
+                    return list(range(min(8, len(available_themes))))
+            
+            # Function to load previews for specific themes
+            def load_preview_batch(theme_indices):
+                """Load preview colors for a batch of themes."""
+                for idx in theme_indices:
+                    if idx >= len(available_themes):
+                        continue
+                    theme = available_themes[idx]
+                    filename = theme["filename"]
+                    
+                    # Skip if already loaded or loading
+                    if filename in loaded_previews or filename in loading_queue:
+                        continue
+                    
+                    # Add to loading queue
+                    loading_queue.append(filename)
+                    
+                    # Fetch in background thread
+                    def fetch_and_update(fname=filename):
+                        colors = self._get_theme_preview_colors(fname)
+                        # Update UI in main thread (even if colors is empty)
+                        self.root.after(0, lambda f=fname, c=colors: update_theme_preview(f, c))
+                        if fname in loading_queue:
+                            loading_queue.remove(fname)
+                    
+                    import threading
+                    threading.Thread(target=fetch_and_update, daemon=True).start()
+            
+            # Function to check scroll and load more previews
+            def on_scroll_or_resize(event=None):
+                """Load previews for visible themes when scrolling."""
+                try:
+                    visible = get_visible_themes()
+                    if visible:
+                        # Load visible themes plus a buffer (next 4 below visible area)
+                        max_visible = max(visible) if visible else 0
+                        to_load = visible + [i for i in range(max_visible + 1, max_visible + 5) if i < len(available_themes)]
+                        load_preview_batch(to_load)
+                except Exception:
+                    pass  # Silently fail if calculation errors occur
+            
+            # Enable mouse wheel scrolling with lazy loading
+            def on_mousewheel(event):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                # Trigger lazy loading after scroll
+                self.root.after(50, on_scroll_or_resize)
+            
+            def bind_mousewheel(event):
+                canvas.bind_all("<MouseWheel>", on_mousewheel)
+            def unbind_mousewheel(event):
+                canvas.unbind_all("<MouseWheel>")
+            canvas.bind("<Enter>", bind_mousewheel)
+            canvas.bind("<Leave>", unbind_mousewheel)
+            
+            # Bind scroll events to trigger lazy loading
+            def on_scroll(event=None):
+                self.root.after(50, on_scroll_or_resize)
+            
+            canvas.bind('<Button-1>', on_scroll)
+            canvas.bind('<B1-Motion>', on_scroll)
+            scrollbar.bind('<Button-1>', on_scroll)
+            
+            # Update configure handler to also trigger lazy loading
+            original_configure_handler = on_canvas_configure
+            def enhanced_configure(event):
+                original_configure_handler(event)
+                self.root.after(100, on_scroll_or_resize)
+            canvas.bind('<Configure>', enhanced_configure)
+            
+            # Load initial batch (first 8 visible themes)
+            dialog.update()  # Ensure layout is complete
+            self.root.after(100, lambda: load_preview_batch(get_visible_themes()))
+            
+            # Fallback: Load ALL themes after a delay to ensure nothing is missed
+            # This handles cases where visibility detection might miss some themes
+            def load_all_remaining():
+                """Load previews for any themes that haven't been loaded yet."""
+                for i, theme in enumerate(available_themes):
+                    filename = theme["filename"]
+                    if filename not in loaded_previews and filename not in loading_queue:
+                        load_preview_batch([i])
+            
+            # Load all remaining themes after 2 seconds (gives initial batch time to start)
+            self.root.after(2000, load_all_remaining)
+        
+        # Build dialog immediately
+        build_dialog_ui()
+    
+    def _resolve_theme_conflicts(self, parent_dialog, conflicts, all_selected):
+        """Show dialog to resolve theme conflicts.
+        
+        Args:
+            parent_dialog: Parent themes browser dialog
+            conflicts: List of conflicting theme filenames
+            all_selected: All selected themes to install
+        """
+        conflict_dialog = self._create_dialog_base("Theme Conflicts", 500, 300)
+        
+        main_frame = Frame(conflict_dialog, bg='#1E1E1E')
+        main_frame.pack(fill=BOTH, expand=True, padx=15, pady=15)
+        
+        # Title
+        title_label = Label(
+            main_frame,
+            text="Theme Conflicts Detected",
+            font=("Segoe UI", 11, "bold"),
+            bg='#1E1E1E',
+            fg='#D4D4D4'
+        )
+        title_label.pack(pady=(0, 10))
+        
+        # Description
+        desc_text = (
+            "The following themes are already installed:\n\n" +
+            "\n".join([f"• {parent_dialog.theme_data[fname]['theme'].get('name', fname)}" for fname in conflicts]) +
+            "\n\nHow would you like to handle these conflicts?"
+        )
+        desc_label = Label(
+            main_frame,
+            text=desc_text,
+            font=("Segoe UI", 9),
+            bg='#1E1E1E',
+            fg='#CCCCCC',
+            justify=LEFT,
+            wraplength=470
+        )
+        desc_label.pack(pady=(0, 20))
+        
+        # Store resolution choice
+        conflict_dialog.resolution = None
+        
+        # Buttons
+        buttons_frame = Frame(main_frame, bg='#1E1E1E')
+        buttons_frame.pack(fill=X, pady=(10, 0))
+        
+        def choose_overwrite():
+            conflict_dialog.resolution = "overwrite"
+            conflict_dialog.destroy()
+            self._install_themes(parent_dialog, all_selected, conflict_resolution="overwrite")
+        
+        def choose_rename():
+            conflict_dialog.resolution = "rename"
+            conflict_dialog.destroy()
+            self._install_themes(parent_dialog, all_selected, conflict_resolution="rename")
+        
+        def choose_skip():
+            conflict_dialog.resolution = "skip"
+            conflict_dialog.destroy()
+            # Remove conflicts from selection
+            selected_without_conflicts = [fname for fname in all_selected if fname not in conflicts]
+            if selected_without_conflicts:
+                self._install_themes(parent_dialog, selected_without_conflicts)
+            else:
+                messagebox.showinfo("Installation Complete", "All selected themes were skipped due to conflicts.")
+                parent_dialog.destroy()
+        
+        overwrite_btn = ttk.Button(
+            buttons_frame,
+            text="Overwrite",
+            command=choose_overwrite
+        )
+        overwrite_btn.pack(side=LEFT, padx=(0, 10))
+        
+        rename_btn = ttk.Button(
+            buttons_frame,
+            text="Rename",
+            command=choose_rename
+        )
+        rename_btn.pack(side=LEFT, padx=(0, 10))
+        
+        skip_btn = ttk.Button(
+            buttons_frame,
+            text="Skip",
+            command=choose_skip
+        )
+        skip_btn.pack(side=LEFT, padx=(0, 10))
+        
+        cancel_btn = ttk.Button(
+            buttons_frame,
+            text="Cancel",
+            command=conflict_dialog.destroy
+        )
+        cancel_btn.pack(side=RIGHT)
+    
+    def _install_themes(self, parent_dialog, selected_themes, conflict_resolution="overwrite"):
+        """Download and install selected themes.
+        
+        Args:
+            parent_dialog: Parent themes browser dialog
+            selected_themes: List of theme filenames to install
+            conflict_resolution: How to handle conflicts ("overwrite", "rename", or "skip")
+        """
+        # Create progress dialog
+        progress_dialog = self._create_dialog_base("Installing Themes", 400, 150)
+        progress_frame = Frame(progress_dialog, bg='#1E1E1E')
+        progress_frame.pack(fill=BOTH, expand=True, padx=20, pady=20)
+        
+        status_label = Label(
+            progress_frame,
+            text="Downloading themes...",
+            font=("Segoe UI", 9),
+            bg='#1E1E1E',
+            fg='#CCCCCC'
+        )
+        status_label.pack(pady=(0, 10))
+        
+        progress_var = StringVar(value="0 / 0")
+        progress_label = Label(
+            progress_frame,
+            textvariable=progress_var,
+            font=("Segoe UI", 8),
+            bg='#1E1E1E',
+            fg='#808080'
+        )
+        progress_label.pack()
+        
+        progress_dialog.update()
+        
+        # Get Color Schemes directory
+        css_dir = self.script_dir / "Color Schemes"
+        css_dir.mkdir(exist_ok=True)
+        
+        installed_count = 0
+        skipped_count = 0
+        error_count = 0
+        error_details = []  # Track error details
+        
+        # Process each theme
+        for i, filename in enumerate(selected_themes, 1):
+            status_label.config(text=f"Downloading {filename}...")
+            progress_var.set(f"{i} / {len(selected_themes)}")
+            progress_dialog.update()
+            
+            # Check for conflict
+            theme_data = parent_dialog.theme_data.get(filename, {})
+            theme = theme_data.get("theme", {})
+            theme_name = theme.get("name", filename.replace("Scheme_", "").replace(".css", ""))
+            # Extract scheme name the same way as _load_color_schemes_from_css does
+            scheme_name = filename.replace("Scheme_", "").replace(".css", "")
+            # Remove suffixes like "-CE", "-EE"
+            scheme_name = scheme_name.split("-")[0]
+            # Clean up: "Pier_at_Dawn" -> "Pier at Dawn" then back to lowercase for comparison
+            scheme_name = scheme_name.replace("_", " ").lower()
+            
+            existing_schemes = self._get_color_schemes()
+            has_conflict = scheme_name in existing_schemes and scheme_name != "default"
+            
+            if has_conflict:
+                if conflict_resolution == "skip":
+                    skipped_count += 1
+                    continue
+                elif conflict_resolution == "rename":
+                    # Find a unique filename
+                    counter = 1
+                    base_name = filename.replace("Scheme_", "").replace(".css", "")
+                    new_filename = f"Scheme_{base_name}_{counter}.css"
+                    new_scheme_name = f"{base_name} {counter}".lower().replace("_", " ")
+                    
+                    while new_scheme_name in existing_schemes or (css_dir / new_filename).exists():
+                        counter += 1
+                        new_filename = f"Scheme_{base_name}_{counter}.css"
+                        new_scheme_name = f"{base_name} {counter}".lower().replace("_", " ")
+                    
+                    filename = new_filename
+            
+            # Download theme file
+            content = self._download_theme_file(filename)
+            if not content:
+                error_count += 1
+                error_details.append(f"{theme_name}: Download failed")
+                if hasattr(self, 'log'):
+                    self.log(f"ERROR: Failed to download theme {filename}")
+                continue
+            
+            # Validate it's a valid CSS file with colors
+            colors = self._parse_css_color_scheme(content)
+            if not colors:
+                error_count += 1
+                error_details.append(f"{theme_name}: Invalid CSS (missing colors)")
+                if hasattr(self, 'log'):
+                    self.log(f"ERROR: Theme {filename} is invalid (missing or invalid color definitions)")
+                continue
+            
+            # Save to file
+            file_path = css_dir / filename
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                installed_count += 1
+                if hasattr(self, 'log'):
+                    self.log(f"Installed theme: {theme_name}")
+            except Exception as e:
+                error_count += 1
+                error_details.append(f"{theme_name}: {str(e)}")
+                if hasattr(self, 'log'):
+                    self.log(f"ERROR: Failed to save theme {filename}: {str(e)}")
+        
+        progress_dialog.destroy()
+        
+        # Clear cached schemes to force reload
+        self._TAG_COLOR_SCHEMES = None
+        
+        # Rebuild menu
+        if hasattr(self, 'color_scheme_menu'):
+            self._build_color_scheme_menu()
+        
+        # Show completion message
+        message_parts = []
+        if installed_count > 0:
+            message_parts.append(f"✓ Installed: {installed_count}")
+        if skipped_count > 0:
+            message_parts.append(f"⊘ Skipped: {skipped_count}")
+        if error_count > 0:
+            message_parts.append(f"✗ Errors: {error_count}")
+            if error_details:
+                message_parts.append("")
+                message_parts.append("Error details:")
+                for detail in error_details[:5]:  # Show first 5 errors
+                    message_parts.append(f"  • {detail}")
+                if len(error_details) > 5:
+                    message_parts.append(f"  ... and {len(error_details) - 5} more")
+        
+        message = "\n".join(message_parts) if message_parts else "No themes were installed."
+        messagebox.showinfo("Installation Complete", message)
+        
+        parent_dialog.destroy()
+        
+        # Auto-refresh themes after installation
+        self._refresh_color_schemes()
     
     def _show_about_dialog(self):
         """Show About dialog."""
@@ -15331,6 +17078,28 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             else:
                 dialog.destroy()
     
+    def _update_filename_edit_button(self):
+        """Update filename edit button state based on current selection."""
+        if hasattr(self, 'filename_customize_btn'):
+            numbering_style = self.numbering_var.get()
+            # Disable edit button when "Original" is selected (nothing to customize)
+            if numbering_style == "Original":
+                self.filename_customize_btn.config(fg='#404040', cursor='arrow')
+                # Unbind events
+                try:
+                    self.filename_customize_btn.unbind("<Button-1>")
+                    self.filename_customize_btn.unbind("<Enter>")
+                    self.filename_customize_btn.unbind("<Leave>")
+                except:
+                    pass
+            else:
+                # Enable edit button for other formats
+                self.filename_customize_btn.config(fg='#808080', cursor='hand2')
+                # Rebind events
+                self.filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog())
+                self.filename_customize_btn.bind("<Enter>", lambda e: self.filename_customize_btn.config(fg='#D4D4D4'))
+                self.filename_customize_btn.bind("<Leave>", lambda e: self.filename_customize_btn.config(fg='#808080'))
+    
     def _update_filename_manage_button(self):
         """Update filename manage button state based on whether custom formats exist."""
         if hasattr(self, 'filename_manage_btn'):
@@ -15367,6 +17136,15 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         """Build filename menu with standard and custom formats."""
         menu.delete(0, END)
         
+        # Add "Original" option first (preserves original Bandcamp filenames)
+        menu.add_command(
+            label=" Original      ",
+            command=lambda: self._on_filename_menu_select("Original")
+        )
+        
+        # Add separator after Original
+        menu.add_separator()
+        
         # Add standard formats
         for format_key in ["Track", "01. Track", "Artist - Track", "01. Artist - Track"]:
             padded_label = f" {format_key}      "
@@ -15392,16 +17170,19 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         """Handle filename format menu selection.
         
         Args:
-            choice: Either a string key ("None", "01. Track", etc.) or a format dict
+            choice: Either a string key ("Original", "01. Track", etc.) or a format dict
         """
         if isinstance(choice, str):
-            # Standard format
+            # Standard format (including "Original")
             self.numbering_var.set(choice)
         elif isinstance(choice, dict):
             # Custom format
             formatted = self._format_custom_filename(choice)
             if formatted:
                 self.numbering_var.set(formatted)
+        
+        # Update edit button state based on selection
+        self._update_filename_edit_button()
         
         # Save the selection and update preview
         self.on_numbering_change()
@@ -15412,7 +17193,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         if hasattr(self, 'filename_menu'):
             self._build_filename_menu(self.filename_menu)
         
-        # Update manage button state
+        # Update button states
+        self._update_filename_edit_button()
         self._update_filename_manage_button()
     
     def _format_error_message(self, error_str, is_unexpected=False):
