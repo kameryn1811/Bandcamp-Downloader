@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.6"
+__version__ = "1.2.7"
 
 import sys
 import subprocess

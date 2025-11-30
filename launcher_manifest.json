@@ -1,0 +1,9 @@
+{
+  "version": "1.2.7",
+  "download_url": "https://www.dropbox.com/scl/fi/o9rnpexieca4zfb3zvp4l/BandcampDownloader.exe?rlkey=scrcp5t0nj722tqu2bwixjazk&st=7aosxyp6&dl=1",
+  "file_size": 0,
+  "release_date": "2024-01-01",
+  "notes": "Update this file when releasing a new launcher.exe."
+  "important": "Change dl=0 to dl=1 in the Dropbox URL for direct download."
+}
+
