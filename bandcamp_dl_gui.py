@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 
 import sys
 import subprocess
@@ -335,6 +335,51 @@ class BandcampDownloaderGUI:
             cls._TAG_COLOR_SCHEMES = cls._load_color_schemes_from_css()
         return cls._TAG_COLOR_SCHEMES
     
+    @staticmethod
+    def _is_windows_7():
+        """Check if running on Windows 7.
+        
+        Returns:
+            True if Windows 7 is detected, False otherwise
+        """
+        if sys.platform != 'win32':
+            return False
+        try:
+            # Windows 7 is version 6.1
+            version = sys.getwindowsversion()
+            return version.major == 6 and version.minor == 1
+        except:
+            # Fallback: try platform module
+            try:
+                import platform
+                release = platform.release()
+                return release == '7'
+            except:
+                return False
+    
+    @classmethod
+    def _get_icon(cls, icon_name):
+        """Get the appropriate icon based on Windows version.
+        
+        Args:
+            icon_name: String identifier for the icon ('settings', 'pencil', 'trash', 'expand', 'collapse')
+            
+        Returns:
+            Unicode character string for the icon
+        """
+        is_win7 = cls._is_windows_7()
+        
+        icons = {
+            'settings': '☰' if is_win7 else '⚙',
+            'pencil': '✏' if is_win7 else '✏️',
+            'trash': '✖' if is_win7 else '🗑️',
+            'expand': '⇅' if is_win7 else '⤢',
+            'collapse': '⇅' if is_win7 else '⤡',
+            'eye': 'N' if is_win7 else '👁',
+        }
+        
+        return icons.get(icon_name, '')
+    
     def _extract_format(self, format_val):
         """Extract base format from display value (e.g., 'mp3 (128kbps)' -> 'mp3')."""
         if format_val == "Original":
@@ -465,6 +510,12 @@ class BandcampDownloaderGUI:
         self.download_discography_var = BooleanVar(value=False)  # Always default to off, not persistent
         self.auto_check_updates_var = BooleanVar(value=self.load_saved_auto_check_updates())
         
+        # Split album artist display setting
+        self.split_album_artist_display_var = StringVar(value=self.load_saved_split_album_artist_display())
+        
+        # MP3 skip re-encoding setting (default to True)
+        self.skip_mp3_reencode_var = BooleanVar(value=self.load_saved_skip_mp3_reencode())
+        
         # Color scheme for URL tags
         self.current_tag_color_scheme = self.load_saved_tag_color_scheme()
         schemes = self._get_color_schemes()
@@ -494,7 +545,7 @@ class BandcampDownloaderGUI:
         self.log_snapshot = None  # Store snapshot before clearing: (log_messages_copy, debug_mode_state, scroll_position)
         
         # Store metadata for preview
-        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None, "first_track_title": None, "first_track_number": None}
+        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None, "first_track_title": None, "first_track_number": None, "track_titles": []}
         self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
         self.url_check_timer = None  # For debouncing URL changes
         self.album_art_image = None  # Store reference to prevent garbage collection
@@ -630,8 +681,8 @@ class BandcampDownloaderGUI:
         # Special style for download button with Bandcamp blue accent
         # Default is darker, hover is brighter/more prominent
         style.configure('Download.TButton', background='#2599b8', foreground='#FFFFFF',
-                       borderwidth=2, bordercolor='#2599b8', relief='flat',
-                       padding=(15, 8), font=("Segoe UI", 10, "bold"), width=25)
+                       borderwidth=0, bordercolor='#2599b8', relief='flat',
+                       padding=(12, 6), font=("Segoe UI", 10, "bold"), width=25)
         style.map('Download.TButton',
                  background=[('active', success_color), ('pressed', '#1d7a95')],
                  bordercolor=[('active', success_color), ('pressed', '#1d7a95')])
@@ -639,9 +690,17 @@ class BandcampDownloaderGUI:
         # Cancel button style - matches download button size but keeps muted default colors
         # Slightly wider to match visual size of download button
         style.configure('Cancel.TButton', background=select_bg, foreground=fg_color,
-                       borderwidth=1, bordercolor=border_color, relief='flat',
+                       borderwidth=0, bordercolor=border_color, relief='flat',
                        padding=(15, 10), width=23)  # Slightly wider than download button to match visual size
         style.map('Cancel.TButton',
+                 background=[('active', hover_bg), ('pressed', bg_color)],
+                 bordercolor=[('active', border_color), ('pressed', border_color)])
+        
+        # Browse button style - compact with no border
+        style.configure('Browse.TButton', background=select_bg, foreground=fg_color,
+                       borderwidth=0, bordercolor=border_color, relief='flat',
+                       padding=(8, 4))  # Compact padding
+        style.map('Browse.TButton',
                  background=[('active', hover_bg), ('pressed', bg_color)],
                  bordercolor=[('active', border_color), ('pressed', border_color)])
         style.configure('TRadiobutton', background=bg_color, foreground=fg_color,
@@ -990,6 +1049,8 @@ class BandcampDownloaderGUI:
                 "album_art_mode": self.album_art_mode,
                 "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False,
                 "auto_check_updates": self.auto_check_updates_var.get() if hasattr(self, 'auto_check_updates_var') else True,
+                "split_album_artist_display": self.split_album_artist_display_var.get() if hasattr(self, 'split_album_artist_display_var') else "bandcamp_default",
+                "skip_mp3_reencode": self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True,
                 "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else []),
                 "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else [])
             }
@@ -1662,6 +1723,373 @@ class BandcampDownloaderGUI:
         
         return preview_frame, preview_text
     
+    def _show_additional_settings(self):
+        """Show Additional Settings dialog with split album artist display option."""
+        dialog = self._create_dialog_base("Additional Settings", 580, 290)
+        
+        # Main container
+        main_frame = Frame(dialog, bg='#1E1E1E', padx=10, pady=10)
+        main_frame.pack(fill=BOTH, expand=True)
+        
+        # Split Album Artist Display Panel
+        split_album_panel = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        split_album_panel.pack(fill=X, pady=(0, 15))
+        
+        # Inner content frame for split album panel
+        split_album_content = Frame(split_album_panel, bg='#1E1E1E')
+        split_album_content.pack(fill=X, padx=6, pady=(6, 6))
+        
+        split_album_label = Label(
+            split_album_content,
+            text="In case of Split Artist (Album and Track Artists differ):",
+            font=("Segoe UI", 9),
+            bg='#1E1E1E',
+            fg='#D4D4D4'
+        )
+        split_album_label.pack(anchor=W, pady=(0, 5))
+        
+        # Dropdown for split album artist display (using same menubutton style)
+        split_album_options = [
+            "Show All Artists (Bandcamp Default)",
+            "Use Track Artist",
+            "Use Album Artist",
+            "Use First Track Artist"
+        ]
+        split_album_values = [
+            "bandcamp_default",
+            "track_artist",
+            "album_artist",
+            "first_track_artist"
+        ]
+        
+        # Create display mapping
+        display_map = {
+            "bandcamp_default": "Show All Artists (Bandcamp Default)",
+            "track_artist": "Use Track Artist",
+            "album_artist": "Use Album Artist",
+            "first_track_artist": "Use First Track Artist"
+        }
+        
+        split_album_var = StringVar(value=display_map.get(self.split_album_artist_display_var.get(), "Show All Artists (Bandcamp Default)"))
+        
+        # Update the actual setting when dropdown changes
+        def on_split_album_change(value):
+            # Find the corresponding value
+            index = split_album_options.index(value)
+            if index < len(split_album_values):
+                # Update the internal setting
+                self.split_album_artist_display_var.set(split_album_values[index])
+                self.save_split_album_artist_display()
+                # Update the dropdown display to show the selected option
+                split_album_var.set(value)
+                # Update preview in dialog (simulated split album)
+                update_preview_in_dialog()
+                # Also update main interface preview if it exists
+                if hasattr(self, 'update_preview'):
+                    self.update_preview()
+        
+        # Create and pack dropdown right after label (second in order)
+        split_album_menubutton, split_album_menu = self._create_menubutton_with_menu(
+            split_album_content,
+            split_album_var,
+            split_album_options,
+            40,
+            callback=on_split_album_change
+        )
+        split_album_menubutton.pack(anchor=W, padx=(15, 0), pady=(2, 4))
+        
+        # Note about how this works with Filename setting (inside split album panel)
+        filename_note_label = Label(
+            split_album_content,
+            text="Note: Works in tandem with Filename setting. Only applies/previews if filename format includes \"Artist\".",
+            font=("Segoe UI", 8),
+            bg='#1E1E1E',
+            fg='#A0A0A0',
+            wraplength=550,
+            justify='left'
+        )
+        filename_note_label.pack(anchor=W, pady=(4, 4))      
+        
+        # Preview section (inside split album panel)
+        preview_frame, preview_text = self._create_preview_frame(split_album_content, wraplength=550)
+        preview_frame.pack(fill=X, pady=(6, 0))
+        
+        # MP3 Skip Re-encoding Panel
+        mp3_panel = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        mp3_panel.pack(fill=X, pady=(0, 15))
+        
+        # Inner content frame for MP3 panel
+        mp3_content = Frame(mp3_panel, bg='#1E1E1E')
+        mp3_content.pack(fill=X, padx=6, pady=(6, 6))
+        
+        # MP3 skip re-encoding checkbox
+        mp3_checkbox = Checkbutton(
+            mp3_content,
+            text="Skip re-encoding if bandcamp file is an MP3 (When using MP3 (128kbps) format)",
+            variable=self.skip_mp3_reencode_var,
+            command=self.save_skip_mp3_reencode,
+            font=("Segoe UI", 9),
+            bg='#1E1E1E',
+            fg='#D4D4D4',
+            activebackground='#1E1E1E',
+            activeforeground='#D4D4D4',
+            selectcolor='#1E1E1E',
+            anchor='w',
+            justify='left',
+            wraplength=550
+        )
+        mp3_checkbox.pack(anchor=W, pady=(0, 0))
+        
+        def generate_split_album_preview():
+            """Generate preview filename simulating a split album scenario."""
+            # Get current filename format
+            numbering_style = self.numbering_var.get()
+            if numbering_style == "Original" or numbering_style == "None":
+                return "Preview unavailable (Original filename format)"
+            
+            # Get format data
+            format_data = None
+            if numbering_style in self.FILENAME_FORMATS:
+                format_data = self.FILENAME_FORMATS[numbering_style]
+            else:
+                if hasattr(self, 'custom_filename_formats') and self.custom_filename_formats:
+                    for custom_format in self.custom_filename_formats:
+                        formatted = self._format_custom_filename(custom_format)
+                        if formatted == numbering_style:
+                            format_data = custom_format
+                            break
+            
+            if not format_data:
+                return "Preview unavailable"
+            
+            template = format_data.get("template", "")
+            if not template:
+                return "Preview unavailable"
+            
+            # Check if template includes "Artist"
+            template_lower = template.lower()
+            has_artist_tag = "artist" in template_lower
+            
+            if not has_artist_tag:
+                return "Preview unavailable (Selected filename format doesn't contain artist)"
+            
+            # Check if we have real metadata or should use generic placeholders
+            has_real_metadata = (
+                self.album_info.get("artist") or 
+                self.album_info.get("label") or 
+                self.album_info.get("first_track_title") or
+                self.album_info.get("album")
+            )
+            
+            # Use real metadata if available, otherwise use generic placeholders
+            if has_real_metadata:
+                # Use real metadata from album_info
+                example_label = self.sanitize_filename(self.album_info.get("label") or self.album_info.get("artist") or "Album Artist")
+                first_track_title_raw = self.album_info.get("first_track_title") or "Track Title"
+                
+                # Extract track title (remove artist prefix if present)
+                # Pattern: "Artist - Title" -> extract just "Title"
+                if " - " in first_track_title_raw:
+                    parts = first_track_title_raw.split(" - ", 1)
+                    if len(parts) >= 2:
+                        example_title = self.sanitize_filename(parts[1].strip())
+                    else:
+                        example_title = self.sanitize_filename(first_track_title_raw)
+                else:
+                    example_title = self.sanitize_filename(first_track_title_raw)
+                
+                if not example_title:
+                    example_title = "Track Title"
+                example_album = self.sanitize_filename(self.album_info.get("album")) or "Album"
+                example_album_artist = self.sanitize_filename(self.album_info.get("label") or self.album_info.get("artist") or "Album Artist")
+            else:
+                # Use generic placeholders when no metadata
+                example_label = "Album Artist"
+                example_title = "Track Title"
+                example_album = "Album"
+                example_album_artist = "Album Artist"
+            
+            # Try to extract track artists from track titles and album title if available
+            example_track_artists = set()
+            example_first_track_artist = "Track Artist"
+            
+            # Method 1: Check if album title contains multiple artists (e.g., "DISTURD / 惡AI意")
+            album_title = self.album_info.get("album") or ""
+            if album_title and (" / " in album_title or "⧸" in album_title):
+                # Split by " / " or "⧸" to get multiple artists
+                import re
+                # Try both " / " and "⧸" separators
+                if " / " in album_title:
+                    artists = [a.strip() for a in album_title.split(" / ")]
+                elif "⧸" in album_title:
+                    artists = [a.strip() for a in album_title.split("⧸")]
+                else:
+                    artists = []
+                
+                # Filter out parts that look like album titles (too long, contain quotes, etc.)
+                for artist in artists:
+                    # Remove common album title suffixes like "split 12"", "split EP", etc.
+                    artist_clean = re.sub(r'\s*[-–—]\s*["\'].*$', '', artist)  # Remove "- "title"" suffix
+                    artist_clean = re.sub(r'\s+split\s+\d+["\']?$', '', artist_clean, flags=re.IGNORECASE)
+                    artist_clean = artist_clean.strip()
+                    
+                    # Only use if it looks like an artist name (reasonable length, not empty)
+                    if artist_clean and len(artist_clean) < 50 and len(artist_clean) > 1:
+                        example_track_artists.add(artist_clean)
+                        if not example_first_track_artist or example_first_track_artist == "Track Artist":
+                            example_first_track_artist = artist_clean
+            
+            # Method 2: Check if we can extract track artists from track titles
+            # Split albums often have format: "Track Artist - Track Title"
+            first_track_title_raw = self.album_info.get("first_track_title")
+            if first_track_title_raw:
+                # Try to extract artist from "Artist - Title" pattern
+                parts = first_track_title_raw.split(" - ", 1)
+                if len(parts) >= 2:
+                    potential_artist = parts[0].strip()
+                    # Only use if it looks like an artist name (not too long, not just numbers)
+                    if potential_artist and len(potential_artist) < 50 and not potential_artist.isdigit():
+                        example_first_track_artist = potential_artist
+                        example_track_artists.add(potential_artist)
+            
+            # If we only have one artist, add a second generic one for split album simulation
+            if len(example_track_artists) == 1:
+                example_track_artists.add("Track Artist 2")
+            elif len(example_track_artists) == 0:
+                # No artists extracted, use generic placeholders
+                example_track_artists = {"Track Artist", "Track Artist 2"}
+                example_first_track_artist = "Track Artist"
+            
+            # Get current split album setting
+            current_setting = self.split_album_artist_display_var.get()
+            
+            # Special handling for "bandcamp_default" - show original Bandcamp filename format
+            if current_setting == "bandcamp_default":
+                # Bandcamp default format: "Album Artist - Track Artist - Track Title"
+                # But include track number prefix if the template has it
+                track_number = self.album_info.get("first_track_number") or 1
+                track_prefix = ""
+                
+                # Check if template contains track number tag (01 or 1)
+                # Parse template to see if it starts with a track number tag
+                import re
+                # Check for "01." or "1." at the start
+                if re.match(r'^01\.', template):
+                    track_prefix = f"{track_number:02d}. "
+                elif re.match(r'^1\.', template):
+                    track_prefix = f"{track_number}. "
+                # Check for "01 " or "1 " at the start
+                elif re.match(r'^01\s', template):
+                    track_prefix = f"{track_number:02d} "
+                elif re.match(r'^1\s', template):
+                    track_prefix = f"{track_number} "
+                
+                # Add extension
+                format_val = self.format_var.get()
+                base_format = self._extract_format(format_val)
+                ext_map = {
+                    "original": ".mp3",
+                    "mp3": ".mp3",
+                    "flac": ".flac",
+                    "ogg": ".ogg",
+                    "wav": ".wav"
+                }
+                ext = ext_map.get(base_format, ".mp3")
+                
+                # Return Bandcamp default format with optional track prefix: "01. Album Artist - Track Artist - Track Title"
+                return f"{track_prefix}{example_label} - {example_first_track_artist} - {example_title}{ext}"
+            
+            # For other settings, format artist based on setting and apply to user's template
+            formatted_artist = self._format_split_album_artist(
+                example_first_track_artist,
+                example_track_artists,
+                setting=current_setting
+            )
+            
+            # If "album_artist" setting returns None, use the album artist
+            if formatted_artist is None:
+                formatted_artist = example_album_artist
+            
+            # Build preview metadata (using real metadata if available, otherwise generic)
+            preview_metadata = {
+                "title": example_title,
+                "artist": formatted_artist,
+                "album": example_album,
+                "year": "2024",
+                "genre": "Genre",
+                "label": example_label,
+                "album_artist": example_album_artist,
+                "catalog_number": "CAT001"
+            }
+            
+            # Generate filename
+            track_number = self.album_info.get("first_track_number") or 1
+            generated_name = self._generate_filename_from_template(
+                template, track_number, preview_metadata, preview_mode=False
+            )
+            
+            if generated_name:
+                # Add extension
+                format_val = self.format_var.get()
+                base_format = self._extract_format(format_val)
+                ext_map = {
+                    "original": ".mp3",
+                    "mp3": ".mp3",
+                    "flac": ".flac",
+                    "ogg": ".ogg",
+                    "wav": ".wav"
+                }
+                ext = ext_map.get(base_format, ".mp3")
+                return f"{generated_name}{ext}"
+            
+            return "Preview unavailable"
+        
+        def update_preview_in_dialog():
+            """Update preview in dialog - always simulates split album scenario."""
+            # Generate preview with simulated split album
+            preview_filename = generate_split_album_preview()
+            preview_text.config(text=preview_filename)
+        
+        # Store reference to update function so it can be called when metadata changes
+        # This allows the preview to update dynamically when URL metadata is fetched
+        if not hasattr(self, '_additional_settings_dialogs'):
+            self._additional_settings_dialogs = []
+        dialog_ref = {'update_func': update_preview_in_dialog, 'dialog': dialog}
+        self._additional_settings_dialogs.append(dialog_ref)
+        
+        # Clean up reference when dialog closes
+        def on_dialog_close():
+            if hasattr(self, '_additional_settings_dialogs'):
+                self._additional_settings_dialogs = [d for d in self._additional_settings_dialogs if d['dialog'] != dialog]
+            dialog.destroy()
+        
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+        
+        # Initial preview update
+        update_preview_in_dialog()
+        
+        # Close button
+        button_frame = Frame(main_frame, bg='#1E1E1E')
+        button_frame.pack(fill=X, pady=(0, 0))
+        
+        close_btn = Button(
+            button_frame,
+            text="Close",
+            command=dialog.destroy,
+            bg='#007ACC',
+            fg='#FFFFFF',
+            font=("Segoe UI", 9),
+            relief='flat',
+            padx=20,
+            pady=5,
+            cursor='hand2'
+        )
+        close_btn.pack(side=RIGHT)
+        
+        # Bind Enter key to close
+        dialog.bind('<Return>', lambda e: dialog.destroy())
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+    
     def _create_menubutton_with_menu(self, parent, textvariable, values, width, callback=None):
         """Create a menubutton with menu, matching the structure menubutton style.
         
@@ -1751,7 +2179,7 @@ class BandcampDownloaderGUI:
         menu.unbind('<<MenuSelect>>')
         menu.bind('<<MenuSelect>>', on_menu_post_with_check)
         
-        # Detect when menu closes due to outside click by monitoring root window focus/clicks
+        # Detect when menu closes due to outside Click by monitoring root window focus/Clicks
         # Use a more aggressive approach: check immediately on any root interaction
         def detect_menu_close(event=None):
             nonlocal menu_open
@@ -1768,19 +2196,19 @@ class BandcampDownloaderGUI:
         # Bind to root window events that indicate menu might have closed
         # Focus-in on root: when root gets focus, menu might have closed
         self.root.bind('<FocusIn>', detect_menu_close, add=True)
-        # Button-1 on root: when clicking outside, menu might have closed
-        def root_click_handler(event):
-            # Check immediately if click is not on the menubutton or menu itself
+        # Button-1 on root: when Clicking outside, menu might have closed
+        def root_Click_handler(event):
+            # Check immediately if Click is not on the menubutton or menu itself
             try:
                 widget = event.widget
-                # IMPORTANT: If click is on menubutton, DON'T check - the button click handler will handle it
-                # Only check for clicks outside the menubutton and menu
+                # IMPORTANT: If Click is on menubutton, DON'T check - the button Click handler will handle it
+                # Only check for Clicks outside the menubutton and menu
                 if widget != menubutton and not str(widget).startswith(str(menu)):
                     detect_menu_close(event)
             except:
                 pass
         
-        self.root.bind('<Button-1>', root_click_handler, add=True)
+        self.root.bind('<Button-1>', root_Click_handler, add=True)
         
         # Also periodically check when flag says open (backup detection)
         def periodic_check():
@@ -1807,11 +2235,11 @@ class BandcampDownloaderGUI:
         menu.unbind('<<MenuSelect>>')
         menu.bind('<<MenuSelect>>', on_menu_post_with_check)
         
-        # Check menu state on click - if open, close it; otherwise let default behavior open it
-        # Known limitation: Tkinter's Menubutton doesn't reliably notify when menu closes from outside click.
-        # This causes a 2-click requirement after closing menu by clicking outside (flag gets stale).
+        # Check menu state on Click - if open, close it; otherwise let default behavior open it
+        # Known limitation: Tkinter's Menubutton doesn't reliably notify when menu closes from outside Click.
+        # This causes a 2-Click requirement after closing menu by Clicking outside (flag gets stale).
         # This is a fundamental Tkinter limitation - the current implementation is the best we can achieve.
-        def on_button_click(event=None):
+        def on_button_Click(event=None):
             nonlocal menu_open, item_just_selected
             if item_just_selected:
                 # Menu was just closed via item selection - don't interfere, let default behavior open it
@@ -1844,7 +2272,7 @@ class BandcampDownloaderGUI:
                     menu_open = False
                 return None  # Allow default behavior
         
-        menubutton.bind('<Button-1>', on_button_click, add=True)
+        menubutton.bind('<Button-1>', on_button_Click, add=True)
         
         return menubutton, menu
     
@@ -2096,7 +2524,25 @@ class BandcampDownloaderGUI:
     def load_saved_auto_check_updates(self):
         """Load saved auto-check for updates preference, default to True if not found."""
         settings = self._load_settings()
-        return settings.get("auto_check_updates", True)  # Default to True
+        return settings.get("auto_check_updates", True)
+    
+    def load_saved_split_album_artist_display(self):
+        """Load saved split album artist display preference, default to 'bandcamp_default' if not found."""
+        settings = self._load_settings()
+        return settings.get("split_album_artist_display", "bandcamp_default")
+    
+    def save_split_album_artist_display(self):
+        """Save split album artist display preference."""
+        self._save_settings()
+    
+    def load_saved_skip_mp3_reencode(self):
+        """Load saved MP3 skip re-encoding preference, default to True if not found."""
+        settings = self._load_settings()
+        return settings.get("skip_mp3_reencode", True)  # Default to True
+    
+    def save_skip_mp3_reencode(self):
+        """Save MP3 skip re-encoding preference."""
+        self._save_settings()
     
     def save_auto_check_updates(self):
         """Save auto-check for updates preference."""
@@ -2281,7 +2727,7 @@ class BandcampDownloaderGUI:
     def setup_ui(self):
         """Create the GUI interface."""
         # Main container with compact padding
-        main_frame = ttk.Frame(self.root, padding="12")
+        main_frame = ttk.Frame(self.root, padding="8")
         main_frame.grid(row=0, column=0, sticky=(W, E, N, S))
         
         # URL input - supports both single Entry and multi-line ScrolledText
@@ -2305,14 +2751,14 @@ class BandcampDownloaderGUI:
         # Right-align to mirror X button position, vertically centered with URL field
         # Use rowspan=2 to span both rows (URL label row and URL field row) and sticky to center vertically
         self.url_paste_btn.grid(row=0, column=0, rowspan=2, sticky=(E, N, S), pady=2, padx=0)
-        self.url_paste_btn.bind("<Button-1>", lambda e: self._handle_paste_button_click())
+        self.url_paste_btn.bind("<Button-1>", lambda e: self._handle_paste_button_Click())
         self.url_paste_btn.bind("<Enter>", lambda e: self.url_paste_btn.config(fg='#D4D4D4'))
         self.url_paste_btn.bind("<Leave>", lambda e: self.url_paste_btn.config(fg='#808080'))
         
         # Container frame for URL widgets (Entry and ScrolledText)
         # Span rows 0-1 to align with URL label (row 0) and paste button (row 1)
         self.url_container_frame = Frame(main_frame, bg='#1E1E1E')
-        self.url_container_frame.grid(row=0, column=1, columnspan=2, rowspan=2, sticky=(W, E, N), pady=2, padx=(8, 0))
+        self.url_container_frame.grid(row=0, column=1, columnspan=2, rowspan=2, sticky=(W, E, N), pady=0, padx=(8, 0))
         self.url_container_frame.columnconfigure(0, weight=1)  # URL field expands
         self.url_container_frame.columnconfigure(1, weight=0, minsize=20)  # Clear button fixed width
         self.url_container_frame.columnconfigure(2, weight=0, minsize=20)  # Expand button fixed width
@@ -2344,7 +2790,7 @@ class BandcampDownloaderGUI:
         self.url_entry_widget = url_entry
         
         # Add placeholder text to Entry
-        self._set_entry_placeholder(url_entry, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.")
+        self._set_entry_placeholder(url_entry, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
         
         # Clear button (X) - appears when URL field has content
         # Use smaller font and minimal padding to match entry field height
@@ -2372,7 +2818,7 @@ class BandcampDownloaderGUI:
         # Shows expand icon (⤢) in Entry mode, collapse icon (⤡) in ScrolledText mode
         self.url_expand_btn = Label(
             self.url_container_frame,
-            text="⤢",  # Default to expand icon
+            text=self._get_icon('expand'),  # Default to expand icon
             font=("Segoe UI", 11),
             bg='#1E1E1E',
             fg='#808080',
@@ -2398,7 +2844,7 @@ class BandcampDownloaderGUI:
         url_entry.bind('<Control-v>', self._handle_entry_paste)
         url_entry.bind('<Shift-Insert>', self._handle_entry_paste)
         url_entry.bind('<Button-2>', self._handle_entry_paste)  # Middle mouse button paste
-        url_entry.bind('<Button-3>', self._handle_right_click_paste_entry)  # Right mouse button
+        url_entry.bind('<Button-3>', self._handle_right_Click_paste_entry)  # Right mouse button
         url_entry.bind('<KeyRelease>', lambda e: (self.on_url_change(), self._check_entry_for_newlines(), self._update_url_clear_button()))
         url_entry.bind('<Return>', self._handle_entry_return)  # Enter key - expand to multi-line
         # Disable undo/redo for Entry widget (doesn't work well with tags)
@@ -2489,7 +2935,7 @@ class BandcampDownloaderGUI:
         # This will be positioned over the ScrolledText but won't interfere with editing
         placeholder_label = Label(
             url_text_frame,
-            text="Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.",
+            text="Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.",
             font=("Segoe UI", 9),
             bg='#252526',
             fg='#808080',
@@ -2505,8 +2951,8 @@ class BandcampDownloaderGUI:
         placeholder_label.bind('<Button-1>', lambda e: url_text.focus_set())
         placeholder_label.bind('<Key>', lambda e: url_text.focus_set())
         placeholder_label.bind('<FocusIn>', lambda e: url_text.focus_set())
-        # Allow right-click on placeholder to directly paste
-        placeholder_label.bind('<Button-3>', self._handle_right_click_paste_text)
+        # Allow right-Click on placeholder to directly paste
+        placeholder_label.bind('<Button-3>', self._handle_right_Click_paste_text)
         self.url_text_placeholder_label = placeholder_label
         # Initially show placeholder since widget is empty
         self._update_text_placeholder_visibility()
@@ -2515,7 +2961,7 @@ class BandcampDownloaderGUI:
         context_menu = Menu(url_text, tearoff=0, bg='#252526', fg='#CCCCCC', 
                            activebackground='#007ACC', activeforeground='#FFFFFF',
                            selectcolor='#007ACC')
-        context_menu.add_command(label="Paste", command=self._handle_right_click_paste_text)
+        context_menu.add_command(label="Paste", command=self._handle_right_Click_paste_text)
         self.url_text_context_menu = context_menu
         
         # Bind events for ScrolledText
@@ -2525,7 +2971,7 @@ class BandcampDownloaderGUI:
         url_text.bind('<Button-3>', self._show_text_context_menu)  # Right mouse button - directly paste
         url_text.bind('<KeyRelease>', lambda e: (self._on_text_key_release(), self._update_url_clear_button()))
         url_text.bind('<KeyPress>', lambda e: self._hide_text_placeholder())  # Hide on any key press
-        url_text.bind('<Button-1>', lambda e: self._hide_text_placeholder())  # Hide on click
+        url_text.bind('<Button-1>', lambda e: self._hide_text_placeholder())  # Hide on Click
         url_text.bind('<FocusIn>', lambda e: self._on_text_focus_in())
         url_text.bind('<FocusOut>', lambda e: self._on_text_focus_out())
         url_text.bind('<Return>', self._handle_text_return)  # Enter key - save state when new line added
@@ -2557,18 +3003,18 @@ class BandcampDownloaderGUI:
         # Container frame for Browse button and Settings cog icon
         # Moved to row 2 to align with path field (row 2)
         browse_container = Frame(main_frame, bg='#1E1E1E')
-        browse_container.grid(row=2, column=2, sticky=(W, E), padx=(4, 0), pady=2)
+        browse_container.grid(row=2, column=2, sticky=(W, E), padx=(4, 0), pady=0)
         browse_container.columnconfigure(0, weight=1, minsize=80)  # Browse button expands with minimum width
         browse_container.columnconfigure(1, weight=0)  # Cog icon fixed width
         
-        browse_btn = ttk.Button(browse_container, text="Browse", command=self.browse_folder, cursor='hand2')
+        browse_btn = ttk.Button(browse_container, text="Browse", command=self.browse_folder, cursor='hand2', style='Browse.TButton')
         browse_btn.grid(row=0, column=0, sticky=(W, E))  # Expand to fill available space
         self.browse_btn = browse_btn  # Store reference for unfocus handling
         
         # Settings cog icon button
         self.settings_cog_btn = Label(
             browse_container,
-            text="⚙",
+            text=self._get_icon('settings'),
             font=("Segoe UI", 12),
             bg='#1E1E1E',
             fg='#808080',
@@ -2576,12 +3022,12 @@ class BandcampDownloaderGUI:
             width=2,
             padx=4
         )
-        self.settings_cog_btn.grid(row=0, column=1, padx=(4, 0))
+        self.settings_cog_btn.grid(row=0, column=1, padx=(8, 0))  # Increased left padding to push Browse button left and align with scrollbar
         self.settings_cog_btn.bind("<Button-1>", self._show_settings_menu)
         self.settings_cog_btn.bind("<Enter>", lambda e: self.settings_cog_btn.config(fg='#D4D4D4'))
         self.settings_cog_btn.bind("<Leave>", lambda e: self.settings_cog_btn.config(fg='#808080'))
         
-        # Create settings menu (will be shown on cog click)
+        # Create settings menu (will be shown on cog Click)
         self.settings_menu = None
         
         # Bind path changes to update preview
@@ -2593,14 +3039,14 @@ class BandcampDownloaderGUI:
         # Settings section - reduced width to make room for album art panel
         # Moved to row 3 to avoid conflict with path field (row 2)
         self.settings_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
-        self.settings_frame.grid(row=3, column=0, columnspan=2, sticky=(W, E, N), pady=6, padx=0)
+        self.settings_frame.grid(row=3, column=0, columnspan=2, sticky=(W, E, N), pady=2, padx=0)
         self.settings_frame.grid_propagate(False)
         self.settings_frame.config(height=170)  # Reduced height with equal padding top and bottom
         
         # Inner frame for content
         self.settings_content = Frame(self.settings_frame, bg='#1E1E1E')
         # Start at row 0 (no separate header row)
-        self.settings_content.grid(row=0, column=0, sticky=(W, E), padx=6, pady=(6, 6))  # Equal padding top and bottom
+        self.settings_content.grid(row=0, column=0, sticky=(W, E), padx=6, pady=(4, 8))  # Balanced padding: less top, more bottom
         self.settings_frame.columnconfigure(0, weight=1)
         # Configure columns: label, combo, button (right-aligned)
         self.settings_content.columnconfigure(1, weight=1)  # Allow combo to expand
@@ -2613,7 +3059,7 @@ class BandcampDownloaderGUI:
         # Album art panel (separate frame on the right, same height as settings, square for equal padding)
         self.album_art_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
         # Moved to row 3 to align with settings_frame (row 3)
-        self.album_art_frame.grid(row=3, column=2, sticky=(W, E, N), pady=6, padx=(6, 0))
+        self.album_art_frame.grid(row=3, column=2, sticky=(W, E, N), pady=2, padx=(6, 0))
         self.album_art_frame.grid_propagate(False)
         self.album_art_frame.config(width=170, height=170)  # Square panel matching settings height for equal padding
         # Center content in the frame
@@ -2628,12 +3074,12 @@ class BandcampDownloaderGUI:
             bg='#1E1E1E',
             highlightthickness=0,
             borderwidth=0,
-            cursor='hand2'  # Show hand cursor to indicate it's clickable
+            cursor='hand2'  # Show hand cursor to indicate it's Clickable
         )
         # Center the canvas with equal padding on all sides (10px on each side = 20px total, 150 + 20 = 170)
-        self.album_art_canvas.grid(row=0, column=0, padx=10, pady=10)
+        self.album_art_canvas.grid(row=0, column=0, padx=5, pady=5)
         
-        # Make canvas clickable to toggle album art
+        # Make canvas Clickable to toggle album art
         self.album_art_canvas.bind("<Button-1>", lambda e: self.toggle_album_art())
         
         # Placeholder text on canvas (centered at 75, 75 for 150x150 canvas)
@@ -2664,10 +3110,13 @@ class BandcampDownloaderGUI:
         # Show album art button (hidden by default, shown when album art is hidden)
         # Placed in the same row as Audio Format, right-aligned
         # Always keep it in grid to prevent layout shifts - just make it invisible when not needed
+        # Eye icon for showing album art (Win7 compatible)
+        eye_icon = self._get_icon('eye')
+        eye_font = ("Webdings", 12) if self._is_windows_7() else ("Segoe UI", 10)
         self.show_album_art_btn = Label(
             self.settings_content,
-            text="👁",
-            font=("Segoe UI", 10),
+            text=eye_icon,
+            font=eye_font,
             bg='#1E1E1E',
             fg='#808080',
             cursor='hand2',
@@ -2715,7 +3164,7 @@ class BandcampDownloaderGUI:
         # Customize button (✏️) - matching folder structure style
         filename_customize_btn = Label(
             filename_frame,
-            text="✏️",
+            text=self._get_icon('pencil'),
             font=("Segoe UI", 12),
             bg='#1E1E1E',
             fg='#808080',
@@ -2723,7 +3172,7 @@ class BandcampDownloaderGUI:
             width=2,
             padx=0
         )
-        filename_customize_btn.pack(side=LEFT, padx=(0, 4))
+        filename_customize_btn.pack(side=LEFT, padx=(0, 0))
         filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog())
         filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg='#D4D4D4'))
         filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg='#808080'))
@@ -2736,7 +3185,7 @@ class BandcampDownloaderGUI:
         has_custom_filename = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
         filename_manage_btn = Label(
             filename_frame,
-            text="🗑️",
+            text=self._get_icon('trash'),
             font=("Segoe UI", 12),
             bg='#1E1E1E',
             fg='#808080' if has_custom_filename else '#404040',  # Darker when disabled
@@ -2839,7 +3288,7 @@ class BandcampDownloaderGUI:
         structure_menu.bind('<<MenuSelect>>', on_menu_post)
         structure_menu.bind('<<MenuUnpost>>', on_menu_unpost)
         
-        # Detect when menu closes due to outside click by monitoring root window focus/clicks
+        # Detect when menu closes due to outside Click by monitoring root window focus/Clicks
         # Use a more aggressive approach: check immediately on any root interaction
         def detect_menu_close(event=None):
             if self.structure_menu_open:
@@ -2855,18 +3304,18 @@ class BandcampDownloaderGUI:
         # Bind to root window events that indicate menu might have closed
         # Focus-in on root: when root gets focus, menu might have closed
         self.root.bind('<FocusIn>', detect_menu_close, add=True)
-        # Button-1 on root: when clicking outside, menu might have closed
-        def root_click_handler(event):
-            # Check immediately if click is not on the menubutton or menu itself
+        # Button-1 on root: when Clicking outside, menu might have closed
+        def root_Click_handler(event):
+            # Check immediately if Click is not on the menubutton or menu itself
             try:
                 widget = event.widget
-                # If click is on menubutton or menu, don't check (menu handles its own clicks)
+                # If Click is on menubutton or menu, don't check (menu handles its own Clicks)
                 if widget != structure_menubutton and not str(widget).startswith(str(structure_menu)):
                     detect_menu_close(event)
             except:
                 pass
         
-        self.root.bind('<Button-1>', root_click_handler, add=True)
+        self.root.bind('<Button-1>', root_Click_handler, add=True)
         
         # Also periodically check when flag says open (backup detection)
         def periodic_check():
@@ -2890,11 +3339,11 @@ class BandcampDownloaderGUI:
         structure_menu.unbind('<<MenuSelect>>')
         structure_menu.bind('<<MenuSelect>>', on_menu_post_with_check)
         
-        # Check menu state on click - if open, close it; otherwise let default behavior open it
-        # Known limitation: Tkinter's Menubutton doesn't reliably notify when menu closes from outside click.
-        # This causes a 2-click requirement after closing menu by clicking outside (flag gets stale).
+        # Check menu state on Click - if open, close it; otherwise let default behavior open it
+        # Known limitation: Tkinter's Menubutton doesn't reliably notify when menu closes from outside Click.
+        # This causes a 2-Click requirement after closing menu by Clicking outside (flag gets stale).
         # This is a fundamental Tkinter limitation - the current implementation is the best we can achieve.
-        def on_button_click(event=None):
+        def on_button_Click(event=None):
             if self.structure_item_just_selected:
                 # Menu was just closed via item selection - don't interfere, let default behavior open it
                 self.structure_item_just_selected = False
@@ -2926,7 +3375,7 @@ class BandcampDownloaderGUI:
                     self.structure_menu_open = False
                 return None  # Allow default behavior
         
-        structure_menubutton.bind('<Button-1>', on_button_click, add=True)
+        structure_menubutton.bind('<Button-1>', on_button_Click, add=True)
         
         # Store the rebuild function so _update_structure_dropdown can use it
         self._rebuild_structure_menu_with_tracking = rebuild_with_tracking
@@ -2938,7 +3387,7 @@ class BandcampDownloaderGUI:
         # Customize button (✏️) - matching settings cog icon style
         customize_btn = Label(
             structure_frame,
-            text="✏️",
+            text=self._get_icon('pencil'),
             font=("Segoe UI", 12),
             bg='#1E1E1E',
             fg='#808080',
@@ -2946,7 +3395,7 @@ class BandcampDownloaderGUI:
             width=2,
             padx=0
         )
-        customize_btn.pack(side=LEFT, padx=(0, 4))  # Increased spacing between buttons
+        customize_btn.pack(side=LEFT, padx=(0, 0))  # spacing between buttons
         customize_btn.bind("<Button-1>", lambda e: self._show_customize_dialog())
         customize_btn.bind("<Enter>", lambda e: customize_btn.config(fg='#D4D4D4'))
         customize_btn.bind("<Leave>", lambda e: customize_btn.config(fg='#808080'))
@@ -2955,7 +3404,7 @@ class BandcampDownloaderGUI:
         has_custom = hasattr(self, 'custom_structures') and self.custom_structures
         manage_btn = Label(
             structure_frame,
-            text="🗑️",
+            text=self._get_icon('trash'),
             font=("Segoe UI", 12),
             bg='#1E1E1E',
             fg='#808080' if has_custom else '#404040',  # Darker when disabled
@@ -3060,9 +3509,9 @@ class BandcampDownloaderGUI:
             fg='#D4D4D4',  # White text
             justify='left'
         )
-        preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=4)
+        preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=0)
         
-        # Preview path label (blue, left-aligned, clickable link)
+        # Preview path label (blue, left-aligned, Clickable link)
         self.preview_var = StringVar(value="Select a download path")
         preview_label_path = Label(
             preview_frame,
@@ -3073,12 +3522,12 @@ class BandcampDownloaderGUI:
             wraplength=400,  # Reduced to ensure proper wrapping
             justify='left',
             anchor='w',  # Left-align the text
-            cursor='hand2'  # Hand cursor to indicate clickability
+            cursor='hand2'  # Hand cursor to indicate Clickability
         )
-        preview_label_path.grid(row=0, column=1, sticky=W, padx=(0, 6), pady=4)
+        preview_label_path.grid(row=0, column=1, sticky=W, padx=(0, 6), pady=0)
         preview_frame.columnconfigure(1, weight=1)
         
-        # Make preview path clickable - opens folder in Explorer
+        # Make preview path Clickable - opens folder in Explorer
         def open_preview_path(event=None):
             preview_path = self.preview_var.get()
             if not preview_path or preview_path == "Select a download path":
@@ -3184,11 +3633,11 @@ class BandcampDownloaderGUI:
             style='Download.TButton',
             cursor='hand2'
         )
-        self.download_btn.grid(row=6, column=0, columnspan=3, pady=5)
+        self.download_btn.grid(row=6, column=0, columnspan=3, pady=0)
         
-        # Track if download button is being clicked to prevent URL field collapse interference
-        self.download_button_clicked = False
-        self.download_btn.bind('<Button-1>', lambda e: setattr(self, 'download_button_clicked', True), add='+')
+        # Track if download button is being Clicked to prevent URL field collapse interference
+        self.download_button_Clicked = False
+        self.download_btn.bind('<Button-1>', lambda e: setattr(self, 'download_button_Clicked', True), add='+')
         
         # Cancel button (hidden initially, shown during download)
         # Uses same style as download button for consistent size
@@ -3200,7 +3649,7 @@ class BandcampDownloaderGUI:
             style='Cancel.TButton',
             cursor='arrow'  # Regular cursor when disabled
         )
-        self.cancel_btn.grid(row=6, column=0, columnspan=3, pady=5)
+        self.cancel_btn.grid(row=6, column=0, columnspan=3, pady=0)
         self.cancel_btn.grid_remove()  # Hidden by default
         
         # Progress bar - compact
@@ -3210,7 +3659,7 @@ class BandcampDownloaderGUI:
             textvariable=self.progress_var,
             font=("Segoe UI", 8)
         )
-        self.progress_label.grid(row=7, column=0, columnspan=3, pady=2)
+        self.progress_label.grid(row=7, column=0, columnspan=3, pady=(2, 2))
         
         # Progress bar - using indeterminate mode for smooth animation
         # Options: 'indeterminate' (animated, no specific progress) or 'determinate' (shows actual %)
@@ -3219,7 +3668,7 @@ class BandcampDownloaderGUI:
             mode='indeterminate',  # Smooth animated progress
             length=350
         )
-        self.progress_bar.grid(row=8, column=0, columnspan=3, pady=2, sticky=(W, E))
+        self.progress_bar.grid(row=8, column=0, columnspan=3, pady=0, sticky=(W, E))
         
         # Overall album progress bar (custom thin 3px bar using Canvas)
         self.overall_progress_bar = ThinProgressBar(
@@ -3240,7 +3689,7 @@ class BandcampDownloaderGUI:
         
         # Label for the frame and controls on same row
         log_label = Label(self.log_frame, text="Status", bg='#1E1E1E', fg='#D4D4D4', font=("Segoe UI", 9))
-        log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(6, 2))
+        log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 2))
         
         # Clear log button (between Status label and Debug toggle) - styled like Browse button
         # Use same font size as Debug toggle (8) for consistency in header
@@ -3266,7 +3715,7 @@ class BandcampDownloaderGUI:
             style='Small.TButton',
             state='disabled'  # Disabled initially when log is empty
         )
-        self.clear_log_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(6, 2))
+        self.clear_log_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
         
         # Word wrap toggle checkbox (between Clear Log and Debug)
         settings = self._load_settings()
@@ -3284,7 +3733,7 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=self._toggle_word_wrap
         )
-        word_wrap_toggle.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(6, 2))
+        word_wrap_toggle.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(0, 0))
         
         # Debug toggle checkbox (right-aligned on same row as Status label)
         self.debug_mode_var = BooleanVar(value=False)
@@ -3300,7 +3749,7 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=self._toggle_debug_mode
         )
-        debug_toggle.grid(row=0, column=3, sticky=E, padx=6, pady=(6, 2))
+        debug_toggle.grid(row=0, column=3, sticky=E, padx=6, pady=(0, 0))
         
         # Configure column weights so controls stay on the right
         self.log_frame.columnconfigure(0, weight=1)
@@ -3360,7 +3809,7 @@ class BandcampDownloaderGUI:
         
         # Bind Ctrl+F globally to show search (works anywhere in the app)
         # Use Button-1 with add=True to set focus without interfering with text selection
-        self.log_text.bind('<Button-1>', lambda e: self._on_log_click(), add=True)  # Enable focus when clicking log
+        self.log_text.bind('<Button-1>', lambda e: self._on_log_Click(), add=True)  # Enable focus when Clicking log
         # Use bind_all to ensure Ctrl+F works regardless of which widget has focus
         self.root.bind_all('<Control-f>', lambda e: self._show_search_bar())  # Global Ctrl+F hotkey
         
@@ -3406,14 +3855,14 @@ class BandcampDownloaderGUI:
         # Track if window is expanded
         self.is_expanded = False
         
-        # Bind click events to main frame and root to unfocus URL field when clicking elsewhere
+        # Bind Click events to main frame and root to unfocus URL field when Clicking elsewhere
         def unfocus_url_field(event):
-            """Unfocus URL field when clicking on empty areas or non-interactive widgets."""
-            # Get the widget that was clicked
-            widget_clicked = event.widget
+            """Unfocus URL field when Clicking on empty areas or non-interactive widgets."""
+            # Get the widget that was Clicked
+            widget_Clicked = event.widget
             
-            # Check if click is on URL field, path entry, browse button, clear button, expand button, log text, search bar, or any of their parent containers
-            current = widget_clicked
+            # Check if Click is on URL field, path entry, browse button, clear button, expand button, log text, search bar, or any of their parent containers
+            current = widget_Clicked
             is_interactive_widget = False
             while current:
                 if (current == self.url_entry_widget or 
@@ -3433,7 +3882,7 @@ class BandcampDownloaderGUI:
                 except:
                     break
             
-            # Only unfocus URL field if the click is NOT on any interactive widget
+            # Only unfocus URL field if the Click is NOT on any interactive widget
             if not is_interactive_widget:
                 # Remove focus from URL field by focusing on root or main frame
                 try:
@@ -3605,7 +4054,7 @@ class BandcampDownloaderGUI:
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get().strip()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 content = ""
         else:
             content = ""
@@ -3670,10 +4119,10 @@ class BandcampDownloaderGUI:
         self.url_expand_btn.grid()
         if is_collapsed:
             # Collapsed - show expand icon (⤢) - top-left to bottom-right
-            self.url_expand_btn.config(text="⤢")
+            self.url_expand_btn.config(text=self._get_icon('expand'))
         else:
             # Expanded - show collapse icon (⤡) - bottom-right to top-left
-            self.url_expand_btn.config(text="⤡")
+            self.url_expand_btn.config(text=self._get_icon('collapse'))
     
     def _toggle_url_field_mode(self):
         """Toggle between Entry (single-line) and ScrolledText (multi-line) modes."""
@@ -3681,7 +4130,7 @@ class BandcampDownloaderGUI:
             # Currently in Entry mode - expand to ScrolledText
             content = self.url_var.get().strip()
             # Remove placeholder text if present
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 content = ""
             # Expand to multi-line
             self._expand_to_multiline(content)
@@ -3689,8 +4138,8 @@ class BandcampDownloaderGUI:
             # Currently in ScrolledText mode - collapse to Entry
             self._collapse_to_entry()
     
-    def _handle_paste_button_click(self):
-        """Handle paste button click - replace selection if present, otherwise paste at end."""
+    def _handle_paste_button_Click(self):
+        """Handle paste button Click - replace selection if present, otherwise paste at end."""
         # Determine which mode we're in and paste accordingly
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
             # ScrolledText mode - paste at next blank line (handles selection internally)
@@ -3729,7 +4178,7 @@ class BandcampDownloaderGUI:
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             # Entry is visible - clear it and restore placeholder
             self.url_var.set("")
-            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
             # Unfocus
             self.root.focus_set()
         
@@ -3751,12 +4200,12 @@ class BandcampDownloaderGUI:
         # Immediately check URL to ensure empty state is processed (this will clear preview/artwork)
         self._check_url()
     
-    def _handle_right_click_paste(self, event):
-        """Handle right-click paste in URL field (Entry widget) - replace selection if present, otherwise paste at end."""
+    def _handle_right_Click_paste(self, event):
+        """Handle right-Click paste in URL field (Entry widget) - replace selection if present, otherwise paste at end."""
         # Clear placeholder text if present before pasting
         if self.url_entry_widget:
             current_content = self.url_var.get()
-            if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 # Clear placeholder text
                 self.url_entry_widget.delete(0, END)
                 self.url_entry_widget.config(foreground='#CCCCCC')  # Normal text color
@@ -3765,19 +4214,19 @@ class BandcampDownloaderGUI:
         # Use the same handler as keyboard paste (handles selection correctly)
         self._handle_entry_paste(event)
     
-    def _handle_right_click_paste_entry(self, event):
-        """Handle right-click paste in Entry widget - directly paste without showing context menu."""
-        self._handle_right_click_paste(event)
+    def _handle_right_Click_paste_entry(self, event):
+        """Handle right-Click paste in Entry widget - directly paste without showing context menu."""
+        self._handle_right_Click_paste(event)
         return "break"  # Prevent default context menu
     
     def _show_text_context_menu(self, event):
-        """Handle right-click paste in ScrolledText widget - directly paste without showing context menu."""
+        """Handle right-Click paste in ScrolledText widget - directly paste without showing context menu."""
         # Directly paste instead of showing context menu
-        self._handle_right_click_paste_text(event)
+        self._handle_right_Click_paste_text(event)
         return "break"  # Prevent default context menu
     
-    def _handle_right_click_paste_text(self, event=None):
-        """Handle right-click paste in ScrolledText widget - always paste at next blank line."""
+    def _handle_right_Click_paste_text(self, event=None):
+        """Handle right-Click paste in ScrolledText widget - always paste at next blank line."""
         # Save current content state before pasting (so we can undo back to it)
         self._save_content_state()
         # Paste at next blank line instead of at cursor
@@ -3799,7 +4248,7 @@ class BandcampDownloaderGUI:
             current_content_raw = self.url_var.get()
             current_content = current_content_raw.strip()
             # Skip placeholder text
-            if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 current_content = ""
                 current_content_raw = ""
             
@@ -4101,12 +4550,12 @@ class BandcampDownloaderGUI:
         if self.url_entry_widget:
             content = self.url_var.get()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 content = ""
             if '\n' in content:
                 # Has newlines - expand to multi-line
                 self._expand_to_multiline(content)
-                # After expansion, trigger URL check (similar to right-click paste)
+                # After expansion, trigger URL check (similar to right-Click paste)
                 self.root.after(10, lambda: (self._ensure_trailing_newline(), self._save_content_state(), self._check_url(), self._update_url_count_and_button(), self._update_text_placeholder_visibility(), self._update_url_clear_button()))
             else:
                 # No newlines - just update count
@@ -4119,7 +4568,7 @@ class BandcampDownloaderGUI:
         if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 return
             if '\n' in content:
                 # Has newlines - expand to multi-line
@@ -4134,7 +4583,7 @@ class BandcampDownloaderGUI:
             elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
                 current_content = self.url_var.get().strip()
                 # Skip placeholder text
-                if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+                if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                     current_content = ""
             else:
                 current_content = ""
@@ -4222,9 +4671,9 @@ class BandcampDownloaderGUI:
                 self._expand_to_multiline(previous_content)
             else:
                 # Handle empty content - clear preview and artwork
-                if not previous_content or not previous_content.strip() or previous_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+                if not previous_content or not previous_content.strip() or previous_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                     self.url_var.set("")
-                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self.current_thumbnail_url = None
@@ -4253,7 +4702,7 @@ class BandcampDownloaderGUI:
             
             # Clear the field
             self.url_var.set("")
-            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
             # Immediately clear preview and artwork
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.current_thumbnail_url = None
@@ -4302,9 +4751,9 @@ class BandcampDownloaderGUI:
                 self._expand_to_multiline(next_content)
             else:
                 # Handle empty content - clear preview and artwork
-                if not next_content or not next_content.strip() or next_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+                if not next_content or not next_content.strip() or next_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                     self.url_var.set("")
-                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self.current_thumbnail_url = None
@@ -4630,7 +5079,7 @@ class BandcampDownloaderGUI:
         if not initial_content and self.url_entry_widget:
             initial_content = self.url_var.get()
             # Remove placeholder text if present
-            if initial_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if initial_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 initial_content = ""
         
         # Extract URLs from the single-line content (handles multiple URLs on one line)
@@ -4751,7 +5200,7 @@ class BandcampDownloaderGUI:
         if not text or not text.strip():
             return 0
         # Skip placeholder text
-        if text.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+        if text.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
             return 0
         # Count occurrences of 'bandcamp.com' (case-insensitive)
         text_lower = text.lower()
@@ -5341,7 +5790,7 @@ class BandcampDownloaderGUI:
         if not content or not content.strip():
             return []
         # Skip placeholder text
-        if content.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+        if content.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
             return []
         
         # Check if we have URL tags (tag mapping exists and has entries)
@@ -5369,7 +5818,7 @@ class BandcampDownloaderGUI:
         
         for line in lines:
             line = line.strip()
-            if not line or line == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if not line or line == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 continue
             
             # Check if line contains multiple URLs (by counting 'bandcamp.com' or 'https://' patterns)
@@ -5435,11 +5884,11 @@ class BandcampDownloaderGUI:
             if not text_content:
                 return []
             # Skip placeholder text
-            if text_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if text_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 return []
             # Split by lines and filter out empty lines and placeholder
             urls = [line.strip() for line in text_content.split('\n') 
-                   if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste."]
+                   if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste."]
             return urls
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             # Fallback to Entry widget
@@ -5447,12 +5896,12 @@ class BandcampDownloaderGUI:
             if not content:
                 return []
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 return []
             # Check if it has newlines (shouldn't happen in Entry, but handle it)
             if '\n' in content:
                 urls = [line.strip() for line in content.split('\n') 
-                       if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste."]
+                       if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste."]
                 return urls
             return [content] if content else []
         return []
@@ -5463,7 +5912,7 @@ class BandcampDownloaderGUI:
             return ""
         
         # Remove placeholder text if present
-        if text.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+        if text.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
             return ""
         
         import re
@@ -5476,7 +5925,7 @@ class BandcampDownloaderGUI:
                 continue
             
             # Skip placeholder text
-            if line == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+            if line == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                 continue
             
             # Check if line contains multiple 'bandcamp.com' occurrences
@@ -5555,6 +6004,21 @@ class BandcampDownloaderGUI:
         unique_urls = self._remove_duplicate_urls(urls)
         url_count = len(unique_urls)
         
+        # Classify URLs as tracks or albums
+        track_count = 0
+        album_count = 0
+        for url in unique_urls:
+            parsed = self._parse_bandcamp_url(url)
+            if parsed:
+                url_type = parsed[2]  # url_type is the third element
+                if url_type == 'track':
+                    track_count += 1
+                elif url_type == 'album':
+                    album_count += 1
+                # For 'artist' type, we'll treat it as album (discography mode)
+                else:
+                    album_count += 1
+        
         # Update batch mode
         self.batch_mode = (url_count > 1)
         
@@ -5563,9 +6027,27 @@ class BandcampDownloaderGUI:
             # Check if discography mode is enabled (for single URL or no URL)
             if url_count <= 1 and hasattr(self, 'download_discography_var') and self.download_discography_var.get():
                 self.download_btn.config(text="Download Discography")
-            elif url_count > 1:
-                self.download_btn.config(text=f"Download {url_count} Albums")
+            elif track_count > 0 and album_count == 0:
+                # Only tracks
+                if track_count == 1:
+                    self.download_btn.config(text="Download Single")
+                else:
+                    self.download_btn.config(text=f"Download {track_count} Singles")
+            elif track_count == 0 and album_count > 0:
+                # Only albums
+                if album_count == 1:
+                    self.download_btn.config(text="Download Album")
+                else:
+                    self.download_btn.config(text=f"Download {album_count} Albums")
+            elif track_count > 0 and album_count > 0:
+                # Mixed tracks and albums
+                total = track_count + album_count
+                if total == 1:
+                    self.download_btn.config(text="Download Album")  # Fallback, shouldn't happen
+                else:
+                    self.download_btn.config(text=f"Download {total} Items")
             else:
+                # No valid URLs or unknown types
                 self.download_btn.config(text="Download Album")
         
         # Update discography checkbox state
@@ -5633,7 +6115,7 @@ class BandcampDownloaderGUI:
         url = url.strip() if url else ""
         
         # Reset metadata if URL is empty or just whitespace
-        if not url or url == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+        if not url or url == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
             # Cancel any in-flight artwork fetches
             self.artwork_fetch_id += 1
             self.current_url_being_processed = None
@@ -5644,9 +6126,21 @@ class BandcampDownloaderGUI:
             self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
             self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
             self.album_art_fetching = False
+            # Clear split album detection state to reset preview formatting
+            if hasattr(self, 'download_info'):
+                self.download_info = {}
+            if hasattr(self, 'downloaded_files'):
+                self.downloaded_files = set()
             self.update_preview()
             self.clear_album_art()
             return
+        
+        # Clear split album detection state when checking a new URL
+        # This ensures preview resets to normal format until split album is detected for the new album
+        if hasattr(self, 'download_info'):
+            self.download_info = {}
+        if hasattr(self, 'downloaded_files'):
+            self.downloaded_files = set()
         
         # Only fetch if it looks like a valid URL
         if "bandcamp.com" not in url.lower() and not url.startswith(("http://", "https://")):
@@ -5919,9 +6413,18 @@ class BandcampDownloaderGUI:
                         "thumbnail_url": None,
                         "year": year,  # Store year if found
                         "first_track_title": first_track_title,  # Store first track title if found
-                        "first_track_number": first_track_number  # Store first track number if found
+                        "first_track_number": first_track_number,  # Store first track number if found
+                        "track_titles": [first_track_title] if first_track_title else []  # Store track titles for split album detection
                     }
                     self.root.after(0, self.update_preview)
+                    # Also update Additional Settings dialog preview if open
+                    if hasattr(self, '_additional_settings_dialogs'):
+                        for dialog_ref in self._additional_settings_dialogs:
+                            try:
+                                if dialog_ref['dialog'].winfo_exists():
+                                    dialog_ref['update_func']()
+                            except:
+                                pass
                     
                     # Update tags to reflect new metadata (only from HTML extraction, stage 1)
                     self.root.after(100, self._process_url_tags)
@@ -6073,9 +6576,10 @@ class BandcampDownloaderGUI:
                                            info.get("artwork_url") or
                                            info.get("cover"))
                     
-                    # Extract first track title and number from entries if available
+                    # Extract track titles and numbers from entries if available (for split album detection)
                     first_track_title = None
                     first_track_number = None
+                    track_titles = []  # Store multiple track titles for split album detection
                     if info.get("entries"):
                         entries = [e for e in info.get("entries", []) if e]  # Filter out None
                         if entries:
@@ -6086,6 +6590,8 @@ class BandcampDownloaderGUI:
                                 # Get artist for title cleaning
                                 entry_artist = first_entry.get("artist") or first_entry.get("uploader") or first_entry.get("creator") or artist
                                 first_track_title = self._clean_title(raw_title, entry_artist)
+                                # Store raw title (before cleaning) for split album detection
+                                track_titles.append(raw_title)
                             
                             # Get track number (yt-dlp uses "track_number" or "track")
                             first_track_number = first_entry.get("track_number") or first_entry.get("track")
@@ -6105,6 +6611,12 @@ class BandcampDownloaderGUI:
                                         first_track_number = None
                                 except (ValueError, TypeError):
                                     first_track_number = None
+                            
+                            # Extract additional track titles (up to 3) for better split album detection
+                            for entry in entries[1:4]:  # Check next 3 tracks
+                                raw_title = entry.get("title", "")
+                                if raw_title:
+                                    track_titles.append(raw_title)
                     
                     # Update album info (keep "Track" as placeholder) - preserve HTML extraction results
                     # Only update artist/album if:
@@ -6140,6 +6652,15 @@ class BandcampDownloaderGUI:
                         final_first_track_title = first_track_title or self.album_info.get("first_track_title")
                         final_first_track_number = first_track_number if first_track_number is not None else self.album_info.get("first_track_number")
                         
+                        # Store track titles list for split album detection
+                        existing_track_titles = self.album_info.get("track_titles", [])
+                        if track_titles:
+                            # Use yt-dlp track titles if available
+                            final_track_titles = track_titles
+                        else:
+                            # Keep existing track titles if available
+                            final_track_titles = existing_track_titles
+                        
                         # Store metadata in cache for this URL (normalize consistently)
                         normalized_url = url.rstrip(' \t,;')
                         if not normalized_url.startswith(('http://', 'https://')):
@@ -6152,11 +6673,21 @@ class BandcampDownloaderGUI:
                             "thumbnail_url": thumbnail_url or self.album_info.get("thumbnail_url"),
                             "year": year or self.album_info.get("year"),
                             "first_track_title": final_first_track_title,
-                            "first_track_number": final_first_track_number
+                            "first_track_number": final_first_track_number,
+                            "track_titles": final_track_titles  # Store multiple track titles for split album detection
                         }
                         self.url_metadata_cache[normalized_url] = metadata
                         # Don't update tag metadata cache - tags should only use HTML extraction (stage 1) metadata
                         # This prevents tag updates from overriding other URLs when yt-dlp (stage 2) metadata arrives
+                        
+                        # Store track titles list for split album detection
+                        existing_track_titles = self.album_info.get("track_titles", [])
+                        if track_titles:
+                            # Use yt-dlp track titles if available
+                            final_track_titles = track_titles
+                        else:
+                            # Keep existing track titles if available
+                            final_track_titles = existing_track_titles
                         
                         self.album_info = {
                             "artist": final_artist,
@@ -6165,9 +6696,18 @@ class BandcampDownloaderGUI:
                             "thumbnail_url": thumbnail_url or self.album_info.get("thumbnail_url"),
                             "year": year or self.album_info.get("year"),  # Store year if found
                             "first_track_title": final_first_track_title,  # Store first track title
-                            "first_track_number": final_first_track_number  # Store first track number
+                            "first_track_number": final_first_track_number,  # Store first track number
+                            "track_titles": final_track_titles  # Store multiple track titles for split album detection
                         }
                         self.root.after(0, self.update_preview)
+                        # Also update Additional Settings dialog preview if open
+                        if hasattr(self, '_additional_settings_dialogs'):
+                            for dialog_ref in self._additional_settings_dialogs:
+                                try:
+                                    if dialog_ref['dialog'].winfo_exists():
+                                        dialog_ref['update_func']()
+                                except:
+                                    pass
                         
                         # Don't update tags when yt-dlp metadata arrives - tags should only use HTML extraction (stage 1)
                         # This prevents tag updates from overriding other URLs that were pasted
@@ -6641,7 +7181,7 @@ class BandcampDownloaderGUI:
             elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
                 content = self.url_var.get().strip()
                 # Skip placeholder text
-                if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right CLick or CTRL+V to Paste.":
+                if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
                     content = ""
             else:
                 content = ""
@@ -7260,11 +7800,19 @@ class BandcampDownloaderGUI:
         self.save_album_art_state()
     
     def sanitize_filename(self, name):
-        """Remove invalid filename characters."""
+        """Remove invalid filename characters.
+        
+        Preserves ⧸ (U+29F8) which is valid in Windows filenames.
+        Converts / (U+002F) to ⧸ when it appears in artist/title contexts.
+        """
         if not name:
             return name
+        # Convert / to ⧸ (valid Unicode division slash that works in Windows filenames)
+        # This preserves Bandcamp's formatting while making it Windows-compatible
+        name = name.replace('/', '⧸')
         # Remove invalid characters for Windows/Linux filenames
-        invalid_chars = '<>:"/\\|?*'
+        # Note: ⧸ is NOT in this list - we want to preserve it
+        invalid_chars = '<>:"\\|?*'
         for char in invalid_chars:
             name = name.replace(char, '')
         # Remove leading/trailing spaces and dots
@@ -7385,10 +7933,130 @@ class BandcampDownloaderGUI:
                 track_number = first_track_number if first_track_number is not None else 1
                 template = format_data.get("template", "")
                 if template:
+                    # Check if template includes "Artist" - if not, split album setting doesn't matter
+                    template_lower = template.lower()
+                    has_artist_tag = "artist" in template_lower
+                    
+                    # Check for split album scenario and apply artist formatting
+                    preview_artist = artist if artist != "Artist" else "Artist"
+                    
+                    # Only apply split album formatting if Artist is in the template
+                    if has_artist_tag:
+                        # Try to detect split album from metadata (early detection before download)
+                        track_artists = set()
+                        first_track_artist = None
+                        
+                        # Method 1: Check album title for multiple artists (e.g., "DISTURD / 惡AI意")
+                        album_title = self.album_info.get("album") or ""
+                        if album_title and (" / " in album_title or "⧸" in album_title):
+                            # Split by " / " or "⧸" to get multiple artists
+                            import re
+                            if " / " in album_title:
+                                artists = [a.strip() for a in album_title.split(" / ")]
+                            elif "⧸" in album_title:
+                                artists = [a.strip() for a in album_title.split("⧸")]
+                            else:
+                                artists = []
+                            
+                            # Filter out parts that look like album titles (too long, contain quotes, etc.)
+                            for artist_candidate in artists:
+                                # Remove common album title suffixes like "split 12"", "split EP", etc.
+                                artist_clean = re.sub(r'\s*[-–—]\s*["\'].*$', '', artist_candidate)  # Remove "- "title"" suffix
+                                artist_clean = re.sub(r'\s+split\s+\d+["\']?$', '', artist_clean, flags=re.IGNORECASE)
+                                artist_clean = artist_clean.strip()
+                                
+                                # Only use if it looks like an artist name (reasonable length, not empty)
+                                if artist_clean and len(artist_clean) < 50 and len(artist_clean) > 1:
+                                    track_artists.add(artist_clean)
+                        
+                        # Method 2: Check track titles for "Track Artist - Track Title" pattern
+                        # Check first track title
+                        first_track_title_raw = self.album_info.get("first_track_title")
+                        if first_track_title_raw and " - " in first_track_title_raw:
+                            parts = first_track_title_raw.split(" - ", 1)
+                            if len(parts) >= 2:
+                                potential_artist = parts[0].strip()
+                                # Only use if it looks like an artist name (not too long, not just numbers)
+                                if potential_artist and len(potential_artist) < 50 and not potential_artist.isdigit():
+                                    first_track_artist = potential_artist
+                                    track_artists.add(potential_artist)
+                        
+                        # Check additional track titles from track_titles list for better detection
+                        track_titles_list = self.album_info.get("track_titles", [])
+                        for track_title_raw in track_titles_list:
+                            if track_title_raw and " - " in track_title_raw:
+                                parts = track_title_raw.split(" - ", 1)
+                                if len(parts) >= 2:
+                                    potential_artist = parts[0].strip()
+                                    # Only use if it looks like an artist name (not too long, not just numbers)
+                                    if potential_artist and len(potential_artist) < 50 and not potential_artist.isdigit():
+                                        track_artists.add(potential_artist)
+                                        # Use first track's artist for preview if not set
+                                        if not first_track_artist:
+                                            first_track_artist = potential_artist
+                        
+                        # Method 3: Check download_info if available (after download starts)
+                        if hasattr(self, 'download_info') and self.download_info:
+                            for title_key, info in self.download_info.items():
+                                track_artist = info.get("artist")
+                                if track_artist and track_artist != "Artist":
+                                    track_artists.add(track_artist)
+                                    if info.get("track_number") == track_number:
+                                        if not first_track_artist:
+                                            first_track_artist = track_artist
+                        
+                        # Method 4: Check downloaded_files for original filenames with split album pattern
+                        if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                            for file_path_str in self.downloaded_files:
+                                try:
+                                    file_path = Path(file_path_str)
+                                    file_stem = file_path.stem
+                                    # Check for "Label - Track Artist - Track Title" pattern
+                                    parts = file_stem.split(" - ")
+                                    if len(parts) >= 3:
+                                        track_artist_from_file = parts[1].strip()
+                                        if track_artist_from_file and track_artist_from_file != "Artist":
+                                            track_artists.add(track_artist_from_file)
+                                            # Use first track's artist for preview
+                                            if not first_track_artist:
+                                                first_track_artist = track_artist_from_file
+                                except:
+                                    pass
+                        
+                        # If we detected multiple distinct track artists, it's a split album
+                        # Also treat as split album if album title has multiple artists and first track has artist prefix
+                        # (even if we only have one track artist so far, the album title indicates it's a split)
+                        is_split_album = (
+                            len(track_artists) > 1 or  # Multiple track artists detected
+                            (len(track_artists) == 1 and first_track_artist and 
+                             album_title and (" / " in album_title or "⧸" in album_title))  # Album title has multiple artists
+                        )
+                        
+                        if is_split_album and first_track_artist:
+                            # Get current split album display setting
+                            current_setting = self.split_album_artist_display_var.get() if hasattr(self, 'split_album_artist_display_var') else "bandcamp_default"
+                            
+                            # For "bandcamp_default", construct "Label - Track Artist" format
+                            if current_setting == "bandcamp_default":
+                                # Get label/album artist
+                                label_artist = label_value if label_value != "Label" else (artist if artist != "Artist" else "Album Artist")
+                                # Construct "Label - Track Artist" format
+                                preview_artist = f"{label_artist} - {first_track_artist}"
+                            else:
+                                # For other settings, use the formatting function
+                                preview_artist = self._format_split_album_artist(
+                                    first_track_artist,
+                                    track_artists if len(track_artists) > 1 else {first_track_artist},  # Ensure at least one artist in set
+                                    setting=current_setting
+                                )
+                                # If "album_artist" setting returns None, use the album artist from metadata
+                                if preview_artist is None:
+                                    preview_artist = label_value if label_value != "Label" else (artist if artist != "Artist" else "Album Artist")
+                    
                     # Build metadata dict from album_info (use real values when available)
                     preview_metadata = {
                         "title": title if title != "Track" else "Track",
-                        "artist": artist if artist != "Artist" else "Artist",
+                        "artist": preview_artist,
                         "album": album if album != "Album" else "Album",
                         "year": year_value if year_value != "Year" else "Year",
                         "genre": genre_value if genre_value != "Genre" else "Genre",
@@ -7845,8 +8513,8 @@ class BandcampDownloaderGUI:
         self.root.after(50, self._update_clear_button_state)
         self.root.after(200, self._update_clear_button_state)
     
-    def _on_log_click(self):
-        """Handle click on log text to enable Ctrl+F."""
+    def _on_log_Click(self):
+        """Handle Click on log text to enable Ctrl+F."""
         # Give focus to log_text so Ctrl+F works
         # Don't return "break" - allow default text selection behavior to work
         self.log_text.focus_set()
@@ -7915,11 +8583,11 @@ class BandcampDownloaderGUI:
         self.search_close_btn.grid(row=0, column=5, sticky=E, padx=(4, 6), pady=4)
         
         # Store close button reference and bind properly
-        def on_close_click(event):
+        def on_close_Click(event):
             self._hide_search_bar()
             return "break"  # Prevent event propagation
         
-        self.search_close_btn.bind("<Button-1>", on_close_click)
+        self.search_close_btn.bind("<Button-1>", on_close_Click)
         self.search_close_btn.bind("<Enter>", lambda e: self.search_close_btn.config(fg='#D4D4D4'))
         self.search_close_btn.bind("<Leave>", lambda e: self.search_close_btn.config(fg='#808080'))
         
@@ -7949,22 +8617,22 @@ class BandcampDownloaderGUI:
         self.search_entry.bind('<Return>', on_enter)
         self.search_entry.bind('<Shift-Return>', lambda e: (self._find_previous() if self.search_matches else None) or "break")
         # ESC and Ctrl+F call the exact same handler as the close button
-        self.search_entry.bind('<Escape>', on_close_click)
-        self.search_entry.bind('<Control-f>', on_close_click)
+        self.search_entry.bind('<Escape>', on_close_Click)
+        self.search_entry.bind('<Control-f>', on_close_Click)
         
-        # Make search frame and all its children clickable/interactive
+        # Make search frame and all its children Clickable/interactive
         # This prevents the unfocus handler from stealing focus
-        def on_search_frame_click(event):
-            # Allow clicking on search frame to work normally
+        def on_search_frame_Click(event):
+            # Allow Clicking on search frame to work normally
             return None  # Don't prevent default
         
-        self.search_frame.bind('<Button-1>', on_search_frame_click)
+        self.search_frame.bind('<Button-1>', on_search_frame_Click)
         
         # Also bind to all children to ensure they're interactive
         # But skip the close button since it has its own handler
         for child in self.search_frame.winfo_children():
             if child != self.search_close_btn:
-                child.bind('<Button-1>', lambda e: None)  # Allow clicks
+                child.bind('<Button-1>', lambda e: None)  # Allow Clicks
     
     def _hide_search_bar(self):
         """Hide the search bar and clear highlights."""
@@ -8036,16 +8704,16 @@ class BandcampDownloaderGUI:
         """Start resizing the URL text widget."""
         if not self.url_text_widget:
             return
-        # Use a small delay to allow double-click detection
+        # Use a small delay to allow double-Click detection
         self.url_text_resize_drag_started = False
         self.url_text_resize_start_y = event.y_root
         # Get current widget height in pixels
         self.url_text_resize_start_height = self.url_text_widget.winfo_height()
-        # Start drag after a small delay (allows double-click to cancel it)
+        # Start drag after a small delay (allows double-Click to cancel it)
         self.root.after(150, lambda: self._actually_start_url_text_resize())
     
     def _actually_start_url_text_resize(self):
-        """Actually start the resize drag operation (called after delay to allow double-click detection)."""
+        """Actually start the resize drag operation (called after delay to allow double-Click detection)."""
         if not self.url_text_resize_drag_started:
             self.url_text_resizing = True
             self.url_text_resize_drag_started = True
@@ -8191,7 +8859,7 @@ class BandcampDownloaderGUI:
             pass  # Silently fail if there's an issue
     
     def _toggle_url_text_height(self, event):
-        """Toggle URL text widget between minimum and maximum height on double-click."""
+        """Toggle URL text widget between minimum and maximum height on double-Click."""
         if not self.url_text_widget:
             return
         
@@ -8581,9 +9249,9 @@ class BandcampDownloaderGUI:
     
     def start_download(self):
         """Start the download process in a separate thread."""
-        # Reset the download button clicked flag
-        if hasattr(self, 'download_button_clicked'):
-            self.download_button_clicked = False
+        # Reset the download button Clicked flag
+        if hasattr(self, 'download_button_Clicked'):
+            self.download_button_Clicked = False
         
         # Extract URLs - prefer tag mappings if available (preserves tags without modifying content)
         urls = []
@@ -8830,7 +9498,73 @@ class BandcampDownloaderGUI:
         
         return None
     
-    def _generate_filename_from_format(self, format_data, track_number, track_title, audio_file, dir_path):
+    def _detect_split_album(self, files_to_process):
+        """Detect if this is a split album by checking for multiple distinct track artists.
+        
+        Args:
+            files_to_process: List of Path objects for audio files
+            
+        Returns:
+            Tuple of (is_split_album, unique_artists_dict)
+            - is_split_album: Boolean indicating if split album detected
+            - unique_artists_dict: Dict mapping file paths to their track artists
+        """
+        unique_artists = {}
+        track_artists = set()
+        
+        for audio_file in files_to_process:
+            file_title = audio_file.stem
+            extracted_track_artist = None
+            
+            # Extract track artist from filename if it follows "Label - Track Artist - Track Title" pattern
+            parts = file_title.split(" - ")
+            if len(parts) >= 3:
+                extracted_track_artist = parts[1].strip()
+                if extracted_track_artist and extracted_track_artist != "Artist":
+                    unique_artists[audio_file] = extracted_track_artist
+                    track_artists.add(extracted_track_artist)
+        
+        # Check if we have multiple distinct track artists
+        is_split_album = len(track_artists) > 1
+        
+        return is_split_album, unique_artists
+    
+    def _format_split_album_artist(self, track_artist, all_track_artists, setting=None):
+        """Format artist name based on split album display setting.
+        
+        Args:
+            track_artist: The artist for the current track
+            all_track_artists: Set of all unique track artists in the album
+            setting: Split album display setting (defaults to current setting)
+            
+        Returns:
+            Formatted artist string
+        """
+        if setting is None:
+            setting = self.split_album_artist_display_var.get() if hasattr(self, 'split_album_artist_display_var') else "bandcamp_default"
+        
+        if setting == "bandcamp_default":
+            # Show all artists separated by " / "
+            all_artists = sorted(list(all_track_artists))
+            return " / ".join(all_artists)
+        elif setting == "track_artist":
+            # Use the track's own artist
+            return track_artist
+        elif setting == "album_artist":
+            # Use album artist (label artist) - this will be handled by metadata
+            return None  # Signal to use album artist from metadata
+        elif setting == "first_track_artist":
+            # Use first track artist (by track number, or alphabetically if not available)
+            # Note: first_track_artist should be passed separately, but for backward compatibility
+            # we'll use alphabetical order if not provided
+            if all_track_artists:
+                return sorted(list(all_track_artists))[0]
+            return track_artist
+        else:
+            # Default to track artist
+            return track_artist
+    
+    def _generate_filename_from_format(self, format_data, track_number, track_title, audio_file, dir_path, split_album_info=None):
         """Generate filename from format data using track number and metadata.
         
         Args:
@@ -8839,6 +9573,7 @@ class BandcampDownloaderGUI:
             track_title: Cleaned track title (string)
             audio_file: Path to audio file (for getting metadata if needed)
             dir_path: Directory path (for getting metadata if needed)
+            split_album_info: Optional tuple of (is_split_album, all_track_artists_set) for split album handling
             
         Returns:
             New filename string (without extension) or None if generation failed
@@ -8857,17 +9592,65 @@ class BandcampDownloaderGUI:
         # Get metadata values (try multiple sources)
         metadata = {}
         
+        # Get file title for parsing
+        file_title = audio_file.stem
+        
+        # Extract track artist and label from filename
+        # Pattern 1: "Label - Track Artist - Track Title" (3+ parts) - split albums
+        # Pattern 2: "Artist - Track Title" (2 parts) - regular albums
+        extracted_track_artist = None
+        extracted_label_artist = None
+        parts = file_title.split(" - ")
+        if len(parts) >= 3:
+            # First part is label, second part is track artist, rest is title
+            extracted_label_artist = parts[0].strip()
+            extracted_track_artist = parts[1].strip()
+            if not extracted_track_artist or extracted_track_artist == "Artist":
+                extracted_track_artist = None
+            if not extracted_label_artist or extracted_label_artist == "Artist":
+                extracted_label_artist = None
+        elif len(parts) == 2:
+            # Regular album format: "Artist - Track Title"
+            # First part is the artist
+            extracted_track_artist = parts[0].strip()
+            if not extracted_track_artist or extracted_track_artist == "Artist":
+                extracted_track_artist = None
+        
         # Try to get from download_info (if it exists)
         if hasattr(self, 'download_info') and self.download_info:
-            file_title = audio_file.stem
             for title_key, info in self.download_info.items():
                 if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
                     metadata = info.copy()
+                    # If we extracted a track artist from filename, prefer it over download_info artist
+                    # (especially if download_info has "Artist" placeholder or differs)
+                    if extracted_track_artist:
+                        if not metadata.get("artist") or metadata.get("artist") == "Artist" or extracted_track_artist != metadata.get("artist"):
+                            metadata["artist"] = extracted_track_artist
                     break
+        
+        # If we extracted track artist but don't have metadata yet, or metadata has placeholder, use extracted artist
+        if extracted_track_artist:
+            if not metadata:
+                metadata = {}
+            if not metadata.get("artist") or metadata.get("artist") == "Artist":
+                metadata["artist"] = extracted_track_artist
         
         # Try to get from album_info_stored
         if not metadata and hasattr(self, 'album_info_stored') and self.album_info_stored:
             metadata.update(self.album_info_stored)
+            # If we extracted track artist, use it instead of album artist
+            if extracted_track_artist:
+                metadata["artist"] = extracted_track_artist
+        elif hasattr(self, 'album_info_stored') and self.album_info_stored:
+            # Merge album_info_stored but preserve extracted track artist if we have it
+            if extracted_track_artist:
+                # Save extracted artist before merging
+                track_artist = extracted_track_artist
+                metadata.update(self.album_info_stored)
+                # Restore extracted track artist (don't overwrite with label artist)
+                metadata["artist"] = track_artist
+            else:
+                metadata.update(self.album_info_stored)
         
         # Try to get from directory structure
         if not metadata.get("artist") or not metadata.get("album"):
@@ -8954,6 +9737,88 @@ class BandcampDownloaderGUI:
         # Add year if extracted
         if year_value:
             metadata["year"] = year_value
+        
+        # Handle split album artist formatting if split album detected
+        if split_album_info:
+            # Unpack split_album_info (may be 2-tuple or 3-tuple for backward compatibility)
+            if len(split_album_info) == 3:
+                is_split_album, all_track_artists, first_track_artist = split_album_info
+            else:
+                is_split_album, all_track_artists = split_album_info
+                first_track_artist = None
+                if all_track_artists:
+                    first_track_artist = sorted(list(all_track_artists))[0]  # Fallback to alphabetical
+            
+            if is_split_album:
+                # Get the current track artist
+                current_track_artist = extracted_track_artist or metadata.get("artist")
+                
+                # Get the split album display setting
+                setting = self.split_album_artist_display_var.get() if hasattr(self, 'split_album_artist_display_var') else "bandcamp_default"
+                
+                # Special handling for "bandcamp_default" - preserve original Bandcamp format
+                if setting == "bandcamp_default":
+                    # Bandcamp default format: "Label - Track Artist - Track Title"
+                    # Get label/album artist (prefer extracted from filename, then metadata)
+                    label_artist = extracted_label_artist
+                    if not label_artist:
+                        label_artist = metadata.get("label") or metadata.get("album_artist") or metadata.get("artist")
+                    if not label_artist or label_artist == "Artist":
+                        # Try to get from album_info_stored
+                        if hasattr(self, 'album_info_stored') and self.album_info_stored:
+                            label_artist = (self.album_info_stored.get("label") or 
+                                          self.album_info_stored.get("artist") or 
+                                          "Album Artist")
+                        else:
+                            label_artist = "Album Artist"
+                    
+                    # Use the track artist from filename
+                    if not current_track_artist or current_track_artist == "Artist":
+                        current_track_artist = "Track Artist"
+                    
+                    # Get track number prefix if template has it
+                    track_prefix = ""
+                    import re
+                    if re.match(r'^01\.', template):
+                        track_prefix = f"{track_number:02d}. "
+                    elif re.match(r'^1\.', template):
+                        track_prefix = f"{track_number}. "
+                    elif re.match(r'^01\s', template):
+                        track_prefix = f"{track_number:02d} "
+                    elif re.match(r'^1\s', template):
+                        track_prefix = f"{track_number} "
+                    
+                    # Return Bandcamp default format with optional track prefix: "01. Label - Track Artist - Track Title"
+                    return f"{track_prefix}{self.sanitize_filename(label_artist)} - {self.sanitize_filename(current_track_artist)} - {self.sanitize_filename(track_title)}"
+                
+                # For other settings, format the artist and apply to template
+                if current_track_artist:
+                    # For "first_track_artist", use the first track's artist if available
+                    if setting == "first_track_artist" and first_track_artist:
+                        formatted_artist = first_track_artist
+                    else:
+                        formatted_artist = self._format_split_album_artist(
+                            current_track_artist,
+                            all_track_artists,
+                            setting=setting
+                        )
+                    
+                    # If "album_artist" setting returns None, use album/label artist
+                    if formatted_artist is None:
+                        # Prefer extracted label artist from filename, then metadata
+                        formatted_artist = extracted_label_artist
+                        if not formatted_artist:
+                            formatted_artist = metadata.get("label") or metadata.get("album_artist") or metadata.get("artist")
+                        if not formatted_artist or formatted_artist == "Artist":
+                            if hasattr(self, 'album_info_stored') and self.album_info_stored:
+                                formatted_artist = (self.album_info_stored.get("label") or 
+                                                   self.album_info_stored.get("artist") or 
+                                                   "Album Artist")
+                            else:
+                                formatted_artist = "Album Artist"
+                    
+                    # Update metadata with formatted artist
+                    metadata["artist"] = formatted_artist
         
         # Generate filename using template
         filename = self._generate_filename_from_template(template, track_number, metadata, preview_mode=False)
@@ -9047,6 +9912,62 @@ class BandcampDownloaderGUI:
             
             # Process each directory separately
             for dir_path, dir_files in files_by_dir.items():
+                # Detect split album for this directory (only when split album detected)
+                is_split_album, unique_artists_dict = self._detect_split_album(dir_files)
+                all_track_artists = set(unique_artists_dict.values()) if unique_artists_dict else set()
+                
+                # For "first_track_artist" setting, we need to find the artist of the first track (by track number)
+                # Store mapping of files to their track artists for first track detection
+                first_track_artist = None
+                if is_split_album and unique_artists_dict:
+                    # Find the file with track number 1
+                    for audio_file in dir_files:
+                        try:
+                            # Try to get track number from metadata
+                            import subprocess
+                            import json
+                            ffprobe_path = self.ffmpeg_path.parent / "ffprobe.exe"
+                            if not ffprobe_path.exists():
+                                ffprobe_path = self.script_dir / "ffprobe.exe"
+                            
+                            if ffprobe_path.exists():
+                                cmd = [
+                                    str(ffprobe_path),
+                                    "-v", "quiet",
+                                    "-print_format", "json",
+                                    "-show_format",
+                                    "-show_streams",
+                                    str(audio_file)
+                                ]
+                                result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                                if result.returncode == 0:
+                                    data = json.loads(result.stdout)
+                                    # Try to get track number
+                                    track_num = None
+                                    for stream in data.get("streams", []):
+                                        if stream.get("codec_type") == "audio":
+                                            tags = stream.get("tags", {})
+                                            track_num = tags.get("track") or tags.get("TRACK")
+                                            if track_num:
+                                                try:
+                                                    track_num = int(str(track_num).split("/")[0])
+                                                    break
+                                                except:
+                                                    pass
+                                    
+                                    if track_num == 1 and audio_file in unique_artists_dict:
+                                        first_track_artist = unique_artists_dict[audio_file]
+                                        break
+                        except:
+                            pass
+                    
+                    # If we couldn't find track 1, use alphabetically first
+                    if not first_track_artist and all_track_artists:
+                        first_track_artist = sorted(list(all_track_artists))[0]
+                
+                # Store first_track_artist in split_album_info tuple
+                split_album_info = (is_split_album, all_track_artists, first_track_artist) if is_split_album else None
+                
                 # First, try to get track numbers from metadata for all files in this directory
                 files_with_track_numbers = []
                 files_without_track_numbers = []
@@ -9224,8 +10145,8 @@ class BandcampDownloaderGUI:
                     
                     # Generate new filename using format data
                     new_name_base = self._generate_filename_from_format(
-                        format_data, track_number, track_title, 
-                        audio_file, dir_path
+                        format_data, track_number, track_title,
+                        audio_file, dir_path, split_album_info
                     )
                     
                     if not new_name_base:
@@ -10559,24 +11480,43 @@ class BandcampDownloaderGUI:
                         "already_have_thumbnail": False,
                     })
             elif base_format == "mp3":
-                # Always use 128kbps for MP3 (matches source quality)
-                postprocessors = [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "128",
-                    },
-                    {
-                        "key": "FFmpegMetadata",
-                        "add_metadata": True,
-                    },
-                ]
-                # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
-                if not download_cover_art:
-                    postprocessors.append({
-                        "key": "EmbedThumbnail",
-                        "already_have_thumbnail": False,
-                    })
+                # Check if skip MP3 re-encoding is enabled
+                skip_mp3_reencode = self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True
+                
+                if skip_mp3_reencode:
+                    # Skip re-encoding if file is already MP3 - only add metadata
+                    # Format selection will prefer MP3 when available to avoid re-encoding
+                    postprocessors = [
+                        {
+                            "key": "FFmpegMetadata",
+                            "add_metadata": True,
+                        },
+                    ]
+                    # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
+                    if not download_cover_art:
+                        postprocessors.append({
+                            "key": "EmbedThumbnail",
+                            "already_have_thumbnail": False,
+                        })
+                else:
+                    # Always use 128kbps for MP3 (matches source quality)
+                    postprocessors = [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "128",
+                        },
+                        {
+                            "key": "FFmpegMetadata",
+                            "add_metadata": True,
+                        },
+                    ]
+                    # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
+                    if not download_cover_art:
+                        postprocessors.append({
+                            "key": "EmbedThumbnail",
+                            "already_have_thumbnail": False,
+                        })
             elif base_format == "flac":
                 postprocessors = [
                     {
@@ -10621,8 +11561,21 @@ class BandcampDownloaderGUI:
             
             # yt-dlp options
             # Enhanced options for restricted networks (better user agent, retries, timeouts)
+            # Format selection: if MP3 skip re-encoding is enabled and format is MP3, prefer MP3 format
+            # If skip re-encoding is disabled, avoid MP3 format to force re-encoding
+            format_selector = "bestaudio/best"
+            if base_format == "mp3":
+                skip_mp3_reencode = self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True
+                if skip_mp3_reencode:
+                    # Prefer MP3 format when available to avoid re-encoding
+                    format_selector = "bestaudio[ext=mp3]/bestaudio/best"
+                else:
+                    # Avoid MP3 format to force re-encoding via postprocessor
+                    # This ensures FFmpegExtractAudio will always run
+                    format_selector = "bestaudio[ext!=mp3]/bestaudio/best"
+            
             ydl_opts = {
-                "format": "bestaudio/best",
+                "format": format_selector,
                 "outtmpl": self.get_outtmpl(),
                 "ffmpeg_location": str(self.ffmpeg_path),
                 "writethumbnail": True,
@@ -10678,6 +11631,13 @@ class BandcampDownloaderGUI:
             self.root.after(0, lambda: self.progress_var.set("Fetching album information..."))
             self.root.after(0, lambda: self.log("Fetching album information..."))
             
+            # Check if this is a track URL (single track, not album)
+            is_track_url = False
+            parsed_url = self._parse_bandcamp_url(album_url)
+            if parsed_url:
+                url_type = parsed_url[2]
+                is_track_url = (url_type == 'track')
+            
             # Phase 1: Quick flat extraction to get track count immediately
             try:
                 quick_opts = {
@@ -10691,13 +11651,20 @@ class BandcampDownloaderGUI:
                 
                 with yt_dlp.YoutubeDL(quick_opts) as quick_ydl:
                     quick_info = quick_ydl.extract_info(album_url, download=False)
-                    if quick_info and "entries" in quick_info:
-                        entries = [e for e in quick_info.get("entries", []) if e]
-                        
-                        # Single album mode, entries are tracks
-                        self.total_tracks = len(entries)
-                        self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
-                        self.root.after(0, lambda count=len(entries): self.progress_var.set(f"Found {count} track(s) - Fetching track data..."))
+                    if quick_info:
+                        # For track URLs, the info itself might be the track (no entries)
+                        if is_track_url and "entries" not in quick_info:
+                            # Single track - treat info as the track
+                            self.total_tracks = 1
+                            self.root.after(0, lambda: self.log("Found 1 track"))
+                            self.root.after(0, lambda: self.progress_var.set("Found 1 track - Fetching track data..."))
+                        elif "entries" in quick_info:
+                            entries = [e for e in quick_info.get("entries", []) if e]
+                            
+                            # Single album mode, entries are tracks
+                            self.total_tracks = len(entries)
+                            self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
+                            self.root.after(0, lambda count=len(entries): self.progress_var.set(f"Found {count} track(s) - Fetching track data..."))
             except Exception:
                 # If quick extraction fails, continue to full extraction
                 pass
@@ -10725,54 +11692,62 @@ class BandcampDownloaderGUI:
                             "catalog_number": info.get("catalog_number") or info.get("catalognumber"),
                         }
                         
-                        # Store metadata for each track and update total tracks if not already set
-                        if "entries" in info:
+                        # Handle track URLs: if no entries, treat info itself as the track
+                        entries = []
+                        if is_track_url and "entries" not in info:
+                            # Single track URL - info itself is the track
+                            entries = [info]
+                            if self.total_tracks == 0:  # Only update if quick extraction didn't work
+                                self.total_tracks = 1
+                                self.root.after(0, lambda: self.log("Found 1 track"))
+                        elif "entries" in info:
                             entries = [e for e in info.get("entries", []) if e]  # Filter out None entries
                             
                             # Single album mode, entries are tracks
                             if self.total_tracks == 0:  # Only update if quick extraction didn't work
                                 self.total_tracks = len(entries)
                                 self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
-                            
+                        
+                        # Process entries (tracks)
+                        if entries:
                             # Log format/bitrate info from first track (to show what yt-dlp is downloading)
                             # Always show source info so users know what quality they're getting
                             # Also detect format for Original Format mode preview
-                            if entries:
-                                first_entry = entries[0]
-                                format_info = []
-                                if first_entry.get("format"):
-                                    format_info.append(f"Format: {first_entry.get('format')}")
-                                if first_entry.get("abr"):
-                                    format_info.append(f"Bitrate: {first_entry.get('abr')} kbps")
-                                elif first_entry.get("tbr"):
-                                    format_info.append(f"Bitrate: {first_entry.get('tbr')} kbps")
-                                if first_entry.get("acodec"):
-                                    format_info.append(f"Codec: {first_entry.get('acodec')}")
-                                if first_entry.get("ext"):
-                                    format_info.append(f"Extension: {first_entry.get('ext')}")
-                                if format_info:
-                                    self.root.after(0, lambda info=" | ".join(format_info): self.log(f"Source: {info}"))
-                                
-                                # Detect format for Original Format mode preview
-                                ext = first_entry.get("ext") or ""
-                                acodec = first_entry.get("acodec") or ""
-                                container = first_entry.get("container") or ""
-                                detected_format = None
-                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
-                                    detected_format = "m4a"
-                                elif ext == "flac" or acodec == "flac":
-                                    detected_format = "flac"
-                                elif ext == "ogg" or acodec == "vorbis":
-                                    detected_format = "ogg"
-                                elif ext == "wav" or acodec == "pcm":
-                                    detected_format = "wav"
-                                elif ext == "mp3" or acodec == "mp3":
-                                    detected_format = "mp3"
-                                
-                                # Update album_info with detected format and refresh preview
-                                if detected_format:
-                                    self.album_info["detected_format"] = detected_format
-                                    self.root.after(0, self.update_preview)
+                            first_entry = entries[0]
+                            format_info = []
+                            if first_entry.get("format"):
+                                format_info.append(f"Format: {first_entry.get('format')}")
+                            if first_entry.get("abr"):
+                                format_info.append(f"Bitrate: {first_entry.get('abr')} kbps")
+                            elif first_entry.get("tbr"):
+                                format_info.append(f"Bitrate: {first_entry.get('tbr')} kbps")
+                            if first_entry.get("acodec"):
+                                format_info.append(f"Codec: {first_entry.get('acodec')}")
+                            if first_entry.get("ext"):
+                                format_info.append(f"Extension: {first_entry.get('ext')}")
+                            if format_info:
+                                self.root.after(0, lambda info=" | ".join(format_info): self.log(f"Source: {info}"))
+                            
+                            # Detect format for Original Format mode preview
+                            ext = first_entry.get("ext") or ""
+                            acodec = first_entry.get("acodec") or ""
+                            container = first_entry.get("container") or ""
+                            detected_format = None
+                            if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
+                                detected_format = "m4a"
+                            elif ext == "flac" or acodec == "flac":
+                                detected_format = "flac"
+                            elif ext == "ogg" or acodec == "vorbis":
+                                detected_format = "ogg"
+                            elif ext == "wav" or acodec == "pcm":
+                                detected_format = "wav"
+                            elif ext == "mp3" or acodec == "mp3":
+                                detected_format = "mp3"
+                            
+                            # Update album_info with detected format and refresh preview
+                            if detected_format:
+                                self.album_info["detected_format"] = detected_format
+                                self.root.after(0, self.update_preview)
                             
                             for entry in entries:
                                 # Use title as key (will match by filename later)
@@ -10817,11 +11792,30 @@ class BandcampDownloaderGUI:
                     
                     with yt_dlp.YoutubeDL(retry_opts) as retry_ydl:
                         retry_info = retry_ydl.extract_info(album_url, download=False)
-                        if retry_info and "entries" in retry_info:
-                            entries = [e for e in retry_info.get("entries", []) if e]
-                            if entries:
-                                self.total_tracks = len(entries)
-                                self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s) (retry)"))
+                        if retry_info:
+                            # Handle track URLs: if no entries, treat info itself as the track
+                            if is_track_url and "entries" not in retry_info:
+                                # Single track URL - info itself is the track
+                                self.total_tracks = 1
+                                self.root.after(0, lambda: self.log("Found 1 track (retry)"))
+                                # Add to download_info if not already there
+                                if not self.download_info:
+                                    raw_title = retry_info.get("title", "")
+                                    if raw_title:
+                                        artist = retry_info.get("artist") or retry_info.get("uploader") or retry_info.get("creator") or self.album_info_stored.get("artist")
+                                        cleaned_title = self._clean_title(raw_title, artist)
+                                        self.download_info[raw_title.lower()] = {
+                                            "title": cleaned_title,
+                                            "artist": artist,
+                                            "album": retry_info.get("album") or retry_info.get("title") or self.album_info_stored.get("album"),
+                                            "track_number": retry_info.get("track_number") or retry_info.get("track"),
+                                            "date": retry_info.get("release_date") or retry_info.get("upload_date") or self.album_info_stored.get("date"),
+                                        }
+                            elif "entries" in retry_info:
+                                entries = [e for e in retry_info.get("entries", []) if e]
+                                if entries:
+                                    self.total_tracks = len(entries)
+                                    self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s) (retry)"))
                 except Exception as e:
                     self.root.after(0, lambda err=str(e): self.log(f"DEBUG: Retry extraction also failed: {err}"))
             
@@ -10897,24 +11891,43 @@ class BandcampDownloaderGUI:
                         "already_have_thumbnail": False,
                     })
             elif base_format == "mp3":
-                # Always use 128kbps for MP3 (matches source quality)
-                postprocessors = [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "128",
-                    },
-                    {
-                        "key": "FFmpegMetadata",
-                        "add_metadata": True,
-                    },
-                ]
-                # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
-                if not download_cover_art:
-                    postprocessors.append({
-                        "key": "EmbedThumbnail",
-                        "already_have_thumbnail": False,
-                    })
+                # Check if skip MP3 re-encoding is enabled
+                skip_mp3_reencode = self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True
+                
+                if skip_mp3_reencode:
+                    # Skip re-encoding if file is already MP3 - only add metadata
+                    # Format selection will prefer MP3 when available to avoid re-encoding
+                    postprocessors = [
+                        {
+                            "key": "FFmpegMetadata",
+                            "add_metadata": True,
+                        },
+                    ]
+                    # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
+                    if not download_cover_art:
+                        postprocessors.append({
+                            "key": "EmbedThumbnail",
+                            "already_have_thumbnail": False,
+                        })
+                else:
+                    # Always use 128kbps for MP3 (matches source quality)
+                    postprocessors = [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "128",
+                        },
+                        {
+                            "key": "FFmpegMetadata",
+                            "add_metadata": True,
+                        },
+                    ]
+                    # Only embed thumbnail if download_cover_art is disabled (to keep files separate when enabled)
+                    if not download_cover_art:
+                        postprocessors.append({
+                            "key": "EmbedThumbnail",
+                            "already_have_thumbnail": False,
+                        })
             elif base_format == "flac":
                 postprocessors = [
                     {
@@ -10959,8 +11972,21 @@ class BandcampDownloaderGUI:
             
             # yt-dlp options
             # Enhanced options for restricted networks (better user agent, retries, timeouts)
+            # Format selection: if MP3 skip re-encoding is enabled and format is MP3, prefer MP3 format
+            # If skip re-encoding is disabled, avoid MP3 format to force re-encoding
+            format_selector = "bestaudio/best"
+            if base_format == "mp3":
+                skip_mp3_reencode = self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True
+                if skip_mp3_reencode:
+                    # Prefer MP3 format when available to avoid re-encoding
+                    format_selector = "bestaudio[ext=mp3]/bestaudio/best"
+                else:
+                    # Avoid MP3 format to force re-encoding via postprocessor
+                    # This ensures FFmpegExtractAudio will always run
+                    format_selector = "bestaudio[ext!=mp3]/bestaudio/best"
+            
             ydl_opts = {
-                "format": "bestaudio/best",
+                "format": format_selector,
                 "outtmpl": self.get_outtmpl(),
                 "ffmpeg_location": str(self.ffmpeg_path),
                 "writethumbnail": True,
@@ -12609,7 +13635,7 @@ class BandcampDownloaderGUI:
             # Don't auto-restart - let user restart manually (same behavior as launcher)
     
     def _show_settings_menu(self, event):
-        """Show settings menu when cog icon is clicked."""
+        """Show settings menu when cog icon is Clicked."""
         if self.settings_menu is None:
             # Create settings menu
             self.settings_menu = Menu(
@@ -12635,6 +13661,15 @@ class BandcampDownloaderGUI:
                 label="Automatically Check for Updates",
                 variable=self.auto_check_updates_var,
                 command=self.on_auto_check_updates_change
+            )
+            
+            # Separator
+            self.settings_menu.add_separator()
+            
+            # Additional Settings
+            self.settings_menu.add_command(
+                label="Additional Settings",
+                command=self._show_additional_settings
             )
             
             # Separator
@@ -13334,7 +14369,7 @@ class BandcampDownloaderGUI:
                 )
                 name_label.pack(anchor='w', fill=X)
                 
-                # Make entire row clickable to toggle checkbox
+                # Make entire row Clickable to toggle checkbox
                 def make_toggle_callback(checkbox_var):
                     def toggle_checkbox(event):
                         checkbox_var.set(not checkbox_var.get())
@@ -14042,20 +15077,20 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         template_text.bind('<Control-Shift-Z>', lambda e: self._handle_folder_template_redo(dialog, e))
         template_text.bind('<Control-y>', lambda e: self._handle_folder_template_redo(dialog, e))
         
-        # Create right-click context menu for tag deletion
+        # Create right-Click context menu for tag deletion
         tag_context_menu = Menu(template_text, tearoff=0, bg='#252526', fg='#D4D4D4',
                                 activebackground='#3E3E42', activeforeground='#FFFFFF')
         
         def show_tag_context_menu(event):
-            """Show context menu when right-clicking on a tag."""
-            # Find which tag was clicked (if any)
-            click_pos = template_text.index(f"@{event.x},{event.y}")
-            clicked_tag_id = None
+            """Show context menu when right-Clicking on a tag."""
+            # Find which tag was Clicked (if any)
+            Click_pos = template_text.index(f"@{event.x},{event.y}")
+            Clicked_tag_id = None
             
             for tag_id, (start_pos, end_pos) in dialog.tag_positions.items():
                 try:
-                    if template_text.compare(click_pos, ">=", start_pos) and template_text.compare(click_pos, "<=", end_pos):
-                        clicked_tag_id = tag_id
+                    if template_text.compare(Click_pos, ">=", start_pos) and template_text.compare(Click_pos, "<=", end_pos):
+                        Clicked_tag_id = tag_id
                         break
                 except:
                     pass
@@ -14063,15 +15098,15 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             # Clear existing menu items
             tag_context_menu.delete(0, END)
             
-            if clicked_tag_id:
-                # Add delete option for the clicked tag
+            if Clicked_tag_id:
+                # Add delete option for the Clicked tag
                 tag_context_menu.add_command(
                     label="Delete Tag",
-                    command=lambda tid=clicked_tag_id: self._remove_folder_tag_from_template(dialog, tid)
+                    command=lambda tid=Clicked_tag_id: self._remove_folder_tag_from_template(dialog, tid)
                 )
                 tag_context_menu.post(event.x_root, event.y_root)
         
-        template_text.bind('<Button-3>', show_tag_context_menu)  # Right-click
+        template_text.bind('<Button-3>', show_tag_context_menu)  # Right-Click
         
         # Handle backspace/delete to remove entire tags
         def handle_backspace(event):
@@ -14338,7 +15373,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self._check_folder_structure_changes(dialog)
     
     def _remove_folder_tag_from_template(self, dialog, tag_id):
-        """Remove a tag from the folder template when backspace/delete is used or right-click delete."""
+        """Remove a tag from the folder template when backspace/delete is used or right-Click delete."""
         if tag_id not in dialog.tag_positions:
             return
         
@@ -15981,20 +17016,20 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         template_text.bind('<Control-Shift-Z>', lambda e: self._handle_template_redo(dialog, e))
         template_text.bind('<Control-y>', lambda e: self._handle_template_redo(dialog, e))
         
-        # Create right-click context menu for tag deletion
+        # Create right-Click context menu for tag deletion
         tag_context_menu = Menu(template_text, tearoff=0, bg='#252526', fg='#D4D4D4',
                                 activebackground='#3E3E42', activeforeground='#FFFFFF')
         
         def show_tag_context_menu(event):
-            """Show context menu when right-clicking on a tag."""
-            # Find which tag was clicked (if any)
-            click_pos = template_text.index(f"@{event.x},{event.y}")
-            clicked_tag_id = None
+            """Show context menu when right-Clicking on a tag."""
+            # Find which tag was Clicked (if any)
+            Click_pos = template_text.index(f"@{event.x},{event.y}")
+            Clicked_tag_id = None
             
             for tag_id, (start_pos, end_pos) in dialog.tag_positions.items():
                 try:
-                    if template_text.compare(click_pos, ">=", start_pos) and template_text.compare(click_pos, "<=", end_pos):
-                        clicked_tag_id = tag_id
+                    if template_text.compare(Click_pos, ">=", start_pos) and template_text.compare(Click_pos, "<=", end_pos):
+                        Clicked_tag_id = tag_id
                         break
                 except:
                     pass
@@ -16002,15 +17037,15 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             # Clear existing menu items
             tag_context_menu.delete(0, END)
             
-            if clicked_tag_id:
-                # Add delete option for the clicked tag
+            if Clicked_tag_id:
+                # Add delete option for the Clicked tag
                 tag_context_menu.add_command(
                     label="Delete Tag",
-                    command=lambda tid=clicked_tag_id: self._remove_tag_from_template(dialog, tid)
+                    command=lambda tid=Clicked_tag_id: self._remove_tag_from_template(dialog, tid)
                 )
                 tag_context_menu.post(event.x_root, event.y_root)
         
-        template_text.bind('<Button-3>', show_tag_context_menu)  # Right-click
+        template_text.bind('<Button-3>', show_tag_context_menu)  # Right-Click
         
         # Handle backspace/delete to remove entire tags
         def handle_backspace(event):
@@ -16248,7 +17283,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             dialog.is_processing_tags = False
     
     def _remove_tag_from_template(self, dialog, tag_id):
-        """Remove a tag from the template when backspace/delete is used or right-click delete."""
+        """Remove a tag from the template when backspace/delete is used or right-Click delete."""
         if tag_id not in dialog.tag_positions:
             return
         
@@ -17406,8 +18441,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         text_widget.bind('<KeyPress>', filter_key)
         text_widget.bind('<Control-v>', filter_paste)
         text_widget.bind('<Shift-Insert>', filter_paste)
-        # Note: Right-click paste is handled by the system menu, which we can't easily intercept
-        # Users will see the warning if they paste illegal characters via right-click
+        # Note: Right-Click paste is handled by the system menu, which we can't easily intercept
+        # Users will see the warning if they paste illegal characters via right-Click
     
     def _setup_folder_character_filter(self, dialog, text_widget, parent_frame):
         """Setup character filtering for folder customizer.
@@ -17482,8 +18517,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         text_widget.bind('<KeyPress>', filter_key)
         text_widget.bind('<Control-v>', filter_paste)
         text_widget.bind('<Shift-Insert>', filter_paste)
-        # Note: Right-click paste is handled by the system menu, which we can't easily intercept
-        # Users will see the warning if they paste illegal characters via right-click
+        # Note: Right-Click paste is handled by the system menu, which we can't easily intercept
+        # Users will see the warning if they paste illegal characters via right-Click
 
 
 def main():
