@@ -1,8 +1,6 @@
 <div align="center">
 
-# <img src="images/icon-title.png" width="32" height="32" alt="Icon"> Bandcamp Downloader (Python Edition)
-
-[images/download-button.png]([https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.7)
+[![Download](images/download-button.png)](https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.7)
 
 </div>
 
