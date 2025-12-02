@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.9"
+__version__ = "1.3.0"
 
 import sys
 import subprocess
@@ -395,6 +395,14 @@ class BandcampDownloaderGUI:
             cls._TAG_COLOR_SCHEMES = cls._load_color_schemes_from_css()
         return cls._TAG_COLOR_SCHEMES
     
+    def _ensure_tag_colors_loaded(self):
+        """Lazily load tag colors if not already loaded (optimization for startup)."""
+        if self.current_tag_colors is None:
+            schemes = self._get_color_schemes()
+            if self.current_tag_color_scheme not in schemes:
+                self.current_tag_color_scheme = "default"
+            self.current_tag_colors = schemes.get(self.current_tag_color_scheme, schemes["default"])
+    
     # ============================================================================
     # ERROR HANDLING HELPERS
     # ============================================================================
@@ -591,6 +599,10 @@ class BandcampDownloaderGUI:
         self.root.resizable(False, True)
         self.root.minsize(window_width, window_height)
         
+        # Hide window during initialization for smooth loading
+        # This prevents the jumbled/blotchy appearance during startup
+        self.root.withdraw()
+        
         # Get script directory first (needed for icon path and settings)
         # When launched from launcher, __file__ will be in the launcher directory
         self.script_dir = Path(__file__).resolve().parent
@@ -614,8 +626,9 @@ class BandcampDownloaderGUI:
         # Detect if running from launcher.exe
         self.is_launcher_mode = self._is_launcher_mode()
         
-        # Check for launcher update status (will log after UI is set up)
-        self.pending_update_status = self._check_launcher_update_status()
+        # Check for launcher update status - defer to after UI is ready (optimization)
+        # This avoids blocking startup with file system checks
+        self.pending_update_status = None  # Will be checked after UI loads
         
         # Track URL field mode: 'entry' for single-line, 'text' for multi-line
         self.url_field_mode = 'entry'  # Start in single-line mode
@@ -624,6 +637,10 @@ class BandcampDownloaderGUI:
         self.url_tag_mapping = {}  # {tag_id: full_url}
         # URL tag positions: stores tag positions for deletion protection (tag_id -> (start_pos, end_pos))
         self.url_tag_positions = {}  # {tag_id: (start_pos, end_pos)}
+        self.url_tag_colors = {}  # {tag_id: (bg_color, fg_color)} - preserve colors across reprocessing
+        # URL tag hover overlay
+        self.url_tag_overlay = None  # Current hover overlay window
+        self.url_tag_overlay_tag_id = None  # Tag ID currently showing overlay
         # URL metadata cache: stores metadata for each URL (url -> {artist, album, etc.})
         self.url_metadata_cache = {}  # {url: {artist, album, title, ...}}
         # URL tag metadata cache: stores only HTML extraction (stage 1) metadata for tags (url -> {artist, album, etc.})
@@ -666,14 +683,16 @@ class BandcampDownloaderGUI:
         # MP3 skip re-encoding setting (default to True)
         self.skip_mp3_reencode_var = BooleanVar(value=self.load_saved_skip_mp3_reencode())
         
-        # Color scheme for URL tags
-        self.current_tag_color_scheme = self.load_saved_tag_color_scheme()
-        schemes = self._get_color_schemes()
-        if self.current_tag_color_scheme not in schemes:
-            self.current_tag_color_scheme = "default"
-        self.current_tag_colors = schemes.get(self.current_tag_color_scheme, schemes["default"])
+        # Prefer album artist for folders setting
+        self.prefer_album_artist_for_folders_var = BooleanVar(value=self.load_saved_prefer_album_artist_for_folders())
+        
+        # Color scheme for URL tags - defer loading until needed (optimization)
+        # Load saved preference but don't load all schemes yet (saves file I/O on startup)
+        self.current_tag_color_scheme = settings.get("tag_color_scheme", "default")
         # Initialize variable for menu (will be created when menu is first built)
         self.tag_color_scheme_var = StringVar(value=self.current_tag_color_scheme)
+        # Color schemes will be loaded lazily when first needed (menu opening or tag creation)
+        self.current_tag_colors = None  # Will be loaded on first access
         
         # Theme system - load saved theme preference (default to 'dark' for backward compatibility)
         saved_theme = settings.get("theme", "dark")
@@ -704,7 +723,12 @@ class BandcampDownloaderGUI:
         self.log_snapshot = None  # Store snapshot before clearing: (log_messages_copy, debug_mode_state, scroll_position)
         
         # Store metadata for preview
-        self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None, "first_track_title": None, "first_track_number": None, "track_titles": []}
+        self.album_info = {
+            "artist": None, "album": None, "title": None, "thumbnail_url": None, 
+            "detected_format": None, "year": None, "first_track_title": None, 
+            "first_track_number": None, "track_titles": [],
+            "album_artist": None  # Main album artist from Bandcamp page
+        }
         self.format_suggestion_shown = False  # Track if format suggestion has been shown for current URL
         self.url_check_timer = None  # For debouncing URL changes
         self.album_art_image = None  # Store reference to prevent garbage collection
@@ -750,7 +774,8 @@ class BandcampDownloaderGUI:
         self.load_saved_album_art_state()
         self.setup_ui()
         self.load_saved_path()
-        self.update_preview()
+        # Defer update_preview until after UI is shown (optimization - no URL/metadata yet anyway)
+        self.root.after_idle(self.update_preview)
         # Initialize URL count and button text
         self.root.after(100, self._update_url_count_and_button)
         # Initialize clear button visibility
@@ -760,7 +785,7 @@ class BandcampDownloaderGUI:
         # Show format warnings if selected on startup
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
-        if base_format in ["flac", "ogg", "wav"] and hasattr(self, 'format_conversion_warning_label'):
+        if base_format in ["flac", "wav"] and hasattr(self, 'format_conversion_warning_label'):
             self.format_conversion_warning_label.grid()
         if base_format == "ogg" and hasattr(self, 'ogg_warning_label'):
             self.ogg_warning_label.grid()
@@ -772,8 +797,7 @@ class BandcampDownloaderGUI:
         self.root.after(100, self.set_icon)
         self.root.after(1000, self.set_icon)
         
-        # Bring window to front on startup
-        self.root.after_idle(self._bring_to_front)
+        # Window will be brought to front after fade-in completes (handled in _show_window_with_fade)
         
         # Close console when GUI closes
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -781,13 +805,16 @@ class BandcampDownloaderGUI:
         # Bind to window resize events to update expand/collapse button state
         self.root.bind('<Configure>', self._on_window_configure)
         
-        # Check for launcher update status and log it (after UI is ready)
-        if self.pending_update_status:
-            self.root.after(100, lambda: self._log_launcher_update_status())
+        # Check for launcher update status (deferred for faster startup)
+        # Do this after UI is ready so it doesn't block startup
+        self.root.after(200, self._check_and_log_launcher_update_status)
         
         # Check for updates in background after UI is ready (non-blocking) - only if auto-check is enabled
         if self.auto_check_updates_var.get():
             self.root.after(2000, self._check_for_updates_background)  # Wait 2 seconds after startup
+        
+        # Show window with smooth fade-in effect after all UI is loaded
+        self.root.after_idle(self._show_window_with_fade)
     
     def apply_theme(self):
         """Apply current theme (dark or light) to all UI elements."""
@@ -1025,17 +1052,42 @@ class BandcampDownloaderGUI:
                  bordercolor=[('active', small_btn_bg), ('pressed', small_btn_bg)])
     
     def toggle_theme(self):
-        """Toggle between dark and light mode."""
+        """Toggle between dark and light mode with smooth transition."""
         # Switch theme
         new_theme = 'light' if self.current_theme == 'dark' else 'dark'
         self.current_theme = new_theme
         self.theme_colors = ThemeColors(new_theme)
         
-        # Re-apply theme to all UI elements
-        self.apply_theme()
-        
-        # Refresh all widgets with new theme colors
-        self._refresh_all_widgets()
+        # Freeze window updates during theme transition to prevent widget shaking
+        # This ensures all changes are applied atomically
+        try:
+            # Disable automatic updates
+            self.root.update_idletasks()
+            # Temporarily reduce opacity slightly for smoother visual transition
+            try:
+                current_alpha = self.root.attributes('-alpha')
+                if current_alpha is None or current_alpha >= 1.0:
+                    # Only apply fade if window supports alpha and is fully opaque
+                    self.root.attributes('-alpha', 0.95)  # Slight fade for smooth transition
+            except (TclError, AttributeError):
+                pass
+            
+            # Apply all theme changes while updates are frozen
+            self.apply_theme()
+            self._refresh_all_widgets()
+            
+            # Force a single update to apply all changes at once
+            self.root.update_idletasks()
+            
+            # Restore full opacity
+            try:
+                self.root.attributes('-alpha', 1.0)
+            except (TclError, AttributeError):
+                pass
+        except Exception:
+            # Fallback: apply theme normally if freeze fails
+            self.apply_theme()
+            self._refresh_all_widgets()
         
         # Update settings menu to reflect new theme
         self._rebuild_settings_menu()
@@ -1382,6 +1434,7 @@ class BandcampDownloaderGUI:
         
         # Force menubuttons to refresh their style (filename and folder structure)
         # This ensures they get the updated Dark.TMenubutton style with correct background
+        # Note: Removed update_idletasks() calls to prevent widget shaking during theme transition
         menubutton_attrs = ['filename_menubutton', 'structure_menubutton']
         for attr in menubutton_attrs:
             if hasattr(self, attr):
@@ -1391,10 +1444,8 @@ class BandcampDownloaderGUI:
                         # Force style refresh by temporarily changing style and changing back
                         current_style = widget.cget('style')
                         widget.configure(style='TMenubutton')  # Reset to base
-                        self.root.update_idletasks()
                         widget.configure(style=current_style)  # Apply updated style
-                        # Also force update of the widget itself
-                        widget.update_idletasks()
+                        # Updates will be done at the end of toggle_theme()
                     except (TclError, AttributeError):
                         pass
         
@@ -1500,6 +1551,7 @@ class BandcampDownloaderGUI:
                 pass
         
         # Update scrollbars: use default style in light mode, custom dark style in dark mode
+        # Note: Removed update_idletasks() calls to prevent widget shaking during theme transition
         scrollbar_style = 'TScrollbar' if self.current_theme == 'light' else 'Dark.Vertical.TScrollbar'
         if hasattr(self, 'url_scrollbar') and self.url_scrollbar:
             try:
@@ -1509,7 +1561,6 @@ class BandcampDownloaderGUI:
                 if current_style != scrollbar_style:
                     # Only update if style actually changed
                     self.url_scrollbar.configure(style='TScrollbar')  # Reset to base
-                    self.root.update_idletasks()  # Force update
                     self.url_scrollbar.configure(style=scrollbar_style)  # Apply new style
             except (TclError, AttributeError):
                 pass
@@ -1521,7 +1572,6 @@ class BandcampDownloaderGUI:
                 if current_style != scrollbar_style:
                     # Only update if style actually changed
                     self.log_scrollbar.configure(style='TScrollbar')  # Reset to base
-                    self.root.update_idletasks()  # Force update
                     self.log_scrollbar.configure(style=scrollbar_style)  # Apply new style
             except (TclError, AttributeError):
                 pass
@@ -1830,6 +1880,7 @@ class BandcampDownloaderGUI:
                 "auto_check_updates": self.auto_check_updates_var.get() if hasattr(self, 'auto_check_updates_var') else True,
                 "split_album_artist_display": self.split_album_artist_display_var.get() if hasattr(self, 'split_album_artist_display_var') else "bandcamp_default",
                 "skip_mp3_reencode": self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True,
+                "prefer_album_artist_for_folders": self.prefer_album_artist_for_folders_var.get() if hasattr(self, 'prefer_album_artist_for_folders_var') else True,
                 "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else []),
                 "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else []),
                 "theme": self.current_theme if hasattr(self, 'current_theme') else 'dark'
@@ -2319,9 +2370,17 @@ class BandcampDownloaderGUI:
         if metadata is None:
             metadata = {}
         
+        # Check if we should use album_artist instead of artist
+        use_album_artist = False
+        if hasattr(self, 'prefer_album_artist_for_folders_var') and self.prefer_album_artist_for_folders_var.get():
+            # Use album_artist if available, otherwise fall back to artist
+            album_artist = self.album_info.get("album_artist") if hasattr(self, 'album_info') else None
+            if album_artist:
+                use_album_artist = True
+        
         # Field to yt-dlp template mapping
         field_templates = {
-            "Artist": "%(artist)s",
+            "Artist": "%(album_artist)s" if use_album_artist else "%(artist)s",
             "Album": "%(album)s",
             "Year": "%(release_date>%Y)s",
             "Genre": "%(genre)s",
@@ -2518,7 +2577,7 @@ class BandcampDownloaderGUI:
     
     def _show_additional_settings(self):
         """Show Additional Settings dialog with split album artist display option."""
-        dialog = self._create_dialog_base("Additional Settings", 580, 290)
+        dialog = self._create_dialog_base("Additional Settings", 580, 370)
         
         # Use theme colors
         colors = self.theme_colors
@@ -2540,7 +2599,7 @@ class BandcampDownloaderGUI:
         split_album_label = Label(
             split_album_content,
             text="In case of Split Artist (Album and Track Artists differ):",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 9, "bold"),
             bg=main_bg,
             fg=colors.fg
         )
@@ -2649,6 +2708,36 @@ class BandcampDownloaderGUI:
             justify='left'
         )
         mp3_note_label.pack(anchor=W, pady=(4, 0))
+        
+        # Prefer Album Artist for Folders checkbox (in MP3 panel)
+        prefer_album_artist_checkbox = Checkbutton(
+            mp3_content,
+            text="Prefer Album Artist for Folders (use album artist instead of track artist when available)",
+            variable=self.prefer_album_artist_for_folders_var,
+            command=self._on_prefer_album_artist_for_folders_change,
+            font=("Segoe UI", 9),
+            bg=main_bg,
+            fg=colors.fg,
+            activebackground=main_bg,
+            activeforeground=colors.fg,
+            selectcolor=main_bg,
+            anchor='w',
+            justify='left',
+            wraplength=550
+        )
+        prefer_album_artist_checkbox.pack(anchor=W, pady=(8, 4))
+        
+        # Note about flexibility
+        album_artist_note_label = Label(
+            mp3_content,
+            text="Note: For more flexibility, you can disable this option and use 'Album Artist' field in folder structure instead.",
+            font=("Segoe UI", 8),
+            bg=main_bg,
+            fg=colors.disabled_fg,
+            wraplength=550,
+            justify='left'
+        )
+        album_artist_note_label.pack(anchor=W, pady=(4, 0))
         
         def generate_split_album_preview():
             """Generate preview filename simulating a split album scenario."""
@@ -3363,11 +3452,25 @@ class BandcampDownloaderGUI:
         settings = self._load_settings()
         return settings.get("skip_mp3_reencode", True)  # Default to True
     
+    def load_saved_prefer_album_artist_for_folders(self):
+        """Load saved prefer album artist for folders preference, default to True if not found."""
+        settings = self._load_settings()
+        return settings.get("prefer_album_artist_for_folders", True)
+    
+    def save_prefer_album_artist_for_folders(self):
+        """Save prefer album artist for folders preference."""
+        self._save_settings()
+    
+    def _on_prefer_album_artist_for_folders_change(self):
+        """Handle prefer album artist for folders checkbox change."""
+        self.save_prefer_album_artist_for_folders()
+        self.update_preview()
+    
     def _get_format_menu_options(self):
         """Get format menu options with dynamic MP3 label based on skip re-encode setting."""
         skip_mp3_reencode = self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True
         mp3_label = "MP3 (varies)" if skip_mp3_reencode else "MP3 (128kbps)"
-        return ["Original", mp3_label, "FLAC", "OGG", "WAV"]
+        return ["Original", mp3_label, "OGG"]
     
     def _update_format_menu(self):
         """Update format menu with current options (for dynamic MP3 label)."""
@@ -3608,6 +3711,27 @@ class BandcampDownloaderGUI:
         main_frame = ttk.Frame(self.root, padding="8")
         main_frame.grid(row=0, column=0, sticky=(W, E, N, S))
         
+        # Configure grid weights early so URL field starts at full width
+        # This prevents the URL field from resizing multiple times during startup
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        
+        # Calculate minimum width for column 0 based on the widest label ("Path:")
+        # This prevents the URL field from shifting when Path section loads
+        temp_label = ttk.Label(main_frame, text="Path:", font=("Segoe UI", 9))
+        temp_label.grid(row=999, column=0)  # Place off-screen temporarily
+        self.root.update_idletasks()  # Force layout to measure
+        path_label_width = temp_label.winfo_reqwidth()
+        temp_label.destroy()  # Clean up temporary label
+        
+        main_frame.columnconfigure(0, weight=0, minsize=path_label_width)  # Column 0 sized for Path label
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(2, weight=0)  # Album art column doesn't expand
+        main_frame.rowconfigure(10, weight=1)  # Status log row expands
+        
+        # Force layout update so all widgets can calculate their sizes immediately
+        self.root.update_idletasks()
+        
         # Setup UI sections in order
         self._setup_url_section(main_frame)
         self._setup_path_section(main_frame)
@@ -3811,6 +3935,7 @@ class BandcampDownloaderGUI:
             wraplength=50  # Allow text wrapping if needed
         )
         # Use place() to position it just above the bottom edge, centered and narrower
+        # Use fixed width since grid weights are configured early (layout happens before this)
         # Exact width of URL field with adjustments to center placement with no border or scrollbar overlap
         self.url_text_resize_handle.place(relx=0.5, rely=1.0, width=405, anchor='s', height=5, y=-2, x=-9)
         self.url_text_resize_handle.lower()  # Place behind text widget initially
@@ -3964,7 +4089,7 @@ class BandcampDownloaderGUI:
         # Album art panel (separate frame on the right, same height as settings, square for equal padding)
         # Frame background: dark mode uses bg, light mode uses select_bg (white)
         album_art_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
-        self.album_art_frame = Frame(main_frame, bg=album_art_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
+        self.album_art_frame = Frame(main_frame, bg=album_art_bg, relief='flat', bd=0, highlightbackground=colors.border, highlightthickness=1)
         # Moved to row 3 to align with settings_frame (row 3)
         self.album_art_frame.grid(row=3, column=2, sticky=(W, E, N), pady=2, padx=(6, 0))
         self.album_art_frame.grid_propagate(False)
@@ -3973,27 +4098,28 @@ class BandcampDownloaderGUI:
         self.album_art_frame.columnconfigure(0, weight=1)
         self.album_art_frame.rowconfigure(0, weight=1)
         
-        # Album art canvas with consistent padding all around (10px padding = 150x150 canvas)
+        # Album art canvas - accounts for frame border (168x168 to maximize size)
+        # Frame is 170x170 with highlightthickness=1, so we use 168x168 with 1px padding
         # Canvas background: dark mode uses bg, light mode uses select_bg (white)
         canvas_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
         self.album_art_canvas = Canvas(
             self.album_art_frame,
-            width=150,
-            height=150,
+            width=168,
+            height=168,
             bg=canvas_bg,
             highlightthickness=0,
             borderwidth=0,
             cursor='hand2'  # Show hand cursor to indicate it's Clickable
         )
-        # Center the canvas with equal padding on all sides (10px on each side = 20px total, 150 + 20 = 170)
-        self.album_art_canvas.grid(row=0, column=0, padx=5, pady=5)
+        # Canvas centered in frame (1px padding on all sides to account for border)
+        self.album_art_canvas.grid(row=0, column=0, padx=1, pady=1, sticky=(N, S, E, W))
         
         # Make canvas Clickable to toggle album art
         self.album_art_canvas.bind("<Button-1>", lambda e: self.toggle_album_art())
         
-        # Placeholder text on canvas (centered at 75, 75 for 150x150 canvas)
+        # Placeholder text on canvas (centered at 84, 84 for 168x168 canvas)
         self.album_art_canvas.create_text(
-            75, 75,
+            84, 84,
             text="Album Art",
             fill=colors.disabled_fg,
             font=("Segoe UI", 8)
@@ -4778,12 +4904,7 @@ class BandcampDownloaderGUI:
         # Use bind_all to ensure Ctrl+F works regardless of which widget has focus
         self.root.bind_all('<Control-f>', lambda e: self._show_search_bar())  # Global Ctrl+F hotkey
         
-        # Configure grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.columnconfigure(2, weight=0)  # Album art column doesn't expand
-        main_frame.rowconfigure(10, weight=1)  # Status log row expands
+        # Grid weights are already configured at the start of setup_ui() to prevent URL field resizing
         
         # Expand/Collapse button at the bottom (centered, fits in log_frame bottom padding, no extra space)
         # Place it in log_frame at the very bottom, centered
@@ -4875,6 +4996,76 @@ class BandcampDownloaderGUI:
     def hide_console(self):
         """Hide the console window after GUI is ready (backup method)."""
         self._minimize_console_immediately()
+    
+    def _show_window_with_fade(self):
+        """Show the window with a smooth ease-in fade effect for professional loading."""
+        try:
+            # Check if alpha/opacity is supported (Windows typically supports this)
+            try:
+                # CRITICAL: Set alpha to 0 BEFORE showing window to eliminate initial flicker
+                self.root.attributes('-alpha', 0.0)
+                alpha_supported = True
+            except (TclError, AttributeError):
+                # Alpha not supported on this platform, just show normally
+                alpha_supported = False
+            
+            if alpha_supported:
+                # Show the window while still transparent (no flicker)
+                self.root.deiconify()
+                # Small delay to ensure window is fully ready before starting fade
+                self.root.update_idletasks()
+                
+                # Fade in over 400ms with ease-in curve (slow start, faster end)
+                # Ease-in uses quadratic function: opacity = (progress)^2
+                fade_steps = 40  # More steps for ultra-smooth fade
+                fade_duration_ms = 400  # Slightly longer for smoother ease-in
+                step_delay = max(1, fade_duration_ms // fade_steps)
+                step = 0
+                
+                def fade_step():
+                    nonlocal step
+                    try:
+                        step += 1
+                        # Ease-in quadratic: progress^2 (starts slow, accelerates)
+                        # This creates a natural, smooth fade-in effect
+                        progress = step / fade_steps
+                        # Quadratic ease-in: t^2
+                        eased_progress = progress * progress
+                        current_opacity = min(1.0, eased_progress)
+                        
+                        if step >= fade_steps:
+                            # Final step - ensure fully opaque
+                            self.root.attributes('-alpha', 1.0)
+                            self.root.update_idletasks()
+                            # Bring to front after fade completes
+                            self._bring_to_front()
+                        else:
+                            self.root.attributes('-alpha', current_opacity)
+                            # Continue fade
+                            self.root.after(step_delay, fade_step)
+                    except (TclError, RuntimeError):
+                        # Window may have been closed, just ensure it's visible
+                        try:
+                            self.root.attributes('-alpha', 1.0)
+                            self._bring_to_front()
+                        except Exception:
+                            pass
+                
+                # Start fade-in after ensuring window is ready
+                self.root.after(10, fade_step)
+            else:
+                # Alpha not supported - just show and bring to front
+                self.root.deiconify()
+                self.root.update_idletasks()
+                self._bring_to_front()
+        except Exception:
+            # Fallback: just show the window normally
+            try:
+                self.root.deiconify()
+                self.root.update_idletasks()
+                self._bring_to_front()
+            except Exception:
+                pass
     
     def _bring_to_front(self):
         """Bring the window to the front and give it focus."""
@@ -6121,6 +6312,8 @@ class BandcampDownloaderGUI:
         
         # Show resize handle when text widget is visible (place it just above bottom edge, centered)
         if hasattr(self, 'url_text_resize_handle'):
+            # Ensure window is laid out before using fixed width
+            self.root.update_idletasks()
             self.url_text_resize_handle.place(relx=0.5, rely=1.0, width=405, anchor='s', height=5, y=-2, x=-9)
             self.url_text_resize_handle.lift()  # Bring to front so it's draggable
         
@@ -6266,6 +6459,8 @@ class BandcampDownloaderGUI:
             Hex color string (e.g., '#2E4A5C')
         """
         # Use modulo to cycle through colors from current scheme
+        # Lazy load colors if not already loaded (optimization)
+        self._ensure_tag_colors_loaded()
         color_index = index % len(self.current_tag_colors)
         return self.current_tag_colors[color_index]
     
@@ -6385,10 +6580,65 @@ class BandcampDownloaderGUI:
         else:
             return artist  # Use parsed artist as-is
     
+    def _process_url_tags_with_restore(self):
+        """Process URLs after deletion or paste & replace, restoring protected tags."""
+        # Check if we have pending tag restore data
+        if hasattr(self, '_pending_tag_restore') and self._pending_tag_restore:
+            # Inject the restored tag data into the processing
+            text_widget = self.url_text_widget
+            if text_widget:
+                content = text_widget.get('1.0', END).rstrip('\n')
+                existing_tag_data = []
+                
+                # Use the pre-calculated adjusted positions
+                tag_color_map = {}  # {(start_char_idx, end_char_idx, full_url): (tag_id, bg_color, fg_color)}
+                
+                for tag_id, tag_data in self._pending_tag_restore.items():
+                    start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color = tag_data
+                    # Verify the content still matches at this position
+                    # For paste & replace, the content might be the new URL, so we need to be flexible
+                    if start_char_idx < len(content) and end_char_idx <= len(content):
+                        try:
+                            content_at_pos = content[start_char_idx:end_char_idx]
+                            # For restored tags, content should match tag_display
+                            # But for paste & replace, the new URL might be at this position
+                            # So we check if it matches either the tag_display OR if it's a URL that matches the full_url
+                            # Also handle case where tag_display is the same as full_url (for replaced tags)
+                            if (content_at_pos == tag_display or 
+                                content_at_pos.strip() == full_url.strip() or
+                                content_at_pos.strip() == tag_display.strip()):
+                                existing_tag_data.append((start_char_idx, end_char_idx, full_url, tag_display))
+                                # Store color mapping keyed by position and URL for matching
+                                if bg_color and fg_color:
+                                    tag_color_map[(start_char_idx, end_char_idx, full_url)] = (tag_id, bg_color, fg_color)
+                        except:
+                            pass
+                
+                # Clean up old _pending_new_tag_info if it exists (no longer used)
+                if hasattr(self, '_pending_new_tag_info'):
+                    delattr(self, '_pending_new_tag_info')
+                
+                # Store color map temporarily
+                self._pending_tag_colors = tag_color_map
+                
+                # Clear the pending restore data
+                if hasattr(self, '_pending_tag_restore'):
+                    del self._pending_tag_restore
+                
+                # Process with the restored tag data
+                self._process_url_tags_internal(existing_tag_data, preserve_tag_ids=True)
+        else:
+            # Normal processing
+            self._process_url_tags()
+    
     def _process_url_tags(self):
         """Process URLs in the URL text widget and convert them to styled tags.
         Similar to _process_template_tags but for URLs.
         """
+        self._process_url_tags_internal(None)
+    
+    def _process_url_tags_internal(self, pre_existing_tag_data=None, preserve_tag_ids=False):
+        """Internal method to process URL tags with optional pre-existing tag data."""
         if not self.url_text_widget or not self.url_text_widget.winfo_viewable():
             return
         
@@ -6412,24 +6662,36 @@ class BandcampDownloaderGUI:
             
             # Save existing tag mappings before clearing (to preserve them)
             # Track each tag by its position to avoid mixing up URLs when multiple tags exist
-            existing_tag_data = []  # List of (start_char_idx, end_char_idx, full_url, tag_display) tuples
-            for tag_id, full_url in list(self.url_tag_mapping.items()):
-                if tag_id in self.url_tag_positions:
-                    start_pos, end_pos = self.url_tag_positions[tag_id]
-                    try:
-                        # Get the tag display text from widget
-                        tag_display = text_widget.get(start_pos, end_pos)
-                        # Calculate character indices from widget positions
-                        # Get content before start_pos to calculate absolute character index
-                        content_before_start = text_widget.get('1.0', start_pos)
-                        start_char_idx = len(content_before_start.rstrip('\n'))
-                        # Get content up to end_pos
-                        content_before_end = text_widget.get('1.0', end_pos)
-                        end_char_idx = len(content_before_end.rstrip('\n'))
-                        existing_tag_data.append((start_char_idx, end_char_idx, full_url, tag_display))
-                    except:
-                        pass
+            # Note: After a deletion, some positions may be invalid, so we handle errors gracefully
+            if pre_existing_tag_data is not None:
+                # Use the provided pre-existing tag data (from deletion restore)
+                existing_tag_data = pre_existing_tag_data
+            else:
+                # Normal processing - try to preserve existing tags
+                existing_tag_data = []  # List of (start_char_idx, end_char_idx, full_url, tag_display) tuples
+                for tag_id, full_url in list(self.url_tag_mapping.items()):
+                    if tag_id in self.url_tag_positions:
+                        start_pos, end_pos = self.url_tag_positions[tag_id]
+                        try:
+                            # Validate positions are still valid before using them
+                            # Try to get text at these positions - if it fails, positions are invalid
+                            tag_display = text_widget.get(start_pos, end_pos)
+                            # Calculate character indices from widget positions
+                            # Get content before start_pos to calculate absolute character index
+                            content_before_start = text_widget.get('1.0', start_pos)
+                            start_char_idx = len(content_before_start.rstrip('\n'))
+                            # Get content up to end_pos
+                            content_before_end = text_widget.get('1.0', end_pos)
+                            end_char_idx = len(content_before_end.rstrip('\n'))
+                            # Only add if the tag display is actually in the content at this position
+                            if start_char_idx < len(content) and end_char_idx <= len(content):
+                                existing_tag_data.append((start_char_idx, end_char_idx, full_url, tag_display))
+                        except Exception:
+                            # Positions are invalid (likely due to deletion), skip this tag
+                            # It will be re-detected by regex if the URL is still in content
+                            pass
             
+            # Continue with the rest of processing...
             # Clear all existing URL tag styling
             for tag_id in list(self.url_tag_mapping.keys()):
                 try:
@@ -6629,21 +6891,105 @@ class BandcampDownloaderGUI:
             
             # Now apply tags and build mapping
             tag_id_counter = 0
+            tag_id_map = {}  # Map from (start, end, url) to (tag_id, bg_color, fg_color) for color preservation
+            
+            # Check if we have a pending new tag (from paste & replace) that should use original color
+            pending_new_tag_info = None
+            if hasattr(self, '_pending_new_tag_info'):
+                pending_new_tag_info = self._pending_new_tag_info
+            
+            # If preserving tag IDs, build a map from URL to colors (position-independent matching)
+            # Also build a position map for exact matches when possible
+            url_color_map = {}  # {normalized_url: (tag_id, bg_color, fg_color)}
+            position_color_map = {}  # {(start_char_idx, end_char_idx): (tag_id, bg_color, fg_color)}
+            
+            if preserve_tag_ids and hasattr(self, '_pending_tag_colors'):
+                # Build maps: by URL (for flexible matching) and by position (for exact matches)
+                for (start_char_idx, end_char_idx, full_url), (tag_id, bg_color, fg_color) in self._pending_tag_colors.items():
+                    # Normalize URL for matching
+                    normalized_url = full_url.rstrip(' \t,;').rstrip('/').lower()
+                    if not normalized_url.startswith(('http://', 'https://')):
+                        normalized_url = 'https://' + normalized_url
+                    normalized_url = normalized_url.rstrip('/').lower()
+                    
+                    # Store by URL (allows flexible matching)
+                    # Only store if not already stored (to avoid overwriting with None tag_id)
+                    if bg_color and fg_color:
+                        if normalized_url not in url_color_map or tag_id is not None:
+                            url_color_map[normalized_url] = (tag_id, bg_color, fg_color)
+                    # Also store by position for exact matches
+                    position_color_map[(start_char_idx, end_char_idx)] = (tag_id, bg_color, fg_color)
+                
+                # Clean up
+                if hasattr(self, '_pending_tag_colors'):
+                    del self._pending_tag_colors
+            
+            # Also add the new tag from paste & replace to url_color_map if it exists
+            if pending_new_tag_info and pending_new_tag_info['bg_color'] and pending_new_tag_info['fg_color']:
+                new_tag_url = pending_new_tag_info['url']
+                normalized_new_url = new_tag_url.rstrip(' \t,;').rstrip('/').lower()
+                if not normalized_new_url.startswith(('http://', 'https://')):
+                    normalized_new_url = 'https://' + normalized_new_url
+                normalized_new_url = normalized_new_url.rstrip('/').lower()
+                # Add to url_color_map (will be used for URL-based matching)
+                url_color_map[normalized_new_url] = (None, pending_new_tag_info['bg_color'], pending_new_tag_info['fg_color'])
+            
             for new_start, new_end, full_url, tag_display in tag_positions:
                 try:
                     # Convert to widget positions
                     start_pos = text_widget.index(f'1.0 + {new_start} chars')
                     end_pos = text_widget.index(f'1.0 + {new_end} chars')
                     
+                    # Determine tag_id and colors
+                    # First try exact position match
+                    tag_key = (new_start, new_end)
+                    matched = False
+                    tag_id = None
+                    tag_color = None
+                    tag_text_color = None
+                    
+                    if tag_key in position_color_map:
+                        # Exact position match - use preserved colors
+                        tag_id, tag_color, tag_text_color = position_color_map[tag_key]
+                        matched = True
+                    else:
+                        # Try URL-based matching (more flexible, handles position shifts)
+                        normalized_url = full_url.rstrip(' \t,;').rstrip('/').lower()
+                        if not normalized_url.startswith(('http://', 'https://')):
+                            normalized_url = 'https://' + normalized_url
+                        normalized_url = normalized_url.rstrip('/').lower()
+                        
+                        if normalized_url in url_color_map:
+                            # URL match found - use preserved colors
+                            tag_id, tag_color, tag_text_color = url_color_map[normalized_url]
+                            matched = True
+                    
+                    # If still not matched, check if this is the new tag from paste & replace
+                    if not matched:
+                        if (pending_new_tag_info and
+                            full_url == pending_new_tag_info['url']):
+                            # This is the new tag from paste & replace - use original color
+                            if pending_new_tag_info['bg_color'] and pending_new_tag_info['fg_color']:
+                                tag_color = pending_new_tag_info['bg_color']
+                                tag_text_color = pending_new_tag_info['fg_color']
+                                matched = True
+                    
+                    # If still not matched, use sequential color
+                    if not matched:
+                        tag_color = self._get_tag_color_sequential(tag_id_counter)
+                        tag_text_color = self._get_tag_text_color(tag_color)
+                    
+                    # Create new tag_id if not preserved
+                    if tag_id is None:
+                        tag_id = f"tag_{tag_id_counter}"
+                        tag_id_counter += 1
+                    
                     # Store tag position and full URL mapping
-                    tag_id = f"tag_{tag_id_counter}"
-                    tag_id_counter += 1
                     self.url_tag_mapping[tag_id] = full_url
                     self.url_tag_positions[tag_id] = (start_pos, end_pos)
+                    self.url_tag_colors[tag_id] = (tag_color, tag_text_color)  # Store colors
                     
-                    # Style the tag text with sequential color assignment
-                    tag_color = self._get_tag_color_sequential(tag_id_counter - 1)
-                    tag_text_color = self._get_tag_text_color(tag_color)
+                    # Style the tag text
                     text_widget.tag_add(f"url_tag_{tag_id}", start_pos, end_pos)
                     text_widget.tag_config(f"url_tag_{tag_id}", 
                                          background=tag_color, 
@@ -6651,9 +6997,112 @@ class BandcampDownloaderGUI:
                                          font=("Segoe UI", 9, "bold"),
                                          relief='flat',
                                          borderwidth=0)
+                    
+                    # Bind hover events for overlay
+                    # Use delayed show/hide to prevent flickering when moving to overlay
+                    def on_tag_enter(e, tid=tag_id):
+                        # Cancel any pending hide
+                        if hasattr(self, '_tag_overlay_show_timer'):
+                            if self._tag_overlay_show_timer:
+                                try:
+                                    self.root.after_cancel(self._tag_overlay_show_timer)
+                                except:
+                                    pass
+                        
+                        # Only show if not already showing for this tag
+                        if self.url_tag_overlay_tag_id != tid:
+                            # If overlay is showing for a different tag, hide it immediately
+                            if self.url_tag_overlay_tag_id is not None:
+                                # Cancel any pending hide timer
+                                if hasattr(self, '_overlay_hide_timer') and self._overlay_hide_timer:
+                                    try:
+                                        self.root.after_cancel(self._overlay_hide_timer)
+                                    except:
+                                        pass
+                                    self._overlay_hide_timer = None
+                                # Hide old overlay immediately
+                                if self.url_tag_overlay:
+                                    try:
+                                        self.url_tag_overlay.destroy()
+                                    except:
+                                        pass
+                                    self.url_tag_overlay = None
+                                    self.url_tag_overlay_tag_id = None
+                            
+                            # Add delay before showing overlay (400ms - less intrusive)
+                            def show_after_delay():
+                                if self.url_tag_overlay_tag_id != tid:  # Still not showing
+                                    self._show_tag_overlay(tid, e)
+                                self._tag_overlay_show_timer = None
+                            
+                            self._tag_overlay_show_timer = self.root.after(400, show_after_delay)
+                    
+                    def on_tag_leave(e, tid=tag_id):
+                        # Cancel any pending show timer for this tag
+                        if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
+                            try:
+                                self.root.after_cancel(self._tag_overlay_show_timer)
+                            except:
+                                pass
+                            self._tag_overlay_show_timer = None
+                        
+                        # Don't hide immediately - use delay to allow moving to overlay or another tag
+                        def delayed_hide():
+                            # Only hide if this is still the current tag's overlay
+                            if self.url_tag_overlay_tag_id == tid and self.url_tag_overlay:
+                                # Check if mouse is over overlay
+                                try:
+                                    mouse_x = self.root.winfo_pointerx()
+                                    mouse_y = self.root.winfo_pointery()
+                                    if self.url_tag_overlay:
+                                        overlay_x = self.url_tag_overlay.winfo_rootx()
+                                        overlay_y = self.url_tag_overlay.winfo_rooty()
+                                        overlay_w = self.url_tag_overlay.winfo_width()
+                                        overlay_h = self.url_tag_overlay.winfo_height()
+                                        
+                                        if (overlay_x <= mouse_x <= overlay_x + overlay_w and 
+                                            overlay_y <= mouse_y <= overlay_y + overlay_h):
+                                            return  # Mouse is over overlay, don't hide
+                                        
+                                        # Check if mouse is over any other tag
+                                        text_widget_local = self.url_text_widget
+                                        if text_widget_local:
+                                            widget_x_local = text_widget_local.winfo_rootx()
+                                            widget_y_local = text_widget_local.winfo_rooty()
+                                            
+                                            for other_tid, (other_start, other_end) in self.url_tag_positions.items():
+                                                if other_tid != tid:
+                                                    try:
+                                                        other_bbox = text_widget_local.bbox(other_start)
+                                                        if other_bbox:
+                                                            other_tag_x = widget_x_local + other_bbox[0]
+                                                            other_tag_y = widget_y_local + other_bbox[1]
+                                                            other_tag_w = other_bbox[2]
+                                                            other_tag_h = other_bbox[3]
+                                                            
+                                                            if (other_tag_x <= mouse_x <= other_tag_x + other_tag_w and 
+                                                                other_tag_y <= mouse_y <= other_tag_y + other_tag_h):
+                                                                return  # Mouse is over another tag, don't hide
+                                                    except:
+                                                        pass
+                                except:
+                                    pass
+                                
+                                # Mouse is not over overlay or another tag, hide it
+                                self._hide_tag_overlay(None)
+                        
+                        # Small delay to allow moving to overlay or another tag
+                        self.root.after(150, delayed_hide)
+                    
+                    text_widget.tag_bind(f"url_tag_{tag_id}", "<Enter>", on_tag_enter)
+                    text_widget.tag_bind(f"url_tag_{tag_id}", "<Leave>", on_tag_leave)
                 except Exception:
                     # If styling fails, skip this tag (but URL is still in mapping)
                     continue
+            
+            # Clean up pending new tag info after processing
+            if hasattr(self, '_pending_new_tag_info'):
+                del self._pending_new_tag_info
             
             # Restore cursor position
             try:
@@ -6668,6 +7117,1344 @@ class BandcampDownloaderGUI:
         finally:
             # Clear processing flag
             self.is_processing_url_tags = False
+    
+    def _lighten_color(self, hex_color, amount=0.2):
+        """Lighten a hex color by a specified amount.
+        
+        Args:
+            hex_color: Hex color string (e.g., '#FF0000')
+            amount: Amount to lighten (0.0 to 1.0, default 0.2)
+            
+        Returns:
+            Lightened hex color string
+        """
+        hex_color = hex_color.lstrip('#')
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        
+        # Lighten by blending with white
+        r = min(255, int(r + (255 - r) * amount))
+        g = min(255, int(g + (255 - g) * amount))
+        b = min(255, int(b + (255 - b) * amount))
+        
+        return f"#{r:02x}{g:02x}{b:02x}"
+    
+    def _show_tag_overlay(self, tag_id, event):
+        """Show hover overlay for URL tag."""
+        # If overlay is already showing for this tag, don't recreate it
+        if self.url_tag_overlay_tag_id == tag_id and self.url_tag_overlay:
+            return
+        
+        # Cancel any pending timers first
+        if hasattr(self, '_overlay_hide_timer') and self._overlay_hide_timer:
+            try:
+                self.root.after_cancel(self._overlay_hide_timer)
+            except:
+                pass
+            self._overlay_hide_timer = None
+        
+        if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
+            try:
+                self.root.after_cancel(self._tag_overlay_show_timer)
+            except:
+                pass
+            self._tag_overlay_show_timer = None
+        
+        # Hide any existing overlay immediately (no fade when switching)
+        # First cancel any fade-out animation that might be running
+        old_overlay = self.url_tag_overlay
+        if old_overlay:
+            # Cancel any pending timers
+            if hasattr(self, '_overlay_fade_timer'):
+                try:
+                    self.root.after_cancel(self._overlay_fade_timer)
+                except:
+                    pass
+                self._overlay_fade_timer = None
+            
+            # Immediately destroy old overlay
+            try:
+                old_overlay.destroy()
+            except:
+                pass
+            self.url_tag_overlay = None
+            self.url_tag_overlay_tag_id = None
+        
+        # Check if tag still exists
+        if tag_id not in self.url_tag_mapping or tag_id not in self.url_tag_positions:
+            return
+        
+        text_widget = self.url_text_widget
+        if not text_widget:
+            return
+        
+        # Get tag position
+        start_pos, end_pos = self.url_tag_positions[tag_id]
+        
+        # Get tag's background color (inherit from tag)
+        tag_name = f"url_tag_{tag_id}"
+        try:
+            tag_bg = text_widget.tag_cget(tag_name, "background")
+            tag_fg = text_widget.tag_cget(tag_name, "foreground")
+        except:
+            # Fallback to theme colors if tag color not available
+            colors = self.theme_colors
+            tag_bg = colors.bg
+            tag_fg = colors.fg
+        
+        # Get bounding box of tag
+        try:
+            bbox = text_widget.bbox(start_pos)
+            if not bbox:
+                return
+        except:
+            return
+        
+        # Get widget position on screen
+        widget_x = text_widget.winfo_rootx()
+        widget_y = text_widget.winfo_rooty()
+        
+        # Get mouse cursor position (where user is hovering)
+        try:
+            cursor_x = self.root.winfo_pointerx()
+            cursor_y = self.root.winfo_pointery()
+        except:
+            # Fallback to tag center if cursor position unavailable
+            tag_x = widget_x + bbox[0]
+            tag_y = widget_y + bbox[1]
+            tag_width = bbox[2]
+            tag_height = bbox[3]
+            cursor_x = tag_x + (tag_width // 2)
+            cursor_y = tag_y + (tag_height // 2)
+        
+        # Create overlay window with no border
+        overlay = Toplevel(self.root)
+        overlay.overrideredirect(True)  # Remove window decorations
+        overlay.attributes('-topmost', True)  # Keep on top
+        overlay.configure(bg=tag_bg, highlightthickness=0, bd=0)  # Match tag background, no border
+        
+        # Get theme colors for buttons
+        colors = self.theme_colors
+        
+        # Lighten tag color for hover (instead of using hover_bg)
+        hover_bg = self._lighten_color(tag_bg, 0.15)  # Lighten by 15%
+        
+        # Create frame for buttons - inherit tag color, no border
+        button_frame = Frame(overlay, bg=tag_bg, relief='flat', bd=0, highlightthickness=0)
+        button_frame.pack(fill=BOTH, expand=True, padx=2, pady=2)
+        
+        # Button size
+        btn_size = 24
+        btn_pad = 2
+        
+        # Helper function to show tooltip with delay
+        def show_tooltip(widget, text):
+            """Show tooltip for button with delay."""
+            # Cancel any existing tooltip timer
+            if hasattr(widget, '_tooltip_timer'):
+                try:
+                    self.root.after_cancel(widget._tooltip_timer)
+                except:
+                    pass
+            
+            def show_after_delay():
+                tooltip = Toplevel(overlay)
+                tooltip.overrideredirect(True)
+                tooltip.attributes('-topmost', True)
+                tooltip_label = Label(tooltip, text=text, bg=tag_bg, fg=tag_fg,
+                                     font=("Segoe UI", 8), relief='flat', bd=0,
+                                     padx=4, pady=2)
+                tooltip_label.pack()
+                tooltip.update_idletasks()
+                
+                # Position tooltip above button
+                widget_x = widget.winfo_rootx()
+                widget_y = widget.winfo_rooty()
+                widget_width = widget.winfo_width()
+                tooltip_width = tooltip.winfo_reqwidth()
+                tooltip_height = tooltip.winfo_reqheight()
+                
+                tooltip_x = widget_x + (widget_width // 2) - (tooltip_width // 2)
+                tooltip_y = widget_y - tooltip_height - 5
+                
+                tooltip.geometry(f"{tooltip_width}x{tooltip_height}+{tooltip_x}+{tooltip_y}")
+                widget.tooltip = tooltip
+                widget._tooltip_timer = None
+            
+            # Show tooltip after 500ms delay
+            widget._tooltip_timer = self.root.after(500, show_after_delay)
+            
+            def hide_tooltip(e=None):
+                # Cancel pending tooltip
+                if hasattr(widget, '_tooltip_timer') and widget._tooltip_timer:
+                    try:
+                        self.root.after_cancel(widget._tooltip_timer)
+                    except:
+                        pass
+                    widget._tooltip_timer = None
+                
+                # Hide existing tooltip
+                if hasattr(widget, 'tooltip'):
+                    try:
+                        widget.tooltip.destroy()
+                    except:
+                        pass
+                    del widget.tooltip
+            
+            widget.bind("<Leave>", hide_tooltip, add='+')
+            return None  # No immediate return, tooltip shows after delay
+        
+        # Open in Browser button - inherit tag colors
+        # Using 🌐 (globe) icon for open in browser
+        def open_browser_handler(e):
+            self._open_tag_in_browser(tag_id)
+            return "break"  # Stop event propagation
+        open_browser_btn = Button(button_frame, text="🌐", font=("Segoe UI", 10),
+                                 bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
+                                 width=2, height=1, cursor='hand2',
+                                 activebackground=hover_bg, activeforeground=tag_fg)
+        open_browser_btn.pack(side=LEFT, padx=btn_pad)
+        open_browser_btn.bind("<Enter>", lambda e: (open_browser_btn.config(bg=hover_bg), show_tooltip(open_browser_btn, "Open in Browser")))
+        open_browser_btn.bind("<Leave>", lambda e: (open_browser_btn.config(bg=tag_bg),
+                                                     self.root.after_cancel(open_browser_btn._tooltip_timer) if hasattr(open_browser_btn, '_tooltip_timer') and open_browser_btn._tooltip_timer else None))
+        open_browser_btn.bind("<Button-1>", open_browser_handler)
+        
+        # View Metadata button - inherit tag colors
+        # Using ℹ️ (information) icon for view metadata
+        def view_metadata_handler(e):
+            self._view_tag_metadata(tag_id)
+            return "break"  # Stop event propagation
+        view_metadata_btn = Button(button_frame, text="ℹ️", font=("Segoe UI", 10),
+                                  bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
+                                  width=2, height=1, cursor='hand2',
+                                  activebackground=hover_bg, activeforeground=tag_fg)
+        view_metadata_btn.pack(side=LEFT, padx=btn_pad)
+        view_metadata_btn.bind("<Enter>", lambda e: (view_metadata_btn.config(bg=hover_bg), show_tooltip(view_metadata_btn, "View Metadata")))
+        view_metadata_btn.bind("<Leave>", lambda e: (view_metadata_btn.config(bg=tag_bg),
+                                                      self.root.after_cancel(view_metadata_btn._tooltip_timer) if hasattr(view_metadata_btn, '_tooltip_timer') and view_metadata_btn._tooltip_timer else None))
+        view_metadata_btn.bind("<Button-1>", view_metadata_handler)
+        
+        # Copy button - inherit tag colors
+        # Using 🔗 (link symbol) for copy URL
+        def copy_handler(e):
+            self._copy_tag_url(tag_id)
+            return "break"  # Stop event propagation
+        copy_btn = Button(button_frame, text="🔗", font=("Segoe UI", 10), 
+                         bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
+                         width=2, height=1, cursor='hand2',
+                         activebackground=hover_bg, activeforeground=tag_fg)
+        copy_btn.pack(side=LEFT, padx=btn_pad)
+        copy_btn.bind("<Enter>", lambda e: (copy_btn.config(bg=hover_bg), show_tooltip(copy_btn, "Copy URL")))
+        copy_btn.bind("<Leave>", lambda e: (copy_btn.config(bg=tag_bg),
+                                            self.root.after_cancel(copy_btn._tooltip_timer) if hasattr(copy_btn, '_tooltip_timer') and copy_btn._tooltip_timer else None))
+        copy_btn.bind("<Button-1>", copy_handler)
+        
+        # Paste button - inherit tag colors
+        # Using ➕ (plus) icon for consistency with main paste button
+        def paste_handler(e):
+            self._paste_from_overlay(tag_id)
+            return "break"  # Stop event propagation to prevent double paste
+        paste_btn = Button(button_frame, text="➕", font=("Segoe UI", 10),
+                          bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
+                          width=2, height=1, cursor='hand2',
+                          activebackground=hover_bg, activeforeground=tag_fg)
+        paste_btn.pack(side=LEFT, padx=btn_pad)
+        paste_btn.bind("<Enter>", lambda e: (paste_btn.config(bg=hover_bg), show_tooltip(paste_btn, "Paste")))
+        paste_btn.bind("<Leave>", lambda e: (paste_btn.config(bg=tag_bg),
+                                             self.root.after_cancel(paste_btn._tooltip_timer) if hasattr(paste_btn, '_tooltip_timer') and paste_btn._tooltip_timer else None))
+        paste_btn.bind("<Button-1>", paste_handler)
+        
+        # Delete button - inherit tag colors
+        # Using ✕ (multiplication x) for delete
+        def delete_handler(e):
+            self._delete_tag(tag_id)
+            return "break"  # Stop event propagation
+        delete_btn = Button(button_frame, text="✕", font=("Segoe UI", 11),
+                           bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
+                           width=2, height=1, cursor='hand2',
+                           activebackground=hover_bg, activeforeground=tag_fg,
+                           padx=2, pady=2)  # Extra padding for better icon centering
+        delete_btn.pack(side=LEFT, padx=btn_pad)
+        delete_btn.bind("<Enter>", lambda e: (delete_btn.config(bg=hover_bg), show_tooltip(delete_btn, "Delete")))
+        delete_btn.bind("<Leave>", lambda e: (delete_btn.config(bg=tag_bg),
+                                              self.root.after_cancel(delete_btn._tooltip_timer) if hasattr(delete_btn, '_tooltip_timer') and delete_btn._tooltip_timer else None))
+        delete_btn.bind("<Button-1>", delete_handler)
+        
+        # Update overlay to get size
+        overlay.update_idletasks()
+        overlay_width = overlay.winfo_reqwidth()
+        overlay_height = overlay.winfo_reqheight()
+        
+        # Position overlay centered on cursor position (both horizontally and vertically)
+        overlay_x = cursor_x - (overlay_width // 2)  # Center horizontally on cursor
+        overlay_y = cursor_y - (overlay_height // 2)  # Center vertically on cursor
+        
+        # Ensure overlay stays within text widget bounds
+        if overlay_x < widget_x:
+            overlay_x = widget_x + 5
+        elif overlay_x + overlay_width > widget_x + text_widget.winfo_width():
+            overlay_x = widget_x + text_widget.winfo_width() - overlay_width - 5
+        
+        if overlay_y < widget_y:
+            # If top of overlay would be above widget, adjust to keep it within bounds
+            overlay_y = widget_y + 5
+        elif overlay_y + overlay_height > widget_y + text_widget.winfo_height():
+            # If bottom of overlay would be below widget, adjust to keep it within bounds
+            overlay_y = widget_y + text_widget.winfo_height() - overlay_height - 5
+        
+        overlay.geometry(f"{overlay_width}x{overlay_height}+{overlay_x}+{overlay_y}")
+        
+        # No transparency - overlay should look like part of the tag
+        
+        # Store overlay reference
+        self.url_tag_overlay = overlay
+        self.url_tag_overlay_tag_id = tag_id
+        
+        # Keep overlay visible when hovering over it - prevent flickering
+        def keep_overlay_visible(e):
+            # Cancel any pending hide operations
+            if hasattr(self, '_overlay_hide_timer') and self._overlay_hide_timer:
+                try:
+                    self.root.after_cancel(self._overlay_hide_timer)
+                except:
+                    pass
+                self._overlay_hide_timer = None
+        
+        def hide_on_leave(e):
+            # Use a delay to allow moving between tag and overlay
+            def check_and_hide():
+                if self.url_tag_overlay_tag_id != tag_id:
+                    return  # Different tag now
+                
+                # Check if mouse is still over tag or overlay
+                try:
+                    mouse_x = self.root.winfo_pointerx()
+                    mouse_y = self.root.winfo_pointery()
+                    
+                    # Check if mouse is over overlay
+                    if self.url_tag_overlay:
+                        overlay_x = self.url_tag_overlay.winfo_rootx()
+                        overlay_y = self.url_tag_overlay.winfo_rooty()
+                        overlay_w = self.url_tag_overlay.winfo_width()
+                        overlay_h = self.url_tag_overlay.winfo_height()
+                        
+                        if (overlay_x <= mouse_x <= overlay_x + overlay_w and 
+                            overlay_y <= mouse_y <= overlay_y + overlay_h):
+                            return  # Mouse is over overlay, don't hide
+                    
+                    # Check if mouse is over tag
+                    bbox = text_widget.bbox(start_pos)
+                    if bbox:
+                        tag_x_local = widget_x + bbox[0]
+                        tag_y_local = widget_y + bbox[1]
+                        tag_w = bbox[2]
+                        tag_h = bbox[3]
+                        
+                        if (tag_x_local <= mouse_x <= tag_x_local + tag_w and 
+                            tag_y_local <= mouse_y <= tag_y_local + tag_h):
+                            return  # Mouse is over tag, don't hide
+                except:
+                    pass
+                
+                # Mouse is not over tag or overlay, hide
+                self._hide_tag_overlay(None)
+                self._overlay_hide_timer = None
+            
+            # Cancel any existing timer
+            if hasattr(self, '_overlay_hide_timer') and self._overlay_hide_timer:
+                try:
+                    self.root.after_cancel(self._overlay_hide_timer)
+                except:
+                    pass
+            
+            # Schedule hide with delay
+            self._overlay_hide_timer = self.root.after(200, check_and_hide)
+        
+        # Bind to overlay to keep it visible
+        overlay.bind("<Enter>", keep_overlay_visible)
+        overlay.bind("<Leave>", hide_on_leave)
+        button_frame.bind("<Enter>", keep_overlay_visible)
+        button_frame.bind("<Leave>", hide_on_leave)
+        
+        # Also bind to all buttons to keep overlay visible
+        for btn in [open_browser_btn, view_metadata_btn, copy_btn, paste_btn, delete_btn]:
+            btn.bind("<Enter>", keep_overlay_visible, add='+')
+            btn.bind("<Leave>", hide_on_leave, add='+')
+        
+        # Allow right-click and Ctrl+V while hovering overlay
+        def handle_right_click(e):
+            # Stop event propagation to prevent double paste
+            e.widget.focus_set()
+            # Allow right-click paste in URL field
+            if text_widget:
+                text_widget.focus_set()
+                # Trigger the existing right-click paste handler
+                self._handle_right_Click_paste_text(e)
+            return "break"  # Stop event propagation
+        
+        def handle_ctrl_v(e):
+            # Allow Ctrl+V paste in URL field
+            if text_widget:
+                text_widget.focus_set()
+                # Let the normal paste handler work - return None to allow default
+                return None
+        
+        overlay.bind("<Button-3>", handle_right_click)  # Right-click
+        overlay.bind("<Control-v>", handle_ctrl_v)  # Ctrl+V
+        button_frame.bind("<Button-3>", handle_right_click)
+        button_frame.bind("<Control-v>", handle_ctrl_v)
+        for btn in [open_browser_btn, view_metadata_btn, copy_btn, paste_btn, delete_btn]:
+            btn.bind("<Button-3>", handle_right_click, add='+')
+            btn.bind("<Control-v>", handle_ctrl_v, add='+')
+        
+        # Hide overlay when clicking outside or when tag scrolls out of view
+        def hide_on_click(event):
+            if event.widget != overlay and event.widget not in overlay.winfo_children():
+                self._hide_tag_overlay(None)
+        
+        # Bind to root for clicks outside
+        self.root.bind("<Button-1>", hide_on_click, add='+')
+        
+        # Monitor scrolling
+        def check_scroll(*args):
+            if self.url_tag_overlay_tag_id == tag_id:
+                try:
+                    # Check if tag is still visible
+                    bbox = text_widget.bbox(start_pos)
+                    if not bbox:
+                        self._hide_tag_overlay(None)
+                except:
+                    self._hide_tag_overlay(None)
+        
+        text_widget.bind("<Button-1>", lambda e: self._hide_tag_overlay(None), add='+')
+        text_widget.bind("<Key>", lambda e: self._hide_tag_overlay(None), add='+')
+    
+    def _hide_tag_overlay(self, tag_id):
+        """Hide hover overlay for URL tag with fade-out."""
+        # Only hide if tag_id matches or is None (force hide)
+        if tag_id is not None and self.url_tag_overlay_tag_id != tag_id:
+            return  # Different tag, don't hide
+        
+        # Cancel any pending timers
+        if hasattr(self, '_overlay_hide_timer') and self._overlay_hide_timer:
+            try:
+                self.root.after_cancel(self._overlay_hide_timer)
+            except:
+                pass
+            self._overlay_hide_timer = None
+        
+        if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
+            try:
+                self.root.after_cancel(self._tag_overlay_show_timer)
+            except:
+                pass
+            self._tag_overlay_show_timer = None
+        
+        if self.url_tag_overlay:
+            overlay = self.url_tag_overlay
+            current_tag_id = self.url_tag_overlay_tag_id  # Store current tag ID
+            
+            # Fade out animation
+            def fade_out(step=0, total_steps=8):
+                # Check if overlay was replaced or destroyed
+                if (self.url_tag_overlay != overlay or 
+                    self.url_tag_overlay_tag_id != current_tag_id):
+                    # Overlay was replaced, just clean up
+                    try:
+                        overlay.destroy()
+                    except:
+                        pass
+                    self._overlay_fade_timer = None
+                    return
+                
+                if step > total_steps:
+                    try:
+                        overlay.destroy()
+                    except:
+                        pass
+                    # Only clear if this is still the current overlay
+                    if self.url_tag_overlay == overlay:
+                        self.url_tag_overlay = None
+                        self.url_tag_overlay_tag_id = None
+                    self._overlay_fade_timer = None
+                    return
+                
+                alpha = 1.0 - (step / total_steps)
+                try:
+                    overlay.attributes('-alpha', max(0.0, alpha))
+                    self._overlay_fade_timer = self.root.after(15, lambda: fade_out(step + 1, total_steps))
+                except:
+                    # If overlay was destroyed, just clean up
+                    if self.url_tag_overlay == overlay:
+                        self.url_tag_overlay = None
+                        self.url_tag_overlay_tag_id = None
+                    self._overlay_fade_timer = None
+            
+            self._overlay_fade_timer = self.root.after(15, lambda: fade_out(0, 8))
+    
+    def _open_tag_in_browser(self, tag_id):
+        """Open tag URL in default web browser."""
+        if tag_id not in self.url_tag_mapping:
+            return
+        
+        url = self.url_tag_mapping[tag_id]
+        
+        # Hide overlay first to prevent flicker
+        if self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id:
+            # Cancel any pending show/hide timers
+            if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
+                try:
+                    self.root.after_cancel(self._tag_overlay_show_timer)
+                except:
+                    pass
+                self._tag_overlay_show_timer = None
+            if hasattr(self, '_overlay_fade_timer') and self._overlay_fade_timer:
+                try:
+                    self.root.after_cancel(self._overlay_fade_timer)
+                except:
+                    pass
+                self._overlay_fade_timer = None
+            
+            # Start fade-out immediately
+            self._hide_tag_overlay(None)
+        
+        # Open URL in browser
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass  # Silently fail if browser can't open
+    
+    def _view_tag_metadata(self, tag_id):
+        """Show metadata dialog for tag URL."""
+        if tag_id not in self.url_tag_mapping:
+            return
+        
+        url = self.url_tag_mapping[tag_id]
+        
+        # Hide overlay first (before opening modal) - same as other buttons
+        if self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id:
+            # Cancel any pending show/hide timers
+            if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
+                try:
+                    self.root.after_cancel(self._tag_overlay_show_timer)
+                except:
+                    pass
+                self._tag_overlay_show_timer = None
+            if hasattr(self, '_overlay_fade_timer') and self._overlay_fade_timer:
+                try:
+                    self.root.after_cancel(self._overlay_fade_timer)
+                except:
+                    pass
+                self._overlay_fade_timer = None
+            
+            # Start fade-out immediately
+            self._hide_tag_overlay(None)
+        
+        # Normalize URL for lookup
+        normalized_url = url.rstrip(' \t,;').rstrip('/').lower()
+        if not normalized_url.startswith(('http://', 'https://')):
+            normalized_url = 'https://' + normalized_url
+        normalized_url = normalized_url.rstrip('/').lower()
+        
+        # Get metadata from cache (prefer HTML extraction metadata for tags)
+        metadata = self.url_tag_metadata_cache.get(normalized_url, {})
+        if not metadata:
+            # Fallback to full metadata cache
+            metadata = self.url_metadata_cache.get(normalized_url, {})
+        
+        # Create metadata dialog
+        dialog = Toplevel(self.root)
+        dialog.title("Metadata")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Apply theme
+        colors = self.theme_colors
+        dialog.configure(bg=colors.bg)
+        
+        # Create scrollable text widget for metadata
+        frame = Frame(dialog, bg=colors.bg)
+        frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+        
+        # URL row: label, text field, and Go button on same row
+        url_row = Frame(frame, bg=colors.bg)
+        url_row.pack(fill=X, pady=(0, 10))
+        
+        url_label = Label(url_row, text="URL:", bg=colors.bg, fg=colors.fg, font=("Segoe UI", 9, "bold"))
+        url_label.pack(side=LEFT, padx=(0, 5))
+        
+        url_text = Text(url_row, wrap=WORD, bg=colors.entry_bg, fg=colors.entry_fg,
+                       font=("Segoe UI", 9), relief='flat', bd=1, height=2,
+                       highlightthickness=1, highlightcolor=colors.accent, highlightbackground=colors.border)
+        url_text.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 5))
+        url_text.insert('1.0', url)
+        url_text.config(state='disabled')
+        
+        # Go button to open URL in browser (same height as text field, no icon, just text)
+        def open_url_in_browser():
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        
+        go_btn = Button(url_row, text="Go", command=open_url_in_browser,
+                       bg=colors.select_bg, fg=colors.fg, relief='flat', bd=0,
+                       padx=12, pady=2, cursor='hand2', font=("Segoe UI", 9),
+                       activebackground=colors.hover_bg, activeforeground=colors.fg)
+        go_btn.pack(side=RIGHT)
+        
+        # Click-to-copy for URL field
+        def copy_url_on_click(e):
+            url_text.config(state='normal')
+            url_text.tag_add("sel", "1.0", END)
+            url_text.config(state='disabled')
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url)
+            # Show tooltip
+            tooltip = Toplevel(self.root)
+            tooltip.overrideredirect(True)
+            tooltip.configure(bg=colors.bg)
+            tooltip_label = Label(tooltip, text="✓ Copied!", bg=colors.bg, fg=colors.success,
+                                 font=("Segoe UI", 8), padx=8, pady=4)
+            tooltip_label.pack()
+            # Position tooltip near click
+            tooltip_x = e.x_root + 10
+            tooltip_y = e.y_root - 30
+            tooltip.geometry(f"+{tooltip_x}+{tooltip_y}")
+            # Auto-hide after 1.5 seconds
+            tooltip.after(1500, tooltip.destroy)
+            return "break"
+        
+        url_text.bind("<Button-1>", copy_url_on_click)
+        
+        # Metadata content
+        metadata_label = Label(frame, text="Metadata:", bg=colors.bg, fg=colors.fg, font=("Segoe UI", 9, "bold"))
+        metadata_label.pack(anchor=W, pady=(0, 5))
+        
+        metadata_text = scrolledtext.ScrolledText(frame, wrap=WORD, bg=colors.entry_bg, fg=colors.entry_fg,
+                                                 font=("Segoe UI", 9), relief='flat', bd=1, height=12,
+                                                 highlightthickness=1, highlightcolor=colors.accent, highlightbackground=colors.border)
+        metadata_text.pack(fill=BOTH, expand=True, pady=(0, 10))
+        
+        # Format and display metadata - show all available fields
+        metadata_content = ""
+        if metadata:
+            lines = []
+            
+            # Basic information
+            if metadata.get('artist'):
+                lines.append(f"Artist: {metadata['artist']}")
+            if metadata.get('album'):
+                lines.append(f"Album: {metadata['album']}")
+            if metadata.get('title'):
+                lines.append(f"Title: {metadata['title']}")
+            if metadata.get('album_artist') or metadata.get('albumartist'):
+                lines.append(f"Album Artist: {metadata.get('album_artist') or metadata.get('albumartist', '')}")
+            
+            # Release information
+            if metadata.get('year'):
+                lines.append(f"Year: {metadata['year']}")
+            if metadata.get('date'):
+                lines.append(f"Date: {metadata['date']}")
+            
+            # Classification
+            if metadata.get('genre'):
+                lines.append(f"Genre: {metadata['genre']}")
+            if metadata.get('label') or metadata.get('publisher'):
+                lines.append(f"Label: {metadata.get('label') or metadata.get('publisher', '')}")
+            if metadata.get('catalog_number') or metadata.get('catalognumber'):
+                lines.append(f"Catalog Number: {metadata.get('catalog_number') or metadata.get('catalognumber', '')}")
+            
+            # Track information
+            if metadata.get('track_number'):
+                lines.append(f"Track Number: {metadata['track_number']}")
+            if metadata.get('track_count'):
+                lines.append(f"Track Count: {metadata['track_count']}")
+            if metadata.get('first_track_title'):
+                lines.append(f"First Track: {metadata['first_track_title']}")
+            if metadata.get('first_track_number'):
+                lines.append(f"First Track Number: {metadata['first_track_number']}")
+            
+            # Track titles list (for split albums)
+            if metadata.get('track_titles') and isinstance(metadata.get('track_titles'), list):
+                track_titles = metadata.get('track_titles')
+                if len(track_titles) > 1:
+                    lines.append(f"\nTrack Titles ({len(track_titles)}):")
+                    for i, track_title in enumerate(track_titles[:10], 1):  # Show first 10
+                        lines.append(f"  {i}. {track_title}")
+                    if len(track_titles) > 10:
+                        lines.append(f"  ... and {len(track_titles) - 10} more")
+            
+            # URL type
+            if metadata.get('url_type'):
+                url_type = metadata['url_type']
+                if url_type == 'album':
+                    lines.append(f"Type: Album")
+                elif url_type == 'track':
+                    lines.append(f"Type: Track")
+                elif url_type == 'artist':
+                    lines.append(f"Type: Artist Page")
+            
+            # Format information
+            if metadata.get('detected_format'):
+                lines.append(f"Detected Format: {metadata['detected_format']}")
+            
+            # Thumbnail/Artwork
+            if metadata.get('thumbnail_url'):
+                lines.append(f"Artwork URL: {metadata['thumbnail_url']}")
+            
+            # Additional fields that might exist
+            if metadata.get('description'):
+                desc = metadata['description']
+                if desc and len(desc) > 0:
+                    # Show full description without truncation
+                    lines.append(f"\nDescription:\n{desc}")
+            
+            if lines:
+                metadata_content = '\n'.join(lines)
+            else:
+                metadata_content = "No metadata available yet.\n\nMetadata will appear here once it's been fetched from Bandcamp."
+        else:
+            metadata_content = "No metadata available yet.\n\nMetadata will appear here once it's been fetched from Bandcamp."
+        
+        metadata_text.insert('1.0', metadata_content)
+        # Make read-only but allow text selection for manual copying
+        metadata_text.config(state='normal')
+        
+        def prevent_edit(event):
+            # Allow selection and navigation keys
+            if event.keysym in ('Left', 'Right', 'Up', 'Down', 'Home', 'End', 'Prior', 'Next', 
+                              'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 
+                              'Alt_L', 'Alt_R', 'Meta_L', 'Meta_R'):
+                return None
+            # Allow Ctrl+C, Ctrl+A, Ctrl+V (for copy/paste/select all)
+            if event.state & 0x4 and event.keysym in ('c', 'C', 'a', 'A', 'v', 'V'):
+                return None
+            # Prevent all other modifications
+            return "break"
+        
+        metadata_text.bind('<Key>', prevent_edit)
+        
+        # Button row: Extract All Metadata and Close
+        button_row = Frame(frame, bg=colors.bg)
+        button_row.pack(fill=X, pady=(10, 0))
+        
+        # Extract All Metadata button
+        def extract_all_metadata():
+            """Extract comprehensive metadata using yt-dlp."""
+            if yt_dlp is None:
+                messagebox.showwarning("Metadata Extraction", "yt-dlp is not installed. Please install it to extract comprehensive metadata.")
+                return
+            
+            # Disable button during extraction
+            extract_btn.config(state='disabled', text="Extracting...")
+            metadata_text.config(state='normal')
+            metadata_text.delete('1.0', END)
+            metadata_text.insert('1.0', "Extracting comprehensive metadata...\n\nThis may take a few seconds.")
+            metadata_text.config(state='disabled')
+            dialog.update()
+            
+            def do_extraction():
+                try:
+                    # Use yt-dlp to extract comprehensive metadata
+                    ydl_opts = {
+                        "quiet": True,
+                        "no_warnings": True,
+                        "extract_flat": False,  # Get full metadata, not just flat
+                        "socket_timeout": 30,
+                        "retries": 3,
+                        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "referer": "https://bandcamp.com/",
+                    }
+                    
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
+                    
+                    if not info:
+                        self.root.after(0, lambda: self._update_metadata_dialog(dialog, metadata_text, extract_btn, url, colors, "Failed to extract metadata."))
+                        return
+                    
+                    # Extract all available fields
+                    all_metadata = {}
+                    
+                    # Basic info
+                    all_metadata['artist'] = info.get("artist") or info.get("uploader") or info.get("channel") or info.get("creator")
+                    all_metadata['album'] = info.get("album") or info.get("title")
+                    all_metadata['title'] = info.get("title")
+                    all_metadata['album_artist'] = info.get("album_artist") or info.get("albumartist") or all_metadata.get('artist')
+                    
+                    # Dates
+                    release_date = info.get("release_date") or info.get("upload_date")
+                    if release_date:
+                        all_metadata['date'] = release_date
+                        if len(release_date) >= 4:
+                            all_metadata['year'] = release_date[:4]
+                    
+                    # Classification
+                    all_metadata['genre'] = info.get("genre")
+                    all_metadata['label'] = info.get("label") or info.get("publisher")
+                    all_metadata['catalog_number'] = info.get("catalog_number") or info.get("catalognumber")
+                    
+                    # Track info
+                    entries = info.get("entries", [])
+                    if entries:
+                        all_metadata['track_count'] = len(entries)
+                        if entries:
+                            first_entry = entries[0]
+                            all_metadata['first_track_title'] = first_entry.get("title")
+                            all_metadata['first_track_number'] = first_entry.get("track_number") or first_entry.get("track")
+                            # Get all track titles
+                            track_titles = [e.get("title", "") for e in entries if e.get("title")]
+                            all_metadata['track_titles'] = track_titles
+                    
+                    # Additional fields
+                    all_metadata['description'] = info.get("description")
+                    all_metadata['thumbnail_url'] = (info.get("thumbnail") or 
+                                                    info.get("thumbnail_url") or 
+                                                    info.get("artwork_url") or
+                                                    info.get("cover"))
+                    all_metadata['detected_format'] = info.get("format") or info.get("ext")
+                    
+                    # Duration
+                    duration = info.get("duration")
+                    if duration:
+                        minutes = int(duration // 60)
+                        seconds = int(duration % 60)
+                        all_metadata['duration'] = f"{minutes}:{seconds:02d}"
+                    
+                    # Tags/categories
+                    tags = info.get("tags") or info.get("categories")
+                    if tags:
+                        if isinstance(tags, list):
+                            all_metadata['tags'] = ", ".join(str(t) for t in tags[:10])  # First 10 tags
+                        else:
+                            all_metadata['tags'] = str(tags)
+                    
+                    # License
+                    all_metadata['license'] = info.get("license")
+                    
+                    # Update dialog with comprehensive metadata
+                    self.root.after(0, lambda: self._update_metadata_dialog(dialog, metadata_text, extract_btn, url, colors, None, all_metadata))
+                    
+                except Exception as e:
+                    error_msg = f"Error extracting metadata: {str(e)}"
+                    self.root.after(0, lambda: self._update_metadata_dialog(dialog, metadata_text, extract_btn, url, colors, error_msg))
+            
+            # Run extraction in background thread
+            threading.Thread(target=do_extraction, daemon=True).start()
+        
+        extract_btn = Button(button_row, text="Extract All Metadata", command=extract_all_metadata,
+                             bg=colors.select_bg, fg=colors.fg, relief='flat', bd=0,
+                             padx=15, pady=5, cursor='hand2', font=("Segoe UI", 9),
+                             activebackground=colors.hover_bg, activeforeground=colors.fg)
+        extract_btn.pack(side=LEFT, padx=(0, 10))
+        
+        # Close button
+        close_btn = Button(button_row, text="Close", command=dialog.destroy,
+                          bg=colors.select_bg, fg=colors.fg, relief='flat', bd=0,
+                          padx=15, pady=5, cursor='hand2', font=("Segoe UI", 9),
+                          activebackground=colors.hover_bg, activeforeground=colors.fg)
+        close_btn.pack(side=RIGHT)
+        
+        # Center dialog
+        dialog.update_idletasks()
+        dialog_width = dialog.winfo_width()
+        dialog_height = dialog.winfo_height()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width // 2) - (dialog_width // 2)
+        y = (screen_height // 2) - (dialog_height // 2)
+        dialog.geometry(f"{dialog_width}x{dialog_height}+{x}+{y}")
+    
+    def _update_metadata_dialog(self, dialog, metadata_text, extract_btn, url, colors, error_msg=None, all_metadata=None):
+        """Update metadata dialog with comprehensive metadata or error message."""
+        metadata_text.config(state='normal')
+        metadata_text.delete('1.0', END)
+        
+        if error_msg:
+            metadata_text.insert('1.0', error_msg)
+        elif all_metadata:
+            lines = []
+            
+            # Basic information
+            if all_metadata.get('artist'):
+                lines.append(f"Artist: {all_metadata['artist']}")
+            if all_metadata.get('album'):
+                lines.append(f"Album: {all_metadata['album']}")
+            if all_metadata.get('title'):
+                lines.append(f"Title: {all_metadata['title']}")
+            if all_metadata.get('album_artist'):
+                lines.append(f"Album Artist: {all_metadata['album_artist']}")
+            
+            # Release information
+            if all_metadata.get('year'):
+                lines.append(f"Year: {all_metadata['year']}")
+            if all_metadata.get('date'):
+                lines.append(f"Release Date: {all_metadata['date']}")
+            
+            # Classification
+            if all_metadata.get('genre'):
+                lines.append(f"Genre: {all_metadata['genre']}")
+            if all_metadata.get('label'):
+                lines.append(f"Label: {all_metadata['label']}")
+            if all_metadata.get('catalog_number'):
+                lines.append(f"Catalog Number: {all_metadata['catalog_number']}")
+            if all_metadata.get('tags'):
+                lines.append(f"Tags: {all_metadata['tags']}")
+            if all_metadata.get('license'):
+                lines.append(f"License: {all_metadata['license']}")
+            
+            # Track information
+            if all_metadata.get('track_count'):
+                lines.append(f"Track Count: {all_metadata['track_count']}")
+            if all_metadata.get('first_track_title'):
+                lines.append(f"First Track: {all_metadata['first_track_title']}")
+            if all_metadata.get('first_track_number'):
+                lines.append(f"First Track Number: {all_metadata['first_track_number']}")
+            
+            # Track titles list
+            if all_metadata.get('track_titles') and isinstance(all_metadata.get('track_titles'), list):
+                track_titles = all_metadata.get('track_titles')
+                if track_titles:
+                    lines.append(f"\nTrack Titles ({len(track_titles)}):")
+                    for i, track_title in enumerate(track_titles[:20], 1):  # Show first 20
+                        lines.append(f"  {i}. {track_title}")
+                    if len(track_titles) > 20:
+                        lines.append(f"  ... and {len(track_titles) - 20} more")
+            
+            # Format and duration
+            if all_metadata.get('detected_format'):
+                lines.append(f"Detected Format: {all_metadata['detected_format']}")
+            if all_metadata.get('duration'):
+                lines.append(f"Duration: {all_metadata['duration']}")
+            
+            # Thumbnail/Artwork
+            if all_metadata.get('thumbnail_url'):
+                lines.append(f"Artwork URL: {all_metadata['thumbnail_url']}")
+            
+            # Description
+            if all_metadata.get('description'):
+                desc = all_metadata['description']
+                if desc and len(desc) > 0:
+                    # Show full description without truncation
+                    lines.append(f"\nDescription:\n{desc}")
+            
+            if lines:
+                metadata_text.insert('1.0', '\n'.join(lines))
+            else:
+                metadata_text.insert('1.0', "No metadata could be extracted.")
+        else:
+            metadata_text.insert('1.0', "No metadata available.")
+        
+        # Keep read-only but allow selection
+        def prevent_edit(event):
+            # Allow selection and navigation keys
+            if event.keysym in ('Left', 'Right', 'Up', 'Down', 'Home', 'End', 'Prior', 'Next', 
+                              'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 
+                              'Alt_L', 'Alt_R', 'Meta_L', 'Meta_R'):
+                return None
+            # Allow Ctrl+C, Ctrl+A, Ctrl+V (for copy/paste/select all)
+            if event.state & 0x4 and event.keysym in ('c', 'C', 'a', 'A', 'v', 'V'):
+                return None
+            # Prevent all other modifications
+            return "break"
+        
+        metadata_text.config(state='normal')
+        metadata_text.bind('<Key>', prevent_edit)
+        extract_btn.config(state='normal', text="Extract All Metadata")
+    
+    def _copy_tag_url(self, tag_id):
+        """Copy tag URL to clipboard."""
+        if tag_id not in self.url_tag_mapping:
+            return
+        
+        url = self.url_tag_mapping[tag_id]
+        
+        # Hide overlay immediately before clipboard operations to prevent flicker
+        # Clipboard operations can cause window updates that interfere with fade animation
+        # So we hide it first, then do clipboard operations
+        if self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id:
+            # Cancel any pending show/hide timers
+            if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
+                try:
+                    self.root.after_cancel(self._tag_overlay_show_timer)
+                except:
+                    pass
+                self._tag_overlay_show_timer = None
+            if hasattr(self, '_overlay_fade_timer') and self._overlay_fade_timer:
+                try:
+                    self.root.after_cancel(self._overlay_fade_timer)
+                except:
+                    pass
+                self._overlay_fade_timer = None
+            
+            # Start fade-out immediately
+            self._hide_tag_overlay(None)
+        
+        # Do clipboard operations after starting fade
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+    
+    def _delete_tag(self, tag_id):
+        """Delete tag from URL field while protecting surrounding tags."""
+        if tag_id not in self.url_tag_mapping or tag_id not in self.url_tag_positions:
+            return
+        
+        text_widget = self.url_text_widget
+        if not text_widget:
+            return
+        
+        start_pos, end_pos = self.url_tag_positions[tag_id]
+        
+        # Store cursor position before deletion
+        try:
+            cursor_pos = text_widget.index(INSERT)
+        except:
+            cursor_pos = None
+        
+        # Get the tag's display text to delete (including spaces)
+        try:
+            tag_text = text_widget.get(start_pos, end_pos)
+        except:
+            tag_text = ""
+        
+        # BEFORE deletion: Save all remaining tags' data using character indices (not widget positions)
+        # This protects them from position invalidation
+        content_before = text_widget.get('1.0', END).rstrip('\n')
+        remaining_tags_data = {}  # {tag_id: (start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color)}
+        
+        for other_tag_id, full_url in list(self.url_tag_mapping.items()):
+            if other_tag_id == tag_id:
+                continue  # Skip the tag we're deleting
+            
+            if other_tag_id in self.url_tag_positions:
+                other_start_pos, other_end_pos = self.url_tag_positions[other_tag_id]
+                try:
+                    # Convert widget positions to character indices (these are stable)
+                    content_before_start = text_widget.get('1.0', other_start_pos)
+                    start_char_idx = len(content_before_start.rstrip('\n'))
+                    content_before_end = text_widget.get('1.0', other_end_pos)
+                    end_char_idx = len(content_before_end.rstrip('\n'))
+                    
+                    # Get the tag display text
+                    tag_display = text_widget.get(other_start_pos, other_end_pos)
+                    
+                    # Get the tag's colors (preserve them)
+                    bg_color = None
+                    fg_color = None
+                    if other_tag_id in self.url_tag_colors:
+                        bg_color, fg_color = self.url_tag_colors[other_tag_id]
+                    else:
+                        # Fallback: get from tag config
+                        try:
+                            tag_name = f"url_tag_{other_tag_id}"
+                            bg_color = text_widget.tag_cget(tag_name, "background")
+                            fg_color = text_widget.tag_cget(tag_name, "foreground")
+                        except:
+                            pass
+                    
+                    # Verify the content at this position matches
+                    if start_char_idx < len(content_before) and end_char_idx <= len(content_before):
+                        content_at_pos = content_before[start_char_idx:end_char_idx]
+                        if content_at_pos == tag_display:
+                            # Store using character indices (stable across deletions) with colors
+                            remaining_tags_data[other_tag_id] = (start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color)
+                except Exception:
+                    # If we can't get the position, skip it - will be re-detected
+                    pass
+        
+        # Calculate deleted tag's character indices for cursor adjustment
+        try:
+            content_before_deleted = text_widget.get('1.0', start_pos)
+            deleted_start_char_idx = len(content_before_deleted.rstrip('\n'))
+            deleted_end_char_idx = deleted_start_char_idx + len(tag_text)
+        except:
+            deleted_start_char_idx = 0
+            deleted_end_char_idx = 0
+        
+        # Delete the tag text (this invalidates all widget positions)
+        text_widget.delete(start_pos, end_pos)
+        
+        # Remove the deleted tag from mappings
+        if tag_id in self.url_tag_mapping:
+            del self.url_tag_mapping[tag_id]
+        if tag_id in self.url_tag_positions:
+            del self.url_tag_positions[tag_id]
+        if tag_id in self.url_tag_colors:
+            del self.url_tag_colors[tag_id]
+        
+        # Remove all tag styling (will be recreated)
+        for existing_tag_id in list(self.url_tag_mapping.keys()):
+            try:
+                text_widget.tag_delete(f"url_tag_{existing_tag_id}")
+            except:
+                pass
+        
+        # Hide overlay
+        self._hide_tag_overlay(None)
+        
+        # Get content after deletion
+        content_after = text_widget.get('1.0', END).rstrip('\n')
+        
+        # Adjust remaining tags' character indices (subtract deleted length)
+        deleted_length = deleted_end_char_idx - deleted_start_char_idx
+        adjusted_remaining_tags = {}
+        for other_tag_id, tag_data in remaining_tags_data.items():
+            start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color = tag_data
+            if start_char_idx > deleted_end_char_idx:
+                # Tag comes after deleted tag - adjust positions
+                new_start = start_char_idx - deleted_length
+                new_end = end_char_idx - deleted_length
+                adjusted_remaining_tags[other_tag_id] = (new_start, new_end, full_url, tag_display, bg_color, fg_color)
+            elif end_char_idx <= deleted_start_char_idx:
+                # Tag comes before deleted tag - no adjustment needed
+                adjusted_remaining_tags[other_tag_id] = (start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color)
+            # If tag overlaps with deleted tag, skip it (shouldn't happen, but safety check)
+        
+        # Restore cursor position
+        if cursor_pos:
+            try:
+                content_before_cursor = text_widget.get('1.0', cursor_pos)
+                cursor_char_idx = len(content_before_cursor.rstrip('\n'))
+                
+                if cursor_char_idx >= deleted_end_char_idx:
+                    # Cursor was after deleted tag, adjust it
+                    new_cursor_char_idx = cursor_char_idx - deleted_length
+                    if new_cursor_char_idx >= 0:
+                        # Convert back to widget position
+                        new_cursor_pos = text_widget.index(f'1.0 + {new_cursor_char_idx} chars')
+                        text_widget.mark_set(INSERT, new_cursor_pos)
+                elif cursor_char_idx > deleted_start_char_idx:
+                    # Cursor was within deleted tag, move to start of deletion
+                    new_cursor_pos = text_widget.index(f'1.0 + {deleted_start_char_idx} chars')
+                    text_widget.mark_set(INSERT, new_cursor_pos)
+            except:
+                pass
+        
+        # Temporarily store adjusted tag data so _process_url_tags can use it
+        # We'll inject this into the existing_tag_data in _process_url_tags
+        self._pending_tag_restore = adjusted_remaining_tags
+        
+        # Reprocess tags - this will restore the remaining tags using our saved data
+        self.root.after(10, self._process_url_tags_with_restore)
+    
+    def _paste_from_overlay(self, tag_id):
+        """Paste from overlay menu - same as ➕ paste button for convenience/accessibility."""
+        # Hide overlay first to prevent flicker
+        if self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id:
+            # Cancel any pending show/hide timers
+            if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
+                try:
+                    self.root.after_cancel(self._tag_overlay_show_timer)
+                except:
+                    pass
+                self._tag_overlay_show_timer = None
+            if hasattr(self, '_overlay_fade_timer') and self._overlay_fade_timer:
+                try:
+                    self.root.after_cancel(self._overlay_fade_timer)
+                except:
+                    pass
+                self._overlay_fade_timer = None
+            
+            # Start fade-out immediately
+            self._hide_tag_overlay(None)
+        
+        # Use the same paste handler as the ➕ button
+        self._handle_paste_button_Click()
+    
+    def _paste_replace_tag(self, tag_id):
+        """Replace tag with URL from clipboard while protecting surrounding tags."""
+        if tag_id not in self.url_tag_mapping or tag_id not in self.url_tag_positions:
+            return
+        
+        text_widget = self.url_text_widget
+        if not text_widget:
+            return
+        
+        # Get clipboard content
+        try:
+            clipboard_text = self.root.clipboard_get()
+        except:
+            return
+        
+        # Extract URLs from clipboard (handle multiple URLs)
+        import re
+        urls = re.findall(r'https?://[^\s<>"{}|\\^`\[\]]+', clipboard_text)
+        
+        if not urls:
+            return
+        
+        # Use first URL if multiple
+        new_url = urls[0].strip()
+        
+        # Validate URL
+        if "bandcamp.com" not in new_url.lower():
+            # Still allow it, but could add validation here
+            pass
+        
+        start_pos, end_pos = self.url_tag_positions[tag_id]
+        
+        # Store cursor position before changes
+        try:
+            cursor_pos = text_widget.index(INSERT)
+        except:
+            cursor_pos = None
+        
+        # Get the old tag's display text
+        try:
+            old_tag_text = text_widget.get(start_pos, end_pos)
+        except:
+            old_tag_text = ""
+        
+        # BEFORE replacement: Save ALL tags' data using character indices (not widget positions)
+        # This protects them from position invalidation, including the tag being replaced
+        content_before = text_widget.get('1.0', END).rstrip('\n')
+        remaining_tags_data = {}  # {tag_id: (start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color)}
+        
+        # Get the original tag's color FIRST (before we might lose it)
+        original_bg_color = None
+        original_fg_color = None
+        if tag_id in self.url_tag_colors:
+            original_bg_color, original_fg_color = self.url_tag_colors[tag_id]
+        else:
+            # Fallback: get from tag config
+            try:
+                tag_name = f"url_tag_{tag_id}"
+                original_bg_color = text_widget.tag_cget(tag_name, "background")
+                original_fg_color = text_widget.tag_cget(tag_name, "foreground")
+            except:
+                pass
+        
+        for other_tag_id, full_url in list(self.url_tag_mapping.items()):
+            # Include ALL tags (including the one being replaced) to preserve their colors
+            if other_tag_id in self.url_tag_positions:
+                other_start_pos, other_end_pos = self.url_tag_positions[other_tag_id]
+                try:
+                    # Convert widget positions to character indices (these are stable)
+                    content_before_start = text_widget.get('1.0', other_start_pos)
+                    start_char_idx = len(content_before_start.rstrip('\n'))
+                    content_before_end = text_widget.get('1.0', other_end_pos)
+                    end_char_idx = len(content_before_end.rstrip('\n'))
+                    
+                    # Get the tag display text
+                    tag_display = text_widget.get(other_start_pos, other_end_pos)
+                    
+                    # Get the tag's colors (preserve them)
+                    bg_color = None
+                    fg_color = None
+                    if other_tag_id in self.url_tag_colors:
+                        bg_color, fg_color = self.url_tag_colors[other_tag_id]
+                    else:
+                        # Fallback: get from tag config
+                        try:
+                            tag_name = f"url_tag_{other_tag_id}"
+                            bg_color = text_widget.tag_cget(tag_name, "background")
+                            fg_color = text_widget.tag_cget(tag_name, "foreground")
+                        except:
+                            pass
+                    
+                    # Verify the content at this position matches
+                    if start_char_idx < len(content_before) and end_char_idx <= len(content_before):
+                        content_at_pos = content_before[start_char_idx:end_char_idx]
+                        if content_at_pos == tag_display:
+                            # Store using character indices (stable across replacements)
+                            remaining_tags_data[other_tag_id] = (start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color)
+                except Exception:
+                    # If we can't get the position, skip it - will be re-detected
+                    pass
+        
+        # Calculate replaced tag's character indices
+        try:
+            content_before_replaced = text_widget.get('1.0', start_pos)
+            replaced_start_char_idx = len(content_before_replaced.rstrip('\n'))
+            replaced_end_char_idx = replaced_start_char_idx + len(old_tag_text)
+        except:
+            replaced_start_char_idx = 0
+            replaced_end_char_idx = 0
+        
+        # Delete old tag text and insert new URL
+        text_widget.delete(start_pos, end_pos)
+        text_widget.insert(start_pos, new_url)
+        
+        # Calculate length difference
+        old_length = len(old_tag_text)
+        new_length = len(new_url)
+        length_diff = new_length - old_length
+        
+        # Remove the replaced tag from mappings (but preserve color for new tag)
+        if tag_id in self.url_tag_mapping:
+            del self.url_tag_mapping[tag_id]
+        if tag_id in self.url_tag_positions:
+            del self.url_tag_positions[tag_id]
+        # Don't delete from url_tag_colors yet - we'll use it for the new tag
+        
+        # Remove all tag styling (will be recreated)
+        for existing_tag_id in list(self.url_tag_mapping.keys()):
+            try:
+                text_widget.tag_delete(f"url_tag_{existing_tag_id}")
+            except:
+                pass
+        
+        # Hide overlay
+        self._hide_tag_overlay(None)
+        
+        # Get content after replacement
+        content_after = text_widget.get('1.0', END).rstrip('\n')
+        
+        # Adjust remaining tags' character indices (add/subtract length difference)
+        adjusted_remaining_tags = {}
+        for other_tag_id, tag_data in remaining_tags_data.items():
+            start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color = tag_data
+            if start_char_idx > replaced_end_char_idx:
+                # Tag comes after replaced tag - adjust positions
+                new_start = start_char_idx + length_diff
+                new_end = end_char_idx + length_diff
+                adjusted_remaining_tags[other_tag_id] = (new_start, new_end, full_url, tag_display, bg_color, fg_color)
+            elif end_char_idx <= replaced_start_char_idx:
+                # Tag comes before replaced tag - no adjustment needed
+                adjusted_remaining_tags[other_tag_id] = (start_char_idx, end_char_idx, full_url, tag_display, bg_color, fg_color)
+            # If tag overlaps with replaced tag, skip it (shouldn't happen, but safety check)
+        
+        # Add the replaced tag to restoration data with new URL but original color
+        # This ensures the new tag gets the original color
+        new_tag_start_char_idx = replaced_start_char_idx
+        new_tag_end_char_idx = replaced_start_char_idx + new_length
+        # Use a temporary tag_id for the new tag (will be assigned during processing)
+        # Store it with the new URL but original color - use position-based matching
+        if original_bg_color and original_fg_color:
+            # Store in adjusted_remaining_tags with a special marker
+            # We'll use position-based matching in _process_url_tags_with_restore
+            adjusted_remaining_tags[tag_id] = (new_tag_start_char_idx, new_tag_end_char_idx, new_url, new_url, original_bg_color, original_fg_color)
+        
+        # Restore cursor position
+        if cursor_pos:
+            try:
+                content_before_cursor = text_widget.get('1.0', cursor_pos)
+                cursor_char_idx = len(content_before_cursor.rstrip('\n'))
+                
+                if cursor_char_idx >= replaced_end_char_idx:
+                    # Cursor was after replaced tag, adjust it
+                    new_cursor_char_idx = cursor_char_idx + length_diff
+                    if new_cursor_char_idx >= 0:
+                        # Convert back to widget position
+                        new_cursor_pos = text_widget.index(f'1.0 + {new_cursor_char_idx} chars')
+                        text_widget.mark_set(INSERT, new_cursor_pos)
+                elif cursor_char_idx > replaced_start_char_idx:
+                    # Cursor was within replaced tag, move to end of new URL
+                    new_cursor_pos = text_widget.index(f'1.0 + {replaced_start_char_idx + new_length} chars')
+                    text_widget.mark_set(INSERT, new_cursor_pos)
+            except:
+                pass
+        
+        # Temporarily store adjusted tag data so _process_url_tags can use it
+        self._pending_tag_restore = adjusted_remaining_tags
+        
+        # Reprocess tags - this will restore the remaining tags and create a new tag for the new URL
+        self.root.after(10, self._process_url_tags_with_restore)
+        
+        # Trigger URL check to fetch metadata and update preview for the new URL
+        self.root.after(50, self._check_url)
     
     def _remove_url_tag(self, tag_id):
         """Remove a URL tag when backspace/delete is used.
@@ -7165,6 +8952,7 @@ class BandcampDownloaderGUI:
                 artist = None
                 album = None
                 year = None
+                album_artist = None  # Main album artist (for compilations)
                 
                 # Extract artist - look for various patterns (ordered by reliability)
                 artist_patterns = [
@@ -7366,7 +9154,8 @@ class BandcampDownloaderGUI:
                     "thumbnail_url": None,
                     "year": year,
                     "first_track_title": first_track_title,
-                    "first_track_number": first_track_number
+                    "first_track_number": first_track_number,
+                    "album_artist": album_artist or artist  # Main album artist
                 }
                 self.url_metadata_cache[normalized_url] = metadata
                 # Also store in tag metadata cache (only HTML extraction, stage 1)
@@ -7382,7 +9171,8 @@ class BandcampDownloaderGUI:
                         "year": year,  # Store year if found
                         "first_track_title": first_track_title,  # Store first track title if found
                         "first_track_number": first_track_number,  # Store first track number if found
-                        "track_titles": [first_track_title] if first_track_title else []  # Store track titles for split album detection
+                        "track_titles": [first_track_title] if first_track_title else [],  # Store track titles for split album detection
+                        "album_artist": album_artist or artist or "Artist"  # Main album artist
                     }
                     self.root.after(0, self.update_preview)
                     # Also update Additional Settings dialog preview if open
@@ -7544,10 +9334,12 @@ class BandcampDownloaderGUI:
                                            info.get("artwork_url") or
                                            info.get("cover"))
                     
-                    # Extract track titles and numbers from entries if available (for split album detection)
+                    # Extract track titles and numbers from entries if available
                     first_track_title = None
                     first_track_number = None
                     track_titles = []  # Store multiple track titles for split album detection
+                    album_artist_from_ytdlp = None  # Album artist from yt-dlp metadata
+                    
                     if info.get("entries"):
                         entries = [e for e in info.get("entries", []) if e]  # Filter out None
                         if entries:
@@ -7585,6 +9377,12 @@ class BandcampDownloaderGUI:
                                 raw_title = entry.get("title", "")
                                 if raw_title:
                                     track_titles.append(raw_title)
+                    
+                    # Get album_artist from top-level info (if available)
+                    album_artist_from_ytdlp = (info.get("album_artist") or 
+                                             info.get("albumartist") or
+                                             info.get("artist") or  # Fallback to main artist
+                                             artist)
                     
                     # Update album info (keep "Track" as placeholder) - preserve HTML extraction results
                     # Only update artist/album if:
@@ -7657,6 +9455,10 @@ class BandcampDownloaderGUI:
                             # Keep existing track titles if available
                             final_track_titles = existing_track_titles
                         
+                        # Store album_artist (prefer HTML extraction, fallback to yt-dlp)
+                        existing_album_artist = self.album_info.get("album_artist")
+                        final_album_artist = existing_album_artist or album_artist_from_ytdlp
+                        
                         self.album_info = {
                             "artist": final_artist,
                             "album": final_album,
@@ -7665,8 +9467,10 @@ class BandcampDownloaderGUI:
                             "year": year or self.album_info.get("year"),  # Store year if found
                             "first_track_title": final_first_track_title,  # Store first track title
                             "first_track_number": final_first_track_number,  # Store first track number
-                            "track_titles": final_track_titles  # Store multiple track titles for split album detection
+                            "track_titles": final_track_titles,  # Store multiple track titles for split album detection
+                            "album_artist": final_album_artist  # Main album artist
                         }
+                        
                         self.root.after(0, self.update_preview)
                         # Also update Additional Settings dialog preview if open
                         if hasattr(self, '_additional_settings_dialogs'):
@@ -8286,8 +10090,9 @@ class BandcampDownloaderGUI:
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
                 
-                # Resize to fit canvas (150x150) while maintaining aspect ratio
-                img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
+                # Using 167x167 to maximize size while ensuring no cutoff
+                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -8306,22 +10111,15 @@ class BandcampDownloaderGUI:
                     # Clear canvas
                     self.album_art_canvas.delete("all")
                     
-                    # Calculate position to center the image
-                    img_width = photo.width()
-                    img_height = photo.height()
-                    
                     # Create blurred background if image doesn't fill the canvas
                     blurred_bg = self._create_blurred_background(img)
                     if blurred_bg:
                         # Draw blurred background first (fills entire canvas)
-                        self.album_art_canvas.create_image(75, 75, image=blurred_bg, anchor='center')
+                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
                     
-                    # Calculate center position for original image
-                    x = (150 - img_width) // 2
-                    y = (150 - img_height) // 2
-                    
-                    # Display original image on top (centered)
-                    self.album_art_canvas.create_image(x + img_width // 2, y + img_height // 2, image=photo, anchor='center')
+                    # Display original image centered (anchor='center' means x,y is the center point)
+                    # Canvas center is 84, 84 (half of 168x168) - this centers both horizontally and vertically
+                    self.album_art_canvas.create_image(84, 84, image=photo, anchor='center')
                     
                     # Keep references to prevent garbage collection
                     self.album_art_image = photo
@@ -8346,7 +10144,7 @@ class BandcampDownloaderGUI:
                 if fetch_id == self.artwork_fetch_id:
                     self.root.after(0, lambda: self.album_art_canvas.delete("all"))
                     self.root.after(0, lambda: self.album_art_canvas.create_text(
-                        75, 75, text="PIL required\nfor bio pic\n\nInstall Pillow:\npip install Pillow", 
+                        84, 84, text="PIL required\nfor bio pic\n\nInstall Pillow:\npip install Pillow", 
                         fill='#808080', font=("Segoe UI", 7), justify='center'
                     ))
                 def reset_flag():
@@ -8457,8 +10255,9 @@ class BandcampDownloaderGUI:
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
                 
-                # Resize to fit canvas (150x150) while maintaining aspect ratio
-                img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
+                # Using 167x167 to maximize size while ensuring no cutoff
+                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -8477,22 +10276,15 @@ class BandcampDownloaderGUI:
                     # Clear canvas
                     self.album_art_canvas.delete("all")
                     
-                    # Calculate position to center the image
-                    img_width = photo.width()
-                    img_height = photo.height()
-                    
                     # Create blurred background if image doesn't fill the canvas
                     blurred_bg = self._create_blurred_background(img)
                     if blurred_bg:
                         # Draw blurred background first (fills entire canvas)
-                        self.album_art_canvas.create_image(75, 75, image=blurred_bg, anchor='center')
+                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
                     
-                    # Calculate center position for original image
-                    x = (150 - img_width) // 2
-                    y = (150 - img_height) // 2
-                    
-                    # Display original image on top (centered)
-                    self.album_art_canvas.create_image(x + img_width // 2, y + img_height // 2, image=photo, anchor='center')
+                    # Display original image centered (anchor='center' means x,y is the center point)
+                    # Canvas center is 84, 84 (half of 168x168) - this centers both horizontally and vertically
+                    self.album_art_canvas.create_image(84, 84, image=photo, anchor='center')
                     
                     # Keep references to prevent garbage collection
                     self.album_art_image = photo
@@ -8517,7 +10309,7 @@ class BandcampDownloaderGUI:
                 if fetch_id == self.artwork_fetch_id:  # Only update if still current
                     self.root.after(0, lambda: self.album_art_canvas.delete("all"))
                     self.root.after(0, lambda: self.album_art_canvas.create_text(
-                        75, 75, text="PIL required\nfor album art\n\nInstall Pillow:\npip install Pillow", 
+                        84, 84, text="PIL required\nfor album art\n\nInstall Pillow:\npip install Pillow", 
                         fill='#808080', font=("Segoe UI", 7), justify='center'
                     ))
                 # Always reset flag after error
@@ -8568,8 +10360,9 @@ class BandcampDownloaderGUI:
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
                 
-                # Resize to fit canvas (150x150) while maintaining aspect ratio
-                img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
+                # Using 167x167 to maximize size while ensuring no cutoff
+                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -8593,10 +10386,10 @@ class BandcampDownloaderGUI:
         threading.Thread(target=preload, daemon=True).start()
     
     def _create_blurred_background(self, img):
-        """Create a blurred background version of an image that fills the entire 150x150 canvas.
+        """Create a blurred background version of an image that fills the entire 166x166 canvas.
         
         Args:
-            img: PIL Image object (already resized to fit within 150x150)
+            img: PIL Image object (already resized to fit within 166x166)
             
         Returns:
             PhotoImage of the blurred background, or None if image already fills canvas
@@ -8604,13 +10397,13 @@ class BandcampDownloaderGUI:
         try:
             from PIL import Image, ImageFilter, ImageTk
             
-            # Check if image already fills the canvas (square and 150x150)
-            if img.width == 150 and img.height == 150:
+            # Check if image already fills the canvas (square and 165x165)
+            if img.width == 165 and img.height == 165:
                 return None  # No blur needed
             
             # Create a copy and scale to fill the entire canvas (crop center if needed)
             # Use a larger size first to maintain quality, then resize down
-            canvas_size = 150
+            canvas_size = 166
             
             # Calculate scale factor to fill canvas (crop to center)
             scale_w = canvas_size / img.width
@@ -8622,7 +10415,7 @@ class BandcampDownloaderGUI:
             new_height = int(img.height * scale)
             blurred_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
             
-            # Crop to center 150x150 if needed
+            # Crop to center 168x168 if needed
             if new_width > canvas_size or new_height > canvas_size:
                 left = (new_width - canvas_size) // 2
                 top = (new_height - canvas_size) // 2
@@ -8667,7 +10460,7 @@ class BandcampDownloaderGUI:
             else:
                 placeholder_text = "Album Art"
             self.album_art_canvas.create_text(
-                75, 75,
+                84, 84,
                 text=placeholder_text,
                 fill='#808080',
                 font=("Segoe UI", 8)
@@ -8726,8 +10519,6 @@ class BandcampDownloaderGUI:
                 if self.preloaded_album_art_image:
                     # Display preloaded image immediately
                     self.album_art_canvas.delete("all")
-                    img_width = self.preloaded_album_art_image.width()
-                    img_height = self.preloaded_album_art_image.height()
                     
                     # Create blurred background if image doesn't fill the canvas
                     blurred_bg = None
@@ -8736,14 +10527,11 @@ class BandcampDownloaderGUI:
                     
                     if blurred_bg:
                         # Draw blurred background first (fills entire canvas)
-                        self.album_art_canvas.create_image(75, 75, image=blurred_bg, anchor='center')
+                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
                     
-                    # Calculate center position for original image
-                    x = (150 - img_width) // 2
-                    y = (150 - img_height) // 2
-                    
-                    # Display original image on top (centered)
-                    self.album_art_canvas.create_image(x + img_width // 2, y + img_height // 2, 
+                    # Display original image centered (anchor='center' means x,y is the center point)
+                    # Canvas center is 84, 84 (half of 168x168) - this centers both horizontally and vertically
+                    self.album_art_canvas.create_image(84, 84, 
                                                        image=self.preloaded_album_art_image, anchor='center')
                     
                     # Use preloaded image as current image
@@ -9204,9 +10992,10 @@ class BandcampDownloaderGUI:
         base_format = self._extract_format(format_val)
         self.save_format()  # Save format preference
         
-        # Show/hide format conversion warning (for FLAC, OGG, WAV - formats that are converted)
+        # Show/hide format conversion warning (for FLAC, WAV - formats that are converted)
+        # OGG is excluded - it has its own warning about cover art
         if hasattr(self, 'format_conversion_warning_label'):
-            if base_format in ["flac", "ogg", "wav"]:
+            if base_format in ["flac", "wav"]:
                 self.format_conversion_warning_label.grid()
             else:
                 self.format_conversion_warning_label.grid_remove()
@@ -10062,9 +11851,16 @@ class BandcampDownloaderGUI:
             # Build path from custom structure
             path_parts = [base_folder]
             
+            # Check if we should use album_artist instead of artist
+            use_album_artist = False
+            if hasattr(self, 'prefer_album_artist_for_folders_var') and self.prefer_album_artist_for_folders_var.get():
+                album_artist = self.album_info.get("album_artist")
+                if album_artist:
+                    use_album_artist = True
+            
             # Field to template mapping
             field_templates = {
-                "Artist": "%(artist)s",
+                "Artist": "%(album_artist)s" if use_album_artist else "%(artist)s",
                 "Album": "%(album)s",
                 "Year": "%(release_date>%Y)s",  # Extract year from release_date
                 "Genre": "%(genre)s",
@@ -10143,12 +11939,20 @@ class BandcampDownloaderGUI:
                     return str(Path(*path_parts))
         
         # Fallback to old hardcoded options
+        # Check if we should use album_artist instead of artist
+        use_album_artist = False
+        if hasattr(self, 'prefer_album_artist_for_folders_var') and self.prefer_album_artist_for_folders_var.get():
+            album_artist = self.album_info.get("album_artist") if hasattr(self, 'album_info') else None
+            if album_artist:
+                use_album_artist = True
+        
+        artist_template = "%(album_artist)s" if use_album_artist else "%(artist)s"
         folder_options = {
             "1": str(base_folder / "%(title)s.%(ext)s"),
             "2": str(base_folder / "%(album)s" / "%(title)s.%(ext)s"),
-            "3": str(base_folder / "%(artist)s" / "%(title)s.%(ext)s"),
-            "4": str(base_folder / "%(artist)s" / "%(album)s" / "%(title)s.%(ext)s"),
-            "5": str(base_folder / "%(album)s" / "%(artist)s" / "%(title)s.%(ext)s"),
+            "3": str(base_folder / artist_template / "%(title)s.%(ext)s"),
+            "4": str(base_folder / artist_template / "%(album)s" / "%(title)s.%(ext)s"),
+            "5": str(base_folder / "%(album)s" / artist_template / "%(title)s.%(ext)s"),
         }
         return folder_options.get(choice, folder_options["4"])
     
@@ -12504,12 +14308,12 @@ class BandcampDownloaderGUI:
                         "add_metadata": True,
                     },
                 ]
-            elif format_val == "ogg":
+            elif base_format == "ogg":
                 postprocessors = [
                     {
                         "key": "FFmpegExtractAudio",
                         "preferredcodec": "vorbis",
-                        "preferredquality": "9",  # High quality, but still converted from 128kbps source
+                        "preferredquality": "9",  # High quality Vorbis encoding
                     },
                     {
                         "key": "FFmpegMetadata",
@@ -12534,6 +14338,16 @@ class BandcampDownloaderGUI:
                 if self.is_cancelling:
                     return "Cancelled by user"
                 return None  # None means accept the entry
+            
+            # Add album_artist to track metadata if setting is enabled
+            def modifyinfo(info):
+                """Modify track info to add album_artist if setting is enabled."""
+                if hasattr(self, 'prefer_album_artist_for_folders_var') and self.prefer_album_artist_for_folders_var.get():
+                    album_artist = self.album_info.get("album_artist") if hasattr(self, 'album_info') else None
+                    if album_artist:
+                        # Add album_artist to track metadata so it's available in outtmpl
+                        info['album_artist'] = album_artist
+                return info
             
             # yt-dlp options
             # Enhanced options for restricted networks (better user agent, retries, timeouts)
@@ -12563,6 +14377,7 @@ class BandcampDownloaderGUI:
                 "noprogress": False,  # Keep progress enabled so hooks are called frequently
                 "progress_hooks": [self.progress_hook],
                 "match_filter": match_filter,  # Reject entries when cancelling
+                "modifyinfo": modifyinfo,  # Add album_artist to track metadata
                 # Enhanced network options for restricted networks
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "referer": "https://bandcamp.com/",
@@ -12915,12 +14730,12 @@ class BandcampDownloaderGUI:
                         "add_metadata": True,
                     },
                 ]
-            elif format_val == "ogg":
+            elif base_format == "ogg":
                 postprocessors = [
                     {
                         "key": "FFmpegExtractAudio",
                         "preferredcodec": "vorbis",
-                        "preferredquality": "9",  # High quality, but still converted from 128kbps source
+                        "preferredquality": "9",  # High quality Vorbis encoding
                     },
                     {
                         "key": "FFmpegMetadata",
@@ -12945,6 +14760,16 @@ class BandcampDownloaderGUI:
                 if self.is_cancelling:
                     return "Cancelled by user"
                 return None  # None means accept the entry
+            
+            # Add album_artist to track metadata if setting is enabled
+            def modifyinfo(info):
+                """Modify track info to add album_artist if setting is enabled."""
+                if hasattr(self, 'prefer_album_artist_for_folders_var') and self.prefer_album_artist_for_folders_var.get():
+                    album_artist = self.album_info.get("album_artist") if hasattr(self, 'album_info') else None
+                    if album_artist:
+                        # Add album_artist to track metadata so it's available in outtmpl
+                        info['album_artist'] = album_artist
+                return info
             
             # yt-dlp options
             # Enhanced options for restricted networks (better user agent, retries, timeouts)
@@ -12974,6 +14799,7 @@ class BandcampDownloaderGUI:
                 "noprogress": False,  # Keep progress enabled so hooks are called frequently
                 "progress_hooks": [self.progress_hook],
                 "match_filter": match_filter,  # Reject entries when cancelling
+                "modifyinfo": modifyinfo,  # Add album_artist to track metadata
                 # Enhanced network options for restricted networks
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "referer": "https://bandcamp.com/",
@@ -13377,6 +15203,10 @@ class BandcampDownloaderGUI:
             for ext in self.FORMAT_EXTENSIONS.get(format_val, []):
                 existing_files_before.update(base_path.rglob(f"*{ext}"))
         
+        # Store format info for progress hook to correct filename extensions after postprocessing
+        self.current_download_base_format = base_format
+        self.current_download_format_val = format_val
+        
         # Download (store instance for cancellation)
         # Track if progress hooks were called (to detect silent failures)
         self.progress_hooks_called = False
@@ -13464,10 +15294,35 @@ class BandcampDownloaderGUI:
                     self.ydl_instance = None
                     return False
                 
+                error_msg = str(e)
+                error_lower = error_msg.lower()
+                
+                # Detect rate limiting / antispam (HTTP 429 or similar)
+                is_rate_limit = (
+                    "429" in error_msg or
+                    "too many requests" in error_lower or
+                    "rate limit" in error_lower or
+                    "antispam" in error_lower or
+                    "http error 429" in error_lower
+                )
+                
                 # If this is a retry attempt, try again
                 if download_attempt < max_download_retries:
-                    self.root.after(0, lambda err=str(e), attempt=download_attempt: self.log(f"DEBUG: Download error on attempt {attempt + 1}, will retry: {err[:100]}"))
+                    if is_rate_limit:
+                        # Enhanced backoff for rate limits: exponential with longer base delay
+                        # 5s, 10s, 20s, 40s (more aggressive than normal errors)
+                        retry_delay = 5.0 * (2.0 ** download_attempt)
+                        self.root.after(0, lambda delay=retry_delay, attempt=download_attempt: 
+                            self.log(f"⚠ Rate limited by Bandcamp. Waiting {delay:.1f}s before retry {attempt + 2}/{max_download_retries + 1}..."))
+                    else:
+                        # Existing backoff for all other errors (unchanged)
+                        retry_delay = 2.0 * download_attempt
+                        self.root.after(0, lambda err=error_msg[:100], attempt=download_attempt: 
+                            self.log(f"DEBUG: Download error on attempt {attempt + 1}, will retry: {err}"))
+                    
+                    time.sleep(retry_delay)
                     continue
+                
                 # Final attempt failed
                 self.ydl_instance = None
                 error_msg = str(e)
@@ -13505,6 +15360,12 @@ class BandcampDownloaderGUI:
         
         # Clear instance after download
         self.ydl_instance = None
+        
+        # Clear format info stored for progress hook
+        if hasattr(self, 'current_download_base_format'):
+            delattr(self, 'current_download_base_format')
+        if hasattr(self, 'current_download_format_val'):
+            delattr(self, 'current_download_format_val')
         
         # Check if cancelled - if so, exit early
         if self.is_cancelling:
@@ -13668,7 +15529,6 @@ class BandcampDownloaderGUI:
                     # Extract album folder from filename path
                     if filename:
                         try:
-                            from pathlib import Path
                             file_path = Path(filename)
                             # Get the album folder based on folder structure
                             # Structure 1: Root/Track.mp3 (no album folder)
@@ -13975,6 +15835,30 @@ class BandcampDownloaderGUI:
                 # Update track counter when a track finishes
                 filename = d.get('filename', '')
                 if filename:
+                    # Correct filename extension if postprocessing changed it (e.g., .mp3 -> .ogg)
+                    # yt-dlp reports the original filename in progress hook, but postprocessor changes extension
+                    if hasattr(self, 'current_download_base_format') and self.current_download_base_format:
+                        base_format = self.current_download_base_format
+                        if base_format in ["ogg", "flac", "wav"]:
+                            # Postprocessor converts to these formats, so update extension
+                            file_path = Path(filename)
+                            if base_format == "ogg":
+                                corrected_filename = str(file_path.with_suffix('.ogg'))
+                            elif base_format == "flac":
+                                corrected_filename = str(file_path.with_suffix('.flac'))
+                            elif base_format == "wav":
+                                corrected_filename = str(file_path.with_suffix('.wav'))
+                            else:
+                                corrected_filename = filename
+                            
+                            # Use corrected filename if it exists, otherwise use original
+                            if Path(corrected_filename).exists():
+                                filename = corrected_filename
+                            else:
+                                # File might not exist yet (postprocessing in progress), but use corrected name anyway
+                                # The file verification will handle checking if it exists
+                                filename = corrected_filename
+                    
                     # Ensure downloaded_files set exists (should be initialized in download_single_album)
                     if not hasattr(self, 'downloaded_files'):
                         self.downloaded_files = set()
@@ -13987,7 +15871,6 @@ class BandcampDownloaderGUI:
                 album_changed = False
                 if self.is_discography_mode and filename:
                     try:
-                        from pathlib import Path
                         file_path = Path(filename)
                         current_album_path = None
                         
@@ -14162,6 +16045,13 @@ class BandcampDownloaderGUI:
             pass
         
         return None
+    
+    def _check_and_log_launcher_update_status(self):
+        """Check for launcher update status and log it (combined for efficiency)."""
+        # Check for update status (deferred from startup for performance)
+        self.pending_update_status = self._check_launcher_update_status()
+        if self.pending_update_status:
+            self._log_launcher_update_status()
     
     def _log_launcher_update_status(self):
         """Log launcher update status to the GUI log."""
