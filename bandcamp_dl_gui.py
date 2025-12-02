@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.2.8"
+__version__ = "1.2.9"
 
 import sys
 import subprocess
@@ -41,7 +41,7 @@ import html
 from pathlib import Path
 from tkinter import (
     Tk, Toplevel, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, LEFT, RIGHT, X, Y, END, WORD, BOTH,
-    Frame, Label, Canvas, Checkbutton, Menu, Entry, Button, Listbox, EXTENDED, INSERT, Text
+    Frame, Label, Canvas, Checkbutton, Menu, Entry, Button, Listbox, EXTENDED, INSERT, Text, TclError
 )
 
 # yt-dlp will be imported after checking if it's installed
@@ -105,7 +105,8 @@ class ThinProgressBar:
             current_width = self.canvas.winfo_width()
             if current_width > 1:
                 self._width = current_width
-        except:
+        except (TclError, RuntimeError):
+            # Widget may be destroyed or not yet mapped
             pass
         
         if self.maximum > 0 and self._width > 0:
@@ -128,12 +129,67 @@ class ThinProgressBar:
         """Check if widget is viewable (compatible with ttk.Progressbar interface)."""
         try:
             return self.canvas.winfo_viewable()
-        except:
+        except (TclError, RuntimeError):
+            # Widget may be destroyed
             return False
 
 
+class ThemeColors:
+    """Color palette for application themes."""
+    def __init__(self, mode='dark'):
+        if mode == 'dark':
+            # Dark mode - preserve exact existing colors
+            self.bg = '#1E1E1E'  # Very dark background (consistent everywhere)
+            self.fg = '#D4D4D4'  # Soft light text
+            self.select_bg = '#252526'  # Slightly lighter for inputs only
+            self.select_fg = '#FFFFFF'
+            self.entry_bg = '#252526'  # Dark input background
+            self.entry_fg = '#CCCCCC'  # Light input text
+            self.border = '#3E3E42'  # Subtle borders
+            self.accent = '#007ACC'  # Blue accent (more modern than green)
+            self.success = '#2dacd5'  # Bandcamp blue for success/preview
+            self.hover_bg = '#3E3E42'  # Hover state
+            self.hover_fg = '#D4D4D4'  # Hover text
+            self.disabled_fg = '#808080'  # Disabled text
+            self.warning = '#FFA500'  # Orange for warnings
+            self.preview_link = '#2dacd5'  # Preview link color
+            self.preview_link_hover = '#4FC3F7'  # Preview link hover
+        elif mode == 'light':
+            # Light mode - modern Windows light mode aesthetic
+            self.bg = '#F0F0F0'  # Light gray app background
+            self.fg = '#1E1E1E'  # Dark text
+            self.select_bg = '#FFFFFF'  # White for section backgrounds
+            self.select_fg = '#1E1E1E'  # Dark text
+            self.entry_bg = '#F5F5F5'  # Light gray input background
+            self.entry_fg = '#1E1E1E'  # Dark input text
+            self.border = '#D0D0D0'  # Medium gray borders (consistent for all sections)
+            self.accent = '#007ACC'  # Same blue accent (consistent)
+            self.success = '#2dacd5'  # Same Bandcamp blue (consistent)
+            self.hover_bg = '#E8E8E8'  # Light hover state
+            self.hover_fg = '#000000'  # Dark hover text
+            self.disabled_fg = '#808080'  # Gray disabled text
+            self.warning = '#FF8C00'  # Slightly darker orange for light mode
+            self.preview_link = '#005A9E'  # Darker blue for preview links (better contrast in light mode)
+            self.preview_link_hover = '#007ACC'  # Lighter blue on hover (still readable)
+
+
 class BandcampDownloaderGUI:
-    # Constants for better maintainability
+    # ============================================================================
+    # CONSTANTS - UI Configuration
+    # ============================================================================
+    DEFAULT_WINDOW_WIDTH = 520
+    DEFAULT_WINDOW_HEIGHT = 580
+    EXPAND_AMOUNT = 150
+    URL_TEXT_MAX_HEIGHT_PX = 235
+    URL_TEXT_DEFAULT_HEIGHT = 1
+    URL_TEXT_MAX_HEIGHT_LINES = 8
+    LOG_HISTORY_MAX_SIZE = 10000  # Maximum log messages to keep in memory
+    SETTINGS_SAVE_DEBOUNCE_MS = 500  # Debounce time for settings saves
+    URL_CHECK_DEBOUNCE_MS = 300  # Debounce time for URL validation
+    
+    # ============================================================================
+    # CONSTANTS - File Formats and Extensions
+    # ============================================================================
     FORMAT_EXTENSIONS = {
         "original": [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mpa", ".aac", ".opus"],  # Common audio formats
         "mp3": [".mp3"],
@@ -142,6 +198,10 @@ class BandcampDownloaderGUI:
         "wav": [".wav"],
     }
     THUMBNAIL_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp']
+    
+    # ============================================================================
+    # CONSTANTS - Folder Structures
+    # ============================================================================
     FOLDER_STRUCTURES = {
         "1": "Root Directory",
         "2": "Album",
@@ -335,6 +395,87 @@ class BandcampDownloaderGUI:
             cls._TAG_COLOR_SCHEMES = cls._load_color_schemes_from_css()
         return cls._TAG_COLOR_SCHEMES
     
+    # ============================================================================
+    # ERROR HANDLING HELPERS
+    # ============================================================================
+    @staticmethod
+    def _safe_widget_operation(operation, default_return=None):
+        """Safely execute a widget operation that might fail.
+        
+        Args:
+            operation: Callable to execute
+            default_return: Value to return if operation fails
+            
+        Returns:
+            Result of operation or default_return if it fails
+        """
+        try:
+            return operation()
+        except (AttributeError, TclError, RuntimeError):
+            # Common Tkinter errors that can be safely ignored
+            return default_return
+        except Exception:
+            # Log unexpected errors in debug mode, but don't crash
+            return default_return
+    
+    @staticmethod
+    def _safe_file_operation(operation, default_return=None):
+        """Safely execute a file operation that might fail.
+        
+        Args:
+            operation: Callable to execute
+            default_return: Value to return if operation fails
+            
+        Returns:
+            Result of operation or default_return if it fails
+        """
+        try:
+            return operation()
+        except (FileNotFoundError, PermissionError, OSError, IOError):
+            # Common file operation errors
+            return default_return
+        except Exception:
+            return default_return
+    
+    # ============================================================================
+    # TIMER MANAGEMENT
+    # ============================================================================
+    def _schedule_timer(self, delay_ms, callback):
+        """Schedule a timer and track it for cleanup.
+        
+        Args:
+            delay_ms: Delay in milliseconds
+            callback: Callable to execute
+            
+        Returns:
+            Timer ID
+        """
+        timer_id = self.root.after(delay_ms, callback)
+        if hasattr(self, '_active_timers'):
+            self._active_timers.add(timer_id)
+        return timer_id
+    
+    def _cancel_timer(self, timer_id):
+        """Cancel a scheduled timer and remove from tracking.
+        
+        Args:
+            timer_id: Timer ID to cancel
+        """
+        if timer_id:
+            try:
+                self.root.after_cancel(timer_id)
+            except (AttributeError, TclError):
+                pass
+            if hasattr(self, '_active_timers'):
+                self._active_timers.discard(timer_id)
+    
+    def _cancel_all_timers(self):
+        """Cancel all tracked timers (useful for cleanup)."""
+        if hasattr(self, '_active_timers'):
+            for timer_id in list(self._active_timers):
+                self._cancel_timer(timer_id)
+            self._active_timers.clear()
+    
     @staticmethod
     def _is_windows_7():
         """Check if running on Windows 7.
@@ -348,13 +489,13 @@ class BandcampDownloaderGUI:
             # Windows 7 is version 6.1
             version = sys.getwindowsversion()
             return version.major == 6 and version.minor == 1
-        except:
+        except (AttributeError, OSError):
             # Fallback: try platform module
             try:
                 import platform
                 release = platform.release()
                 return release == '7'
-            except:
+            except (AttributeError, OSError):
                 return False
     
     @classmethod
@@ -381,12 +522,21 @@ class BandcampDownloaderGUI:
         return icons.get(icon_name, '')
     
     def _extract_format(self, format_val):
-        """Extract base format from display value (e.g., 'mp3 (128kbps)' -> 'mp3')."""
+        """Extract base format from display value (e.g., 'MP3 (128kbps)' -> 'mp3', 'MP3 (varies)' -> 'mp3')."""
         if format_val == "Original":
             return "original"
-        if format_val.startswith("mp3"):
+        # Handle both old and new MP3 labels (case-insensitive)
+        format_lower = format_val.lower()
+        if format_lower.startswith("mp3"):
             return "mp3"
-        return format_val
+        # Handle uppercase format names
+        if format_lower == "flac":
+            return "flac"
+        if format_lower == "ogg":
+            return "ogg"
+        if format_lower == "wav":
+            return "wav"
+        return format_val.lower() if format_val else format_val
     
     def _clean_title(self, title, artist=None):
         """
@@ -525,6 +675,11 @@ class BandcampDownloaderGUI:
         # Initialize variable for menu (will be created when menu is first built)
         self.tag_color_scheme_var = StringVar(value=self.current_tag_color_scheme)
         
+        # Theme system - load saved theme preference (default to 'dark' for backward compatibility)
+        saved_theme = settings.get("theme", "dark")
+        self.current_theme = saved_theme if saved_theme in ['dark', 'light'] else 'dark'
+        self.theme_colors = ThemeColors(self.current_theme)
+        
         # Batch URL mode tracking
         self.batch_mode = False  # Track if we're in batch mode (multiple URLs)
         self.url_entry_widget = None  # Store reference to Entry widget
@@ -536,6 +691,10 @@ class BandcampDownloaderGUI:
         self.content_history_index = -1  # Current position in history (-1 = most recent)
         self.content_save_timer = None  # Timer for debounced content state saving
         self.auto_expand_timer = None  # Timer for debounced auto-expand height adjustment
+        
+        # Timer management for cleanup
+        self._active_timers = set()  # Track active timer IDs for cleanup
+        self._settings_save_timer = None  # Debounce timer for settings saves
         
         # Debug mode flag (default: False)
         self.debug_mode = False
@@ -585,7 +744,8 @@ class BandcampDownloaderGUI:
             self.root.destroy()
             return
         
-        self.setup_dark_mode()
+        # Apply theme (dark or light based on saved preference)
+        self.apply_theme()
         # Load album art state before setting up UI so eye icon can be positioned correctly
         self.load_saved_album_art_state()
         self.setup_ui()
@@ -629,29 +789,35 @@ class BandcampDownloaderGUI:
         if self.auto_check_updates_var.get():
             self.root.after(2000, self._check_for_updates_background)  # Wait 2 seconds after startup
     
-    def setup_dark_mode(self):
-        """Configure dark mode theme."""
+    def apply_theme(self):
+        """Apply current theme (dark or light) to all UI elements."""
         style = ttk.Style()
         style.theme_use('clam')
         
-        # Modern dark color scheme - all backgrounds consistently dark
-        bg_color = '#1E1E1E'  # Very dark background (consistent everywhere)
-        fg_color = '#D4D4D4'  # Soft light text
-        select_bg = '#252526'  # Slightly lighter for inputs only
-        select_fg = '#FFFFFF'
-        entry_bg = '#252526'  # Dark input background
-        entry_fg = '#CCCCCC'  # Light input text
-        border_color = '#3E3E42'  # Subtle borders
-        accent_color = '#007ACC'  # Blue accent (more modern than green)
-        success_color = '#2dacd5'  # Bandcamp blue for success/preview
-        hover_bg = '#3E3E42'  # Hover state
+        # Use theme colors (preserves exact dark mode colors when in dark mode)
+        colors = self.theme_colors
+        bg_color = colors.bg
+        fg_color = colors.fg
+        select_bg = colors.select_bg
+        select_fg = colors.select_fg
+        entry_bg = colors.entry_bg
+        entry_fg = colors.entry_fg
+        border_color = colors.border
+        accent_color = colors.accent
+        success_color = colors.success
+        hover_bg = colors.hover_bg
         
         # Configure root background
         self.root.configure(bg=bg_color)
         
         # Configure styles - all backgrounds use bg_color
         style.configure('TFrame', background=bg_color, borderwidth=0)
+        # TLabel uses bg_color (app background) - this is correct for most labels
         style.configure('TLabel', background=bg_color, foreground=fg_color)
+        # Settings.TLabel for labels in settings section - matches settings frame background
+        # Dark mode: uses bg, Light mode: uses select_bg (white)
+        settings_label_bg = select_bg if self.current_theme == 'light' else bg_color
+        style.configure('Settings.TLabel', background=settings_label_bg, foreground=fg_color)
         # Create a custom style for LabelFrame that forces dark background
         style.configure('TLabelFrame', background=bg_color, foreground=fg_color, 
                         bordercolor=border_color, borderwidth=1, relief='flat')
@@ -689,20 +855,25 @@ class BandcampDownloaderGUI:
         
         # Cancel button style - matches download button size but keeps muted default colors
         # Slightly wider to match visual size of download button
-        style.configure('Cancel.TButton', background=select_bg, foreground=fg_color,
-                       borderwidth=0, bordercolor=border_color, relief='flat',
+        # Cancel button style - match Browse button styling
+        # Dark mode: uses select_bg (#252526), Light mode: uses entry_bg (#F5F5F5) to match Browse button
+        cancel_bg = entry_bg if self.current_theme == 'light' else select_bg
+        style.configure('Cancel.TButton', background=cancel_bg, foreground=fg_color,
+                       borderwidth=0, bordercolor=cancel_bg, relief='flat',
                        padding=(15, 10), width=23)  # Slightly wider than download button to match visual size
         style.map('Cancel.TButton',
-                 background=[('active', hover_bg), ('pressed', bg_color)],
-                 bordercolor=[('active', border_color), ('pressed', border_color)])
+                 background=[('active', hover_bg), ('pressed', cancel_bg)],
+                 bordercolor=[('active', cancel_bg), ('pressed', cancel_bg)])  # Match background to hide borders
         
         # Browse button style - compact with no border
-        style.configure('Browse.TButton', background=select_bg, foreground=fg_color,
-                       borderwidth=0, bordercolor=border_color, relief='flat',
+        # Dark mode: uses select_bg (#252526), Light mode: uses entry_bg (#F5F5F5) to match Clear Log
+        browse_bg = entry_bg if self.current_theme == 'light' else select_bg
+        style.configure('Browse.TButton', background=browse_bg, foreground=fg_color,
+                       borderwidth=0, bordercolor=browse_bg, relief='flat',
                        padding=(8, 4))  # Compact padding
         style.map('Browse.TButton',
-                 background=[('active', hover_bg), ('pressed', bg_color)],
-                 bordercolor=[('active', border_color), ('pressed', border_color)])
+                 background=[('active', hover_bg), ('pressed', browse_bg)],
+                 bordercolor=[('active', browse_bg), ('pressed', browse_bg)])  # Match background to hide borders
         style.configure('TRadiobutton', background=bg_color, foreground=fg_color,
                         focuscolor=bg_color)
         style.map('TRadiobutton', 
@@ -719,41 +890,62 @@ class BandcampDownloaderGUI:
                  background=[('active', select_bg), ('!active', select_bg)])  # Button area always dark
 
         # Dark themed vertical scrollbar style (used for URL and log text widgets)
-        style.configure(
-            'Dark.Vertical.TScrollbar',
-            background=border_color,
-            troughcolor=bg_color,
-            bordercolor=border_color,
-            arrowcolor='#CCCCCC',
-            relief='flat'
-        )
-        style.map(
-            'Dark.Vertical.TScrollbar',
-            background=[('active', hover_bg), ('!active', border_color)],
-            arrowcolor=[('active', '#FFFFFF'), ('!active', '#CCCCCC')]
-        )
+        # Only configure this style when in dark mode to avoid light mode interference
+        # Explicitly set all properties to prevent inheritance from TScrollbar style
+        if self.current_theme == 'dark':
+            style.configure(
+                'Dark.Vertical.TScrollbar',
+                background=border_color,
+                troughcolor=bg_color,
+                bordercolor=border_color,
+                arrowcolor='#CCCCCC',
+                darkcolor=border_color,  # Explicitly set to prevent bright highlights
+                lightcolor=border_color,  # Explicitly set to prevent bright highlights
+                relief='flat',
+                borderwidth=0
+            )
+            style.map(
+                'Dark.Vertical.TScrollbar',
+                # Make hover more noticeable - use a lighter gray (#4E4E52) that's clearly visible against border (#3E3E42)
+                # This creates a subtle but visible hover effect
+                background=[('active', '#4E4E52'), ('pressed', '#5E5E62'), ('!active', border_color)],
+                arrowcolor=[('active', '#FFFFFF'), ('!active', '#CCCCCC')],
+                # Keep darkcolor, lightcolor, and bordercolor exactly matching background for flat, clean look
+                darkcolor=[('active', '#4E4E52'), ('pressed', '#5E5E62'), ('!active', border_color)],
+                lightcolor=[('active', '#4E4E52'), ('pressed', '#5E5E62'), ('!active', border_color)],
+                bordercolor=[('active', '#4E4E52'), ('pressed', '#5E5E62'), ('!active', border_color)]
+            )
         # Progress bar uses Bandcamp blue for a friendly, success-oriented feel
-        style.configure('TProgressbar', background=success_color, troughcolor=bg_color,
+        # Trough color: dark mode uses bg, light mode uses entry_bg (#F5F5F5) to match URL field
+        progress_trough = colors.entry_bg if self.current_theme == 'light' else bg_color
+        style.configure('TProgressbar', background=success_color, troughcolor=progress_trough,
                         borderwidth=2, bordercolor=border_color, lightcolor=success_color, darkcolor=success_color)
         
         # Menubutton style (shared by all menubuttons - structure, format, numbering)
+        # Use theme-appropriate hover color
+        hover_menubutton = '#2D2D30' if self.current_theme == 'dark' else colors.hover_bg
+        hover_text = '#FFFFFF' if self.current_theme == 'dark' else colors.fg
+        arrow_color = '#CCCCCC' if self.current_theme == 'dark' else '#666666'  # Darker arrow for light mode
+        
+        # Menubutton background: dark mode uses entry_bg, light mode uses select_bg (white) to match settings frame
+        menubutton_bg = select_bg if self.current_theme == 'light' else entry_bg
         style.configure('Dark.TMenubutton',
-            background=entry_bg,
+            background=menubutton_bg,
             foreground=entry_fg,
             borderwidth=1,
             bordercolor=border_color,
             relief='solid',
             padding=(0, 0),  # Remove padding to match combobox alignment
-            arrowcolor='#CCCCCC',  # Light gray arrow
+            arrowcolor=arrow_color,
             arrowpadding=(0, 0, 8, 0)  # Padding for arrow (left, top, right, bottom)
         )
         style.map('Dark.TMenubutton',
-            background=[('active', '#2D2D30'), ('!disabled', entry_bg)],
-            foreground=[('active', '#FFFFFF'), ('!disabled', entry_fg)],
+            background=[('active', hover_menubutton), ('!disabled', menubutton_bg)],
+            foreground=[('active', hover_text), ('!disabled', entry_fg)],
             borderwidth=[('focus', 1), ('!focus', 1)],
             bordercolor=[('focus', accent_color), ('!focus', border_color)],  # Blue border on focus like combobox
             relief=[('pressed', 'solid'), ('!pressed', 'solid')],
-            arrowcolor=[('active', '#CCCCCC'), ('!active', '#CCCCCC')]  # Always light gray
+            arrowcolor=[('active', arrow_color), ('!active', arrow_color)]
         )
         
         # Overall progress bar style (thinner, more subtle color - gray/white)
@@ -782,13 +974,579 @@ class BandcampDownloaderGUI:
                                 troughcolor=bg_color,
                                 borderwidth=0)
         
-        # Configure Scrollbar for dark theme
-        style.configure('TScrollbar', background=bg_color, troughcolor=bg_color,
-                       bordercolor=bg_color, arrowcolor=fg_color, darkcolor=bg_color,
-                       lightcolor=bg_color)
-        style.map('TScrollbar',
-                 background=[('active', hover_bg)],
-                 arrowcolor=[('active', fg_color), ('!active', border_color)])
+        # Configure default TScrollbar style (theme-aware)
+        if self.current_theme == 'light':
+            # Light mode: clean, minimalist scrollbar matching dark mode aesthetic
+            # Use subtle gray colors for a clean, minimal look
+            light_scrollbar_bg = '#D0D0D0'  # Light gray thumb
+            light_scrollbar_trough = '#F5F5F5'  # Very light gray trough
+            light_scrollbar_border = '#D0D0D0'  # Border matches thumb
+            light_scrollbar_arrow = '#808080'  # Medium gray arrows
+            light_scrollbar_hover = '#B0B0B0'  # Slightly darker on hover
+            
+            style.configure('TScrollbar', 
+                           background=light_scrollbar_bg,
+                           troughcolor=light_scrollbar_trough,
+                           bordercolor=light_scrollbar_border,
+                           arrowcolor=light_scrollbar_arrow,
+                           darkcolor=light_scrollbar_border,  # Match border for clean look
+                           lightcolor=light_scrollbar_border,  # Match border for clean look
+                           relief='flat',
+                           borderwidth=0)
+            style.map('TScrollbar',
+                     background=[('active', light_scrollbar_hover), ('pressed', '#999999'), ('!active', light_scrollbar_bg)],
+                     arrowcolor=[('active', '#666666'), ('!active', light_scrollbar_arrow)],
+                     # Keep darkcolor, lightcolor, and bordercolor exactly matching background for flat, clean look
+                     darkcolor=[('active', light_scrollbar_hover), ('pressed', '#999999'), ('!active', light_scrollbar_bg)],
+                     lightcolor=[('active', light_scrollbar_hover), ('pressed', '#999999'), ('!active', light_scrollbar_bg)],
+                     bordercolor=[('active', light_scrollbar_hover), ('pressed', '#999999'), ('!active', light_scrollbar_bg)])
+        else:
+            # Dark mode: minimal styling (Dark.Vertical.TScrollbar is used instead)
+            style.configure('TScrollbar', background=bg_color, troughcolor=bg_color,
+                           bordercolor=bg_color, arrowcolor=fg_color, darkcolor=bg_color,
+                           lightcolor=bg_color)
+            style.map('TScrollbar',
+                     background=[('active', hover_bg)],
+                     arrowcolor=[('active', fg_color), ('!active', border_color)])
+        
+        # Small.TButton style (for Clear Log button)
+        # Dark mode: uses select_bg (#252526), Light mode: uses entry_bg (#F5F5F5)
+        small_btn_bg = entry_bg if self.current_theme == 'light' else select_bg
+        style.configure('Small.TButton', 
+                       background=small_btn_bg,
+                       foreground=fg_color,
+                       borderwidth=0,
+                       bordercolor=small_btn_bg,  # Match background to hide borders
+                       relief='flat',
+                       padding=(6, 2),
+                       font=("Segoe UI", 8))
+        style.map('Small.TButton',
+                 background=[('active', hover_bg), ('pressed', small_btn_bg)],
+                 bordercolor=[('active', small_btn_bg), ('pressed', small_btn_bg)])
+    
+    def toggle_theme(self):
+        """Toggle between dark and light mode."""
+        # Switch theme
+        new_theme = 'light' if self.current_theme == 'dark' else 'dark'
+        self.current_theme = new_theme
+        self.theme_colors = ThemeColors(new_theme)
+        
+        # Re-apply theme to all UI elements
+        self.apply_theme()
+        
+        # Refresh all widgets with new theme colors
+        self._refresh_all_widgets()
+        
+        # Update settings menu to reflect new theme
+        self._rebuild_settings_menu()
+        
+        # Save preference
+        self._save_theme_preference()
+    
+    def _save_theme_preference(self):
+        """Save current theme preference to settings."""
+        settings = self._load_settings()
+        settings["theme"] = self.current_theme
+        self._save_settings(settings)
+    
+    def _refresh_all_widgets(self):
+        """Refresh all widgets with current theme colors."""
+        colors = self.theme_colors
+        
+        # Helper function to recursively update widget colors
+        def update_widget_recursive(widget, depth=0):
+            """Recursively update widget and all children."""
+            if depth > 10:  # Prevent infinite recursion
+                return
+            try:
+                widget_type = widget.winfo_class()
+                if widget_type in ('Frame', 'LabelFrame', 'Toplevel'):
+                    widget.configure(bg=colors.bg)
+                elif widget_type == 'Label':
+                    # Only update if it's not a special label (like preview link)
+                    current_bg = widget.cget('bg')
+                    if current_bg in ['#1E1E1E', '#252526', '#FFFFFF', '#F5F5F5']:
+                        widget.configure(bg=colors.bg, fg=colors.fg)
+                elif widget_type == 'Entry':
+                    widget.configure(
+                        bg=colors.entry_bg,
+                        fg=colors.entry_fg,
+                        insertbackground=colors.fg,
+                        highlightbackground=colors.border,
+                        highlightcolor=colors.accent
+                    )
+                elif widget_type == 'Text':
+                    widget.configure(
+                        bg=colors.bg if widget == getattr(self, 'log_text', None) else colors.entry_bg,
+                        fg=colors.fg,
+                        insertbackground=colors.fg,
+                        highlightbackground=colors.border,
+                        highlightcolor=colors.accent
+                    )
+                elif widget_type == 'Canvas':
+                    widget.configure(bg=colors.bg)
+                elif widget_type == 'Checkbutton':
+                    widget.configure(
+                        bg=colors.bg,
+                        fg=colors.fg,
+                        selectcolor=colors.bg,
+                        activebackground=colors.bg,
+                        activeforeground=colors.fg
+                    )
+                
+                # Recursively update children
+                try:
+                    for child in widget.winfo_children():
+                        update_widget_recursive(child, depth + 1)
+                except:
+                    pass
+            except (TclError, AttributeError):
+                pass
+        
+        # Update root background
+        if hasattr(self, 'root'):
+            self.root.configure(bg=colors.bg)
+            # Recursively update all widgets
+            try:
+                update_widget_recursive(self.root)
+            except:
+                pass
+        
+        # Update main frame if it exists
+        if hasattr(self, 'url_container_frame'):
+            self.url_container_frame.configure(bg=colors.bg)
+        
+        # Update all Label widgets that we track
+        widget_attrs = [
+            'url_paste_btn', 'url_clear_btn', 'url_expand_btn',
+            'settings_cog_btn', 'show_album_art_btn',
+            'preview_label_path', 'format_conversion_warning_label',
+            'ogg_warning_label', 'wav_warning_label'
+        ]
+        
+        for attr in widget_attrs:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget and isinstance(widget, (Label, Frame, Canvas)):
+                    try:
+                        # Update background and foreground
+                        if attr in ['url_paste_btn', 'url_clear_btn', 'url_expand_btn', 'settings_cog_btn', 'show_album_art_btn']:
+                            # Icon buttons use bg and disabled_fg
+                            widget.configure(bg=colors.bg, fg=colors.disabled_fg)
+                            # Rebind hover handlers with current theme colors
+                            widget.unbind('<Enter>')
+                            widget.unbind('<Leave>')
+                            widget.bind('<Enter>', lambda e, w=widget: w.config(fg=colors.hover_fg))
+                            widget.bind('<Leave>', lambda e, w=widget: w.config(fg=colors.disabled_fg))
+                        else:
+                            widget.configure(bg=colors.bg, fg=colors.fg)
+                    except (TclError, AttributeError):
+                        pass
+        
+        # Update Entry widgets
+        if hasattr(self, 'url_entry_widget') and self.url_entry_widget:
+            try:
+                self.url_entry_widget.configure(
+                    bg=colors.entry_bg,
+                    fg=colors.entry_fg,
+                    insertbackground=colors.fg,
+                    highlightbackground=colors.border,
+                    highlightcolor=colors.accent
+                )
+            except (TclError, AttributeError):
+                pass
+        
+        if hasattr(self, 'path_entry') and self.path_entry:
+            try:
+                self.path_entry.configure(
+                    bg=colors.entry_bg,
+                    fg=colors.entry_fg,
+                    insertbackground=colors.fg,
+                    highlightbackground=colors.border,
+                    highlightcolor=colors.accent
+                )
+            except (TclError, AttributeError):
+                pass
+        
+        # Update Text widgets
+        if hasattr(self, 'url_text_widget') and self.url_text_widget:
+            try:
+                self.url_text_widget.configure(
+                    bg=colors.entry_bg,
+                    fg=colors.entry_fg,
+                    insertbackground=colors.fg,
+                    highlightbackground=colors.border,
+                    highlightcolor=colors.accent
+                )
+            except (TclError, AttributeError):
+                pass
+        
+        # Update placeholder labels
+        if hasattr(self, 'url_text_placeholder_label') and self.url_text_placeholder_label:
+            try:
+                self.url_text_placeholder_label.configure(
+                    bg=colors.entry_bg,
+                    fg=colors.disabled_fg
+                )
+            except (TclError, AttributeError):
+                pass
+        
+        # Update frames - sections: dark mode uses bg, light mode uses select_bg (white)
+        # Settings frames: use select_bg in light mode, bg in dark mode
+        settings_frame_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        if hasattr(self, 'settings_frame') and self.settings_frame:
+            try:
+                self.settings_frame.configure(bg=settings_frame_bg, highlightbackground=colors.border)
+            except (TclError, AttributeError):
+                pass
+        
+        if hasattr(self, 'settings_content') and self.settings_content:
+            try:
+                self.settings_content.configure(bg=settings_frame_bg)
+                # Update ttk.Label widgets in settings_content to match frame background
+                # ttk.Label widgets use TLabel style which defaults to app bg, need to update style for settings
+                style = ttk.Style()
+                # Create a custom style for settings labels that matches the frame
+                style.configure('Settings.TLabel', background=settings_frame_bg, foreground=colors.fg)
+                # Update all ttk.Label widgets in settings_content
+                for child in self.settings_content.winfo_children():
+                    try:
+                        if isinstance(child, ttk.Label):
+                            child.configure(style='Settings.TLabel')
+                    except (TclError, AttributeError):
+                        pass
+            except (TclError, AttributeError):
+                pass
+        
+        # Preview frame: use entry_bg in light mode (#F5F5F5), bg in dark mode
+        if hasattr(self, 'preview_frame') and self.preview_frame:
+            try:
+                preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                self.preview_frame.configure(bg=preview_frame_bg, highlightbackground=colors.border)
+                # Update preview label prefix background
+                if hasattr(self, 'preview_label_prefix') and self.preview_label_prefix:
+                    self.preview_label_prefix.configure(bg=preview_frame_bg)
+                # Update preview label path background
+                if hasattr(self, 'preview_label_path') and self.preview_label_path:
+                    self.preview_label_path.configure(bg=preview_frame_bg)
+            except (TclError, AttributeError):
+                pass
+        
+        # Log frame: dark mode uses bg, light mode uses entry_bg (#F5F5F5) to match URL field
+        if hasattr(self, 'log_frame') and self.log_frame:
+            try:
+                log_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                self.log_frame.configure(bg=log_frame_bg, highlightbackground=colors.border)
+                # Update status label background
+                if hasattr(self, 'log_label') and self.log_label:
+                    self.log_label.configure(bg=log_frame_bg)
+                # Update word wrap checkbox background - must use entry_bg (#F5F5F5) in light mode
+                if hasattr(self, 'word_wrap_toggle') and self.word_wrap_toggle:
+                    checkbox_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                    self.word_wrap_toggle.configure(
+                        bg=checkbox_bg, 
+                        selectcolor=checkbox_bg, 
+                        activebackground=checkbox_bg,
+                        activeforeground=colors.fg
+                    )
+                # Update debug checkbox background - must use entry_bg (#F5F5F5) in light mode
+                if hasattr(self, 'debug_toggle') and self.debug_toggle:
+                    checkbox_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                    self.debug_toggle.configure(
+                        bg=checkbox_bg, 
+                        selectcolor=checkbox_bg, 
+                        activebackground=checkbox_bg,
+                        activeforeground=colors.fg
+                    )
+            except (TclError, AttributeError):
+                pass
+        
+        # Album art frame: dark mode uses bg, light mode uses select_bg (white)
+        if hasattr(self, 'album_art_frame') and self.album_art_frame:
+            try:
+                album_art_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+                self.album_art_frame.configure(bg=album_art_bg, highlightbackground=colors.border)
+            except (TclError, AttributeError):
+                pass
+        
+        # Other frames use main bg
+        other_frames = ['url_text_frame', 'entry_container']
+        for attr in other_frames:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget:
+                    try:
+                        widget.configure(bg=colors.bg)
+                    except (TclError, AttributeError):
+                        pass
+        
+        # Update canvas - album art: dark mode uses bg, light mode uses select_bg (white)
+        if hasattr(self, 'album_art_canvas') and self.album_art_canvas:
+            try:
+                canvas_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+                self.album_art_canvas.configure(bg=canvas_bg)
+            except (TclError, AttributeError):
+                pass
+        
+        # Update resize handle
+        if hasattr(self, 'url_text_resize_handle') and self.url_text_resize_handle:
+            try:
+                self.url_text_resize_handle.configure(bg=colors.entry_bg, fg=colors.disabled_fg)
+            except (TclError, AttributeError):
+                pass
+        
+        # Update overall progress bar background
+        if hasattr(self, 'overall_progress_bar') and self.overall_progress_bar:
+            try:
+                progress_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                self.overall_progress_bar.bg_color = progress_bg
+                self.overall_progress_bar.canvas.configure(bg=progress_bg)
+                # Update trough color
+                self.overall_progress_bar.canvas.itemconfig(self.overall_progress_bar.trough, fill=progress_bg)
+            except (TclError, AttributeError):
+                pass
+        
+        # Update expand/collapse button - matches log_frame background (entry_bg in light mode)
+        if hasattr(self, 'expand_collapse_btn') and self.expand_collapse_btn:
+            try:
+                expand_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                self.expand_collapse_btn.configure(bg=expand_bg, fg=colors.disabled_fg)
+                # Rebind hover handlers with current theme colors
+                self.expand_collapse_btn.unbind('<Enter>')
+                self.expand_collapse_btn.unbind('<Leave>')
+                self.expand_collapse_btn.bind('<Enter>', lambda e: self.expand_collapse_btn.config(fg=colors.hover_fg))
+                self.expand_collapse_btn.bind('<Leave>', lambda e: self.expand_collapse_btn.config(fg=colors.disabled_fg))
+            except (TclError, AttributeError):
+                pass
+        
+        # Update edit/delete icon buttons (filename and folder structure)
+        # Use settings_frame_bg to match settings content background
+        icon_button_attrs = [
+            'filename_customize_btn', 'filename_manage_btn',
+            'customize_btn', 'manage_btn'
+        ]
+        for attr in icon_button_attrs:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget:
+                    try:
+                        widget.configure(bg=settings_frame_bg, fg=colors.disabled_fg)
+                        # Rebind hover handlers with current theme colors
+                        widget.unbind('<Enter>')
+                        widget.unbind('<Leave>')
+                        # Check if button is enabled (has custom structures/formats)
+                        if attr in ['filename_manage_btn', 'manage_btn']:
+                            # These buttons may be disabled - check if they have custom items
+                            has_custom = False
+                            if attr == 'filename_manage_btn':
+                                has_custom = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
+                            elif attr == 'manage_btn':
+                                has_custom = hasattr(self, 'custom_structures') and self.custom_structures
+                            
+                            if has_custom:
+                                widget.bind('<Enter>', lambda e, w=widget: w.config(fg=colors.hover_fg))
+                                widget.bind('<Leave>', lambda e, w=widget: w.config(fg=colors.disabled_fg))
+                            else:
+                                # Disabled state - no hover
+                                disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'
+                                widget.configure(fg=disabled_color)
+                        else:
+                            # Always enabled buttons (customize buttons)
+                            widget.bind('<Enter>', lambda e, w=widget: w.config(fg=colors.hover_fg))
+                            widget.bind('<Leave>', lambda e, w=widget: w.config(fg=colors.disabled_fg))
+                    except (TclError, AttributeError):
+                        pass
+        
+        # Update show_album_art_btn to match settings frame
+        if hasattr(self, 'show_album_art_btn') and self.show_album_art_btn:
+            try:
+                self.show_album_art_btn.configure(bg=settings_frame_bg, fg=colors.disabled_fg)
+                # Rebind hover handlers with current theme colors
+                self.show_album_art_btn.unbind('<Enter>')
+                self.show_album_art_btn.unbind('<Leave>')
+                self.show_album_art_btn.bind('<Enter>', lambda e: self.show_album_art_btn.config(fg=colors.hover_fg))
+                self.show_album_art_btn.bind('<Leave>', lambda e: self.show_album_art_btn.config(fg=colors.disabled_fg))
+            except (TclError, AttributeError):
+                pass
+        
+        # Update filename and structure frames to match settings frame background
+        frame_attrs = ['filename_frame', 'structure_frame']
+        for attr in frame_attrs:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget:
+                    try:
+                        widget.configure(bg=settings_frame_bg)
+                    except (TclError, AttributeError):
+                        pass
+        
+        # Force menubuttons to refresh their style (filename and folder structure)
+        # This ensures they get the updated Dark.TMenubutton style with correct background
+        menubutton_attrs = ['filename_menubutton', 'structure_menubutton']
+        for attr in menubutton_attrs:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget:
+                    try:
+                        # Force style refresh by temporarily changing style and changing back
+                        current_style = widget.cget('style')
+                        widget.configure(style='TMenubutton')  # Reset to base
+                        self.root.update_idletasks()
+                        widget.configure(style=current_style)  # Apply updated style
+                        # Also force update of the widget itself
+                        widget.update_idletasks()
+                    except (TclError, AttributeError):
+                        pass
+        
+        # Update preview frame and labels - dark mode uses bg, light mode uses select_bg
+        if hasattr(self, 'preview_frame') and self.preview_frame:
+            try:
+                preview_frame_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+                self.preview_frame.configure(bg=preview_frame_bg, highlightbackground=colors.border)
+            except (TclError, AttributeError):
+                pass
+        
+        if hasattr(self, 'preview_label_path') and self.preview_label_path:
+            try:
+                preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                self.preview_label_path.configure(bg=preview_frame_bg, fg=colors.preview_link)
+                # Update hover handlers to use current theme colors
+                # Unbind old handlers first
+                self.preview_label_path.unbind('<Enter>')
+                self.preview_label_path.unbind('<Leave>')
+                # Bind new handlers with current theme colors
+                self.preview_label_path.bind('<Enter>', lambda e: self.preview_label_path.config(fg=colors.preview_link_hover))
+                self.preview_label_path.bind('<Leave>', lambda e: self.preview_label_path.config(fg=colors.preview_link))
+            except (TclError, AttributeError):
+                pass
+        
+        # Update warning labels - these are in main_frame, so use bg (app background)
+        warning_attrs = ['format_conversion_warning_label', 'ogg_warning_label', 'wav_warning_label']
+        for attr in warning_attrs:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget:
+                    try:
+                        widget.configure(bg=colors.bg, fg=colors.warning)
+                    except (TclError, AttributeError):
+                        pass
+        
+        # Update checkboxes in settings section - dark mode uses bg, light mode uses select_bg
+        checkbox_attrs = [
+            'skip_postprocessing_check', 'download_cover_art_check',
+            'create_playlist_check', 'download_discography_check'
+        ]
+        checkbox_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        for attr in checkbox_attrs:
+            if hasattr(self, attr):
+                widget = getattr(self, attr)
+                if widget:
+                    try:
+                        widget.configure(
+                            bg=checkbox_bg,
+                            fg=colors.fg,
+                            selectcolor=checkbox_bg,
+                            activebackground=checkbox_bg,
+                            activeforeground=colors.fg
+                        )
+                    except (TclError, AttributeError):
+                        pass
+        
+        # Update checkboxes in log section - dark mode uses bg, light mode uses entry_bg (#F5F5F5)
+        # Note: This is handled in the log_frame section above, but keeping this for any other log checkboxes
+        # The word_wrap_toggle and debug_toggle are already updated above with entry_bg in light mode
+        
+        # Update search frame and widgets
+        if hasattr(self, 'search_frame') and self.search_frame:
+            try:
+                self.search_frame.configure(bg=colors.select_bg, highlightbackground=colors.border)
+            except (TclError, AttributeError):
+                pass
+        
+        if hasattr(self, 'search_entry') and self.search_entry:
+            try:
+                self.search_entry.configure(
+                    bg=colors.entry_bg,
+                    fg=colors.entry_fg,
+                    insertbackground=colors.fg,
+                    highlightbackground=colors.border,
+                    highlightcolor=colors.accent
+                )
+            except (TclError, AttributeError):
+                pass
+        
+        if hasattr(self, 'search_count_label') and self.search_count_label:
+            try:
+                self.search_count_label.configure(bg=colors.select_bg, fg=colors.disabled_fg)
+            except (TclError, AttributeError):
+                pass
+        
+        if hasattr(self, 'search_close_btn') and self.search_close_btn:
+            try:
+                self.search_close_btn.configure(bg=colors.select_bg, fg=colors.disabled_fg)
+            except (TclError, AttributeError):
+                pass
+        
+        # Update log text widget - dark mode uses bg, light mode uses select_bg (white)
+        if hasattr(self, 'log_text') and self.log_text:
+            try:
+                log_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                self.log_text.configure(
+                    bg=log_bg,
+                    fg=colors.fg,
+                    insertbackground=colors.fg
+                )
+            except (TclError, AttributeError):
+                pass
+        
+        # Update scrollbars: use default style in light mode, custom dark style in dark mode
+        scrollbar_style = 'TScrollbar' if self.current_theme == 'light' else 'Dark.Vertical.TScrollbar'
+        if hasattr(self, 'url_scrollbar') and self.url_scrollbar:
+            try:
+                # Force complete style refresh by temporarily setting to default, then to target style
+                # This ensures no cached properties from previous theme remain
+                current_style = self.url_scrollbar.cget('style')
+                if current_style != scrollbar_style:
+                    # Only update if style actually changed
+                    self.url_scrollbar.configure(style='TScrollbar')  # Reset to base
+                    self.root.update_idletasks()  # Force update
+                    self.url_scrollbar.configure(style=scrollbar_style)  # Apply new style
+            except (TclError, AttributeError):
+                pass
+        
+        if hasattr(self, 'log_scrollbar') and self.log_scrollbar:
+            try:
+                # Force complete style refresh by temporarily setting to default, then to target style
+                current_style = self.log_scrollbar.cget('style')
+                if current_style != scrollbar_style:
+                    # Only update if style actually changed
+                    self.log_scrollbar.configure(style='TScrollbar')  # Reset to base
+                    self.root.update_idletasks()  # Force update
+                    self.log_scrollbar.configure(style=scrollbar_style)  # Apply new style
+            except (TclError, AttributeError):
+                pass
+        
+        # Update preview frame and labels
+        if hasattr(self, 'preview_label_path') and self.preview_label_path:
+            try:
+                # Find parent preview frame
+                parent = self.preview_label_path.master
+                if parent:
+                    preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                    parent.configure(bg=preview_frame_bg, highlightbackground=colors.border)
+                preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                self.preview_label_path.configure(bg=preview_frame_bg, fg=colors.preview_link)
+                # Update hover handlers to use current theme colors
+                self.preview_label_path.unbind('<Enter>')
+                self.preview_label_path.unbind('<Leave>')
+                self.preview_label_path.bind('<Enter>', lambda e: self.preview_label_path.config(fg=colors.preview_link_hover))
+                self.preview_label_path.bind('<Leave>', lambda e: self.preview_label_path.config(fg=colors.preview_link))
+            except (TclError, AttributeError):
+                pass
+    
+    def _rebuild_settings_menu(self):
+        """Rebuild settings menu to reflect current theme."""
+        self.settings_menu = None  # Force recreation on next access
     
     def set_icon(self):
         """Set the custom icon for the window from icon.ico."""
@@ -805,11 +1563,11 @@ class BandcampDownloaderGUI:
                 # Method 1: iconbitmap - sets title bar icon (MUST be called first)
                 try:
                     self.root.iconbitmap(default=icon_path_str)
-                except Exception as e:
+                except (TclError, OSError):
                     # If iconbitmap fails, try without default parameter
                     try:
                         self.root.iconbitmap(icon_path_str)
-                    except:
+                    except (TclError, OSError):
                         pass
                 
                 # Method 2: iconphoto - sets taskbar icon (more reliable)
@@ -822,7 +1580,8 @@ class BandcampDownloaderGUI:
                     # Keep a reference to prevent garbage collection
                     if not hasattr(self, '_icon_ref'):
                         self._icon_ref = photo
-                except:
+                except (OSError, IOError, ImportError):
+                    # PIL not available or image file error
                     pass
                 
                 # Method 3: Windows API - force set both title bar and taskbar icons
@@ -867,10 +1626,10 @@ class BandcampDownloaderGUI:
                                 
                                 # Force window to redraw
                                 self.root.update_idletasks()
-                    except Exception:
+                    except (OSError, AttributeError, ctypes.ArgumentError):
                         # Silently fail - other methods should still work
                         pass
-        except Exception:
+        except (OSError, IOError, AttributeError):
             # If icon setting fails, just continue without icon
             pass
     
@@ -900,60 +1659,60 @@ class BandcampDownloaderGUI:
         old_file = self.script_dir / "folder_structure_default.txt"
         if old_file.exists():
             try:
-                with open(old_file, 'r') as f:
+                with open(old_file, 'r', encoding='utf-8') as f:
                     value = f.read().strip()
                     if value in ["1", "2", "3", "4", "5"]:
                         settings["folder_structure"] = value
                         migrated = True
-            except:
+            except (IOError, OSError, UnicodeDecodeError):
                 pass
         
         # Migrate download path
         old_file = self.script_dir / "last_download_path.txt"
         if old_file.exists():
             try:
-                with open(old_file, 'r') as f:
+                with open(old_file, 'r', encoding='utf-8') as f:
                     path = f.read().strip()
                     if path and Path(path).exists():
                         settings["download_path"] = path
                         migrated = True
-            except:
+            except (IOError, OSError, UnicodeDecodeError):
                 pass
         
         # Migrate audio format
         old_file = self.script_dir / "audio_format_default.txt"
         if old_file.exists():
             try:
-                with open(old_file, 'r') as f:
+                with open(old_file, 'r', encoding='utf-8') as f:
                     value = f.read().strip()
                     if value in ["mp3", "flac", "ogg", "wav"]:
                         settings["audio_format"] = value
                         migrated = True
-            except:
+            except (IOError, OSError, UnicodeDecodeError):
                 pass
         
         # Migrate audio quality
         old_file = self.script_dir / "audio_quality_default.txt"
         if old_file.exists():
             try:
-                with open(old_file, 'r') as f:
+                with open(old_file, 'r', encoding='utf-8') as f:
                     value = f.read().strip()
                     if value in ["128 kbps", "192 kbps", "256 kbps", "320 kbps", "lossless", "best"]:
                         settings["audio_quality"] = value
                         migrated = True
-            except:
+            except (IOError, OSError, UnicodeDecodeError):
                 pass
         
         # Migrate album art visibility (old boolean format)
         old_file = self.script_dir / "album_art_visible.txt"
         if old_file.exists():
             try:
-                with open(old_file, 'r') as f:
+                with open(old_file, 'r', encoding='utf-8') as f:
                     value = f.read().strip().lower()
                     # Migrate to new mode format
                     settings["album_art_mode"] = "album_art" if (value == "true") else "hidden"
                     migrated = True
-            except:
+            except (IOError, OSError, UnicodeDecodeError):
                 pass
         
         # Save migrated settings and clean up old files
@@ -990,8 +1749,9 @@ class BandcampDownloaderGUI:
             try:
                 with open(settings_file, 'r', encoding='utf-8') as f:
                     settings = json.load(f)
-            except:
-                pass
+            except (FileNotFoundError, json.JSONDecodeError, IOError, OSError):
+                # Settings file is corrupted or unreadable - use defaults
+                settings = {}
         else:
             # If settings.json doesn't exist, try to migrate old settings
             self._migrate_old_settings()
@@ -1000,8 +1760,9 @@ class BandcampDownloaderGUI:
                 try:
                     with open(settings_file, 'r', encoding='utf-8') as f:
                         settings = json.load(f)
-                except:
-                    pass
+                except (FileNotFoundError, json.JSONDecodeError, IOError, OSError):
+                    # Settings file is corrupted or unreadable - use defaults
+                    settings = {}
         
         # Cache the settings if we have an instance
         if hasattr(self, 'root'):
@@ -1009,8 +1770,26 @@ class BandcampDownloaderGUI:
         
         return settings
     
-    def _save_settings(self, settings=None):
-        """Save all settings to settings.json file."""
+    def _save_settings(self, settings=None, debounce=False):
+        """Save all settings to settings.json file.
+        
+        Args:
+            settings: Optional settings dict to save. If None, collects from UI.
+            debounce: If True, debounce the save operation to batch rapid changes.
+        """
+        if debounce:
+            # Cancel any pending save
+            if hasattr(self, '_settings_save_timer') and self._settings_save_timer:
+                self._cancel_timer(self._settings_save_timer)
+            
+            # Schedule debounced save
+            def do_save():
+                self._settings_save_timer = None
+                self._save_settings(settings, debounce=False)
+            
+            self._settings_save_timer = self._schedule_timer(self.SETTINGS_SAVE_DEBOUNCE_MS, do_save)
+            return
+        
         # Clear cache when saving to ensure fresh data on next load
         if hasattr(self, '_cached_settings'):
             delattr(self, '_cached_settings')
@@ -1052,14 +1831,16 @@ class BandcampDownloaderGUI:
                 "split_album_artist_display": self.split_album_artist_display_var.get() if hasattr(self, 'split_album_artist_display_var') else "bandcamp_default",
                 "skip_mp3_reencode": self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True,
                 "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else []),
-                "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else [])
+                "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else []),
+                "theme": self.current_theme if hasattr(self, 'current_theme') else 'dark'
             }
         
         settings_file = self._get_settings_file()
         try:
             with open(settings_file, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)
-        except:
+        except (IOError, OSError, PermissionError):
+            # Settings file cannot be written - log silently (non-critical)
             pass
     
     def get_default_preference(self):
@@ -1635,15 +2416,16 @@ class BandcampDownloaderGUI:
         return options
     
     def _create_dark_menu(self, parent):
-        """Create a dark-themed menu with consistent styling."""
+        """Create a themed menu with consistent styling."""
+        colors = self.theme_colors
         menu = Menu(
             parent,
             tearoff=0,
-            bg='#252526',  # Dark background
-            fg='#CCCCCC',  # Light text
-            activebackground='#2D2D30',  # Hover background
-            activeforeground='#FFFFFF',  # Hover text
-            selectcolor='#007ACC',  # Selection indicator
+            bg=colors.select_bg,
+            fg=colors.fg,
+            activebackground=colors.hover_bg,
+            activeforeground='#FFFFFF' if self.current_theme == 'dark' else colors.fg,
+            selectcolor=colors.accent,
             borderwidth=0,  # No border
             relief='flat',
             activeborderwidth=0  # No border on active items
@@ -1665,7 +2447,8 @@ class BandcampDownloaderGUI:
             Configured Toplevel dialog
         """
         dialog = Toplevel(self.root)
-        dialog.title(title)
+        # Add leading space for nice spacing between icon and title text
+        dialog.title(f" {title}")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -1677,23 +2460,33 @@ class BandcampDownloaderGUI:
         dialog.geometry(f"{width}x{height}+{x}+{y}")
         dialog.resizable(False, False)
         
-        # Configure dialog background
-        dialog.configure(bg='#1E1E1E')
+        # Configure dialog background with theme colors
+        colors = self.theme_colors
+        dialog.configure(bg=colors.bg)
         
         return dialog
     
-    def _create_preview_frame(self, parent, wraplength=530):
+    def _create_preview_frame(self, parent, wraplength=530, bg=None):
         """Create preview frame with common styling.
         
         Args:
             parent: Parent widget
             wraplength: Wraplength for preview text
+            bg: Optional background color (defaults to theme-appropriate background)
             
         Returns:
             Tuple of (preview_frame, preview_text_label)
         """
-        preview_frame = Frame(parent, bg='#1E1E1E', relief='flat', bd=1, 
-                             highlightbackground='#3E3E42', highlightthickness=1)
+        colors = self.theme_colors
+        # Use provided bg, or default to theme-appropriate background
+        if bg is None:
+            # Default: use select_bg for light mode, bg for dark mode (matches dialog pattern)
+            preview_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        else:
+            preview_bg = bg
+        
+        preview_frame = Frame(parent, bg=preview_bg, relief='flat', bd=1, 
+                             highlightbackground=colors.border, highlightthickness=1)
         preview_frame.pack(fill=X, pady=(0, 5))
         
         # Preview label prefix
@@ -1701,8 +2494,8 @@ class BandcampDownloaderGUI:
             preview_frame,
             text="Preview:",
             font=("Consolas", 8),
-            bg='#1E1E1E',
-            fg='#D4D4D4',
+            bg=preview_bg,
+            fg=colors.fg,
             justify='left'
         )
         preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=4)
@@ -1712,8 +2505,8 @@ class BandcampDownloaderGUI:
             preview_frame,
             text="",
             font=("Consolas", 8),
-            bg='#1E1E1E',
-            fg="#2dacd5",
+            bg=preview_bg,
+            fg=colors.preview_link,
             wraplength=wraplength,
             justify='left',
             anchor='w'
@@ -1727,24 +2520,29 @@ class BandcampDownloaderGUI:
         """Show Additional Settings dialog with split album artist display option."""
         dialog = self._create_dialog_base("Additional Settings", 580, 290)
         
-        # Main container
-        main_frame = Frame(dialog, bg='#1E1E1E', padx=10, pady=10)
+        # Use theme colors
+        colors = self.theme_colors
+        # Main container background: dark mode uses bg, light mode uses select_bg (white)
+        main_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        
+        # Main container with theme colors
+        main_frame = Frame(dialog, bg=main_bg, padx=10, pady=10)
         main_frame.pack(fill=BOTH, expand=True)
         
         # Split Album Artist Display Panel
-        split_album_panel = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        split_album_panel = Frame(main_frame, bg=main_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         split_album_panel.pack(fill=X, pady=(0, 15))
         
         # Inner content frame for split album panel
-        split_album_content = Frame(split_album_panel, bg='#1E1E1E')
+        split_album_content = Frame(split_album_panel, bg=main_bg)
         split_album_content.pack(fill=X, padx=6, pady=(6, 6))
         
         split_album_label = Label(
             split_album_content,
             text="In case of Split Artist (Album and Track Artists differ):",
             font=("Segoe UI", 9),
-            bg='#1E1E1E',
-            fg='#D4D4D4'
+            bg=main_bg,
+            fg=colors.fg
         )
         split_album_label.pack(anchor=W, pady=(0, 5))
         
@@ -1803,42 +2601,54 @@ class BandcampDownloaderGUI:
             split_album_content,
             text="Note: Works in tandem with Filename setting. Only applies/previews if filename format includes \"Artist\".",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#A0A0A0',
+            bg=main_bg,
+            fg=colors.disabled_fg,
             wraplength=550,
             justify='left'
         )
         filename_note_label.pack(anchor=W, pady=(4, 4))      
         
         # Preview section (inside split album panel)
-        preview_frame, preview_text = self._create_preview_frame(split_album_content, wraplength=550)
+        preview_frame, preview_text = self._create_preview_frame(split_album_content, wraplength=550, bg=main_bg)
         preview_frame.pack(fill=X, pady=(6, 0))
         
         # MP3 Skip Re-encoding Panel
-        mp3_panel = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        mp3_panel = Frame(main_frame, bg=main_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         mp3_panel.pack(fill=X, pady=(0, 15))
         
         # Inner content frame for MP3 panel
-        mp3_content = Frame(mp3_panel, bg='#1E1E1E')
+        mp3_content = Frame(mp3_panel, bg=main_bg)
         mp3_content.pack(fill=X, padx=6, pady=(6, 6))
         
         # MP3 skip re-encoding checkbox
         mp3_checkbox = Checkbutton(
             mp3_content,
-            text="Skip re-encoding if bandcamp file is an MP3 (When using MP3 (128kbps) format)",
+            text="Skip re-encoding if bandcamp file is an MP3 (When using MP3 format)",
             variable=self.skip_mp3_reencode_var,
-            command=self.save_skip_mp3_reencode,
+            command=self._on_skip_mp3_reencode_change,
             font=("Segoe UI", 9),
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            activebackground='#1E1E1E',
-            activeforeground='#D4D4D4',
-            selectcolor='#1E1E1E',
+            bg=main_bg,
+            fg=colors.fg,
+            activebackground=main_bg,
+            activeforeground=colors.fg,
+            selectcolor=main_bg,
             anchor='w',
             justify='left',
             wraplength=550
         )
         mp3_checkbox.pack(anchor=W, pady=(0, 0))
+        
+        # Note explaining MP3 format behavior (similar to split artist note)
+        mp3_note_label = Label(
+            mp3_content,
+            text="Note: When enabled, preserves source bitrate (varies by album). When disabled, always re-encodes to 128kbps.",
+            font=("Segoe UI", 8),
+            bg=main_bg,
+            fg=colors.disabled_fg,
+            wraplength=550,
+            justify='left'
+        )
+        mp3_note_label.pack(anchor=W, pady=(4, 0))
         
         def generate_split_album_preview():
             """Generate preview filename simulating a split album scenario."""
@@ -2069,14 +2879,14 @@ class BandcampDownloaderGUI:
         update_preview_in_dialog()
         
         # Close button
-        button_frame = Frame(main_frame, bg='#1E1E1E')
+        button_frame = Frame(main_frame, bg=main_bg)
         button_frame.pack(fill=X, pady=(0, 0))
         
         close_btn = Button(
             button_frame,
             text="Close",
             command=dialog.destroy,
-            bg='#007ACC',
+            bg=colors.accent,
             fg='#FFFFFF',
             font=("Segoe UI", 9),
             relief='flat',
@@ -2355,16 +3165,18 @@ class BandcampDownloaderGUI:
         # Update manage button state
         if hasattr(self, 'manage_btn'):
             has_custom = (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates) or (hasattr(self, 'custom_structures') and self.custom_structures)
+            colors = self.theme_colors
+            disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'
             if has_custom:
-                self.manage_btn.config(fg='#808080', cursor='hand2')
+                self.manage_btn.config(fg=colors.disabled_fg, cursor='hand2')
                 # Rebind events if they don't exist
                 if not hasattr(self.manage_btn, '_bound'):
                     self.manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog())
-                    self.manage_btn.bind("<Enter>", lambda e: self.manage_btn.config(fg='#D4D4D4'))
-                    self.manage_btn.bind("<Leave>", lambda e: self.manage_btn.config(fg='#808080'))
+                    self.manage_btn.bind("<Enter>", lambda e: self.manage_btn.config(fg=colors.hover_fg))
+                    self.manage_btn.bind("<Leave>", lambda e: self.manage_btn.config(fg=colors.disabled_fg))
                     self.manage_btn._bound = True
             else:
-                self.manage_btn.config(fg='#404040', cursor='arrow')
+                self.manage_btn.config(fg=disabled_color, cursor='arrow')
                 # Unbind events when disabled
                 try:
                     self.manage_btn.unbind("<Button-1>")
@@ -2390,12 +3202,23 @@ class BandcampDownloaderGUI:
         """Load saved audio format preference, default to Original if not found."""
         settings = self._load_settings()
         format_val = settings.get("audio_format", self.DEFAULT_FORMAT)
-        # Support both old format ("mp3") and new format ("mp3 (128kbps)")
-        if format_val in ["Original", "mp3", "mp3 (128kbps)", "flac", "ogg", "wav"]:
-            # Convert old "mp3" to new format for consistency
-            if format_val == "mp3":
-                return "mp3 (128kbps)"
-            return format_val
+        # Support old formats and convert to current dynamic format
+        # Old formats: "mp3", "mp3 (128kbps)", "flac", "ogg", "wav"
+        # New formats: "Original", "MP3 (varies)", "MP3 (128kbps)", "FLAC", "OGG", "WAV"
+        base_format = self._extract_format(format_val)
+        
+        if base_format == "mp3":
+            # Use current skip re-encode setting to determine label
+            skip_mp3_reencode = self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True
+            return "MP3 (varies)" if skip_mp3_reencode else "MP3 (128kbps)"
+        elif base_format == "flac":
+            return "FLAC"
+        elif base_format == "ogg":
+            return "OGG"
+        elif base_format == "wav":
+            return "WAV"
+        elif format_val == "Original":
+            return "Original"
         return self.DEFAULT_FORMAT
     
     def save_format(self):
@@ -2539,6 +3362,58 @@ class BandcampDownloaderGUI:
         """Load saved MP3 skip re-encoding preference, default to True if not found."""
         settings = self._load_settings()
         return settings.get("skip_mp3_reencode", True)  # Default to True
+    
+    def _get_format_menu_options(self):
+        """Get format menu options with dynamic MP3 label based on skip re-encode setting."""
+        skip_mp3_reencode = self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True
+        mp3_label = "MP3 (varies)" if skip_mp3_reencode else "MP3 (128kbps)"
+        return ["Original", mp3_label, "FLAC", "OGG", "WAV"]
+    
+    def _update_format_menu(self):
+        """Update format menu with current options (for dynamic MP3 label)."""
+        if not hasattr(self, 'format_menu'):
+            return
+        
+        # Get current selection
+        current_selection = self.format_var.get()
+        
+        # Normalize current selection to base format for comparison
+        base_format = self._extract_format(current_selection)
+        
+        # Get new options
+        new_options = self._get_format_menu_options()
+        
+        # Clear and rebuild menu
+        self.format_menu.delete(0, END)
+        
+        def on_format_select(value):
+            self.format_var.set(value)
+            self.on_format_change()
+            self.update_preview()
+        
+        # Rebuild menu items
+        for value in new_options:
+            padded_label = f" {value}      "
+            self.format_menu.add_command(
+                label=padded_label,
+                command=lambda val=value: on_format_select(val)
+            )
+        
+        # Update current selection if it was MP3 (to match new label)
+        # Only update if the current selection is an MP3 variant
+        if base_format == "mp3":
+            # Find the MP3 option in new options
+            for option in new_options:
+                if option.startswith("MP3"):
+                    # Only update if current selection is different
+                    if current_selection != option:
+                        self.format_var.set(option)
+                    break
+    
+    def _on_skip_mp3_reencode_change(self):
+        """Handle skip MP3 re-encode checkbox change."""
+        self.save_skip_mp3_reencode()
+        self._update_format_menu()
     
     def save_skip_mp3_reencode(self):
         """Save MP3 skip re-encoding preference."""
@@ -2724,11 +3599,26 @@ class BandcampDownloaderGUI:
             "You'll be notified when it's complete."
         )
     
+    # ============================================================================
+    # UI SETUP - Main Interface Creation
+    # ============================================================================
     def setup_ui(self):
         """Create the GUI interface."""
         # Main container with compact padding
         main_frame = ttk.Frame(self.root, padding="8")
         main_frame.grid(row=0, column=0, sticky=(W, E, N, S))
+        
+        # Setup UI sections in order
+        self._setup_url_section(main_frame)
+        self._setup_path_section(main_frame)
+        self._setup_settings_and_album_art_section(main_frame)
+        self._setup_preview_section(main_frame)
+        self._setup_download_section(main_frame)
+        self._setup_log_section(main_frame)
+    
+    def _setup_url_section(self, main_frame):
+        """Setup URL input section with Entry and Text widgets."""
+        colors = self.theme_colors
         
         # URL input - supports both single Entry and multi-line ScrolledText
         ttk.Label(main_frame, text="", font=("Segoe UI", 9)).grid(
@@ -2740,8 +3630,8 @@ class BandcampDownloaderGUI:
             main_frame,
             text="➕",  # Plus icon
             font=("Segoe UI", 10),  # Match X button font size
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=colors.bg,
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=1,  # Match X button width
             height=1,  # Match X button height
@@ -2752,12 +3642,12 @@ class BandcampDownloaderGUI:
         # Use rowspan=2 to span both rows (URL label row and URL field row) and sticky to center vertically
         self.url_paste_btn.grid(row=0, column=0, rowspan=2, sticky=(E, N, S), pady=2, padx=0)
         self.url_paste_btn.bind("<Button-1>", lambda e: self._handle_paste_button_Click())
-        self.url_paste_btn.bind("<Enter>", lambda e: self.url_paste_btn.config(fg='#D4D4D4'))
-        self.url_paste_btn.bind("<Leave>", lambda e: self.url_paste_btn.config(fg='#808080'))
+        self.url_paste_btn.bind("<Enter>", lambda e: self.url_paste_btn.config(fg=colors.hover_fg))
+        self.url_paste_btn.bind("<Leave>", lambda e: self.url_paste_btn.config(fg=colors.disabled_fg))
         
         # Container frame for URL widgets (Entry and ScrolledText)
         # Span rows 0-1 to align with URL label (row 0) and paste button (row 1)
-        self.url_container_frame = Frame(main_frame, bg='#1E1E1E')
+        self.url_container_frame = Frame(main_frame, bg=colors.bg)
         self.url_container_frame.grid(row=0, column=1, columnspan=2, rowspan=2, sticky=(W, E, N), pady=0, padx=(8, 0))
         self.url_container_frame.columnconfigure(0, weight=1)  # URL field expands
         self.url_container_frame.columnconfigure(1, weight=0, minsize=20)  # Clear button fixed width
@@ -2766,7 +3656,7 @@ class BandcampDownloaderGUI:
         
         # Single-line Entry widget (default) - with paste button overlay inside
         # Create a frame to hold the Entry and paste button overlay
-        entry_container = Frame(self.url_container_frame, bg='#1E1E1E')
+        entry_container = Frame(self.url_container_frame, bg=colors.bg)
         entry_container.grid(row=0, column=0, sticky=(W, E), pady=0, padx=(0, 4))
         entry_container.columnconfigure(0, weight=1)
         self.entry_container = entry_container  # Store reference
@@ -2777,14 +3667,14 @@ class BandcampDownloaderGUI:
             textvariable=self.url_var,
             width=45,
             font=("Segoe UI", 9),
-            bg='#252526',
-            fg='#CCCCCC',
-            insertbackground='#D4D4D4',
+            bg=colors.entry_bg,
+            fg=colors.entry_fg,
+            insertbackground=colors.fg,
             relief='flat',
             borderwidth=1,
             highlightthickness=2,
-            highlightbackground='#3E3E42',
-            highlightcolor='#007ACC'
+            highlightbackground=colors.border,
+            highlightcolor=colors.accent
         )
         url_entry.grid(row=0, column=0, sticky=(W, E), pady=0, padx=0)
         self.url_entry_widget = url_entry
@@ -2798,8 +3688,8 @@ class BandcampDownloaderGUI:
             self.url_container_frame,
             text="✕",
             font=("Segoe UI", 11),
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=colors.bg,
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=1,
             height=1,
@@ -2810,8 +3700,8 @@ class BandcampDownloaderGUI:
         # Align to center vertically to match entry field
         self.url_clear_btn.grid(row=0, column=1, sticky='', pady=0, padx=(2, 0))
         self.url_clear_btn.bind("<Button-1>", lambda e: self._clear_url_field())
-        self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(fg='#D4D4D4'))
-        self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(fg='#808080'))
+        self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(fg=colors.hover_fg))
+        self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(fg=colors.disabled_fg))
         # Always visible - no grid_remove()
         
         # Expand/Collapse button - toggles between Entry and ScrolledText modes
@@ -2820,8 +3710,8 @@ class BandcampDownloaderGUI:
             self.url_container_frame,
             text=self._get_icon('expand'),  # Default to expand icon
             font=("Segoe UI", 11),
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=colors.bg,
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=1,
             height=1,
@@ -2832,8 +3722,8 @@ class BandcampDownloaderGUI:
         self.url_expand_btn.grid(row=0, column=2, sticky='', pady=0, padx=(2, 0))
         # Repurpose expand/collapse button to toggle URL text height (collapsed/expanded)
         self.url_expand_btn.bind("<Button-1>", self._toggle_url_text_height)
-        self.url_expand_btn.bind("<Enter>", lambda e: self.url_expand_btn.config(fg='#D4D4D4'))
-        self.url_expand_btn.bind("<Leave>", lambda e: self.url_expand_btn.config(fg='#808080'))
+        self.url_expand_btn.bind("<Enter>", lambda e: self.url_expand_btn.config(fg=colors.hover_fg))
+        self.url_expand_btn.bind("<Leave>", lambda e: self.url_expand_btn.config(fg=colors.disabled_fg))
         # Always visible - no grid_remove()
         # Set initial icon based on mode (should be ⤢ for entry mode)
         self._update_url_expand_button()
@@ -2853,7 +3743,7 @@ class BandcampDownloaderGUI:
         url_entry.bind('<Control-y>', lambda e: "break")  # Disable redo (Ctrl+Y - alternative)
         
         # Multi-line Text widget with custom scrollbar (primary URL input - starts collapsed)
-        url_text_frame = Frame(self.url_container_frame, bg='#1E1E1E')
+        url_text_frame = Frame(self.url_container_frame, bg=colors.bg)
         url_text_frame.grid(row=0, column=0, sticky=(W, E, N, S), pady=0)
         # Column 0: Text widget, Column 1: vertical scrollbar
         url_text_frame.columnconfigure(0, weight=1)
@@ -2871,14 +3761,14 @@ class BandcampDownloaderGUI:
             width=45,
             height=1,  # Start with 1 line (collapsed)
             font=("Segoe UI", 9),
-            bg='#252526',
-            fg='#CCCCCC',
-            insertbackground='#D4D4D4',
+            bg=colors.entry_bg,
+            fg=colors.entry_fg,
+            insertbackground=colors.fg,
             relief='flat',
             borderwidth=1,
             highlightthickness=2,
-            highlightbackground='#3E3E42',
-            highlightcolor='#007ACC',
+            highlightbackground=colors.border,
+            highlightcolor=colors.accent,
             wrap='word',  # Enable word wrapping so tags wrap to multiple lines
             spacing1=6,   # Line spacing above first line (in pixels) - creates gap above tags
             spacing2=10,  # Line spacing between lines (in pixels) - creates clear gaps between tag lines
@@ -2887,37 +3777,42 @@ class BandcampDownloaderGUI:
         url_text.grid(row=0, column=0, sticky=(W, E, N, S))
         
         # Dark themed vertical scrollbar bound to the Text widget
+        # Scrollbar: use default style in light mode, custom dark style in dark mode
+        scrollbar_style = 'TScrollbar' if self.current_theme == 'light' else 'Dark.Vertical.TScrollbar'
         url_scrollbar = ttk.Scrollbar(
             url_text_frame,
             orient='vertical',
-            style='Dark.Vertical.TScrollbar',
+            style='TScrollbar',  # Start with base style
             command=url_text.yview
         )
+        self.url_scrollbar = url_scrollbar  # Store reference for theme updates
         url_scrollbar.grid(row=0, column=1, sticky=(N, S))
         url_text.configure(yscrollcommand=url_scrollbar.set)
+        # Apply the correct style after creation (ensures proper initialization)
+        if scrollbar_style != 'TScrollbar':
+            self.root.update_idletasks()  # Force update
+            url_scrollbar.configure(style=scrollbar_style)
 
         self.url_text_widget = url_text
         
         # Create resize handle at the bottom of the text widget (thin, minimal space)
         self.url_text_resize_handle = Label(
             url_text_frame,
-            text="━\n━\n━",  # Three stacked lines for grip icon to indicate draggable
-            bg='#252526',  # Match text widget background to blend in
-            fg='#A0A0A0',  # Lighter gray for better visibility
+            text="➖",  # Single large minus for grip icon to indicate draggable
+            bg=colors.entry_bg,  # Match text widget background to blend in
+            fg=colors.disabled_fg,  # Disabled color for visibility
             cursor='sb_v_double_arrow',  # Vertical resize cursor
             height=4,  # Allow space for 3 lines
             relief='flat',
             borderwidth=0,
-            font=("Segoe UI", 1),  # Slightly larger font for better visibility
+            font=("Segoe UI", 11),  # Slightly larger font for better visibility
             anchor='center',  # Center the text
             justify='center',  # Center the lines
             wraplength=50  # Allow text wrapping if needed
         )
         # Use place() to position it just above the bottom edge, centered and narrower
-        # This way it doesn't take up grid space, doesn't cover borders or scrollbar
-        # Position it centered with some padding from edges
-        # Height matches user's adjustment (10px) to accommodate 3 stacked lines
-        self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=10, y=-2)
+        # Exact width of URL field with adjustments to center placement with no border or scrollbar overlap
+        self.url_text_resize_handle.place(relx=0.5, rely=1.0, width=405, anchor='s', height=5, y=-2, x=-9)
         self.url_text_resize_handle.lower()  # Place behind text widget initially
         self.url_text_resize_handle.place_forget()  # Hidden initially, shown when text widget is visible
 
@@ -2937,8 +3832,8 @@ class BandcampDownloaderGUI:
             url_text_frame,
             text="Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.",
             font=("Segoe UI", 9),
-            bg='#252526',
-            fg='#808080',
+            bg=colors.entry_bg,
+            fg=colors.disabled_fg,
             anchor='nw',
             justify='left',
             padx=4,
@@ -2958,9 +3853,9 @@ class BandcampDownloaderGUI:
         self._update_text_placeholder_visibility()
         
         # Create custom context menu for ScrolledText
-        context_menu = Menu(url_text, tearoff=0, bg='#252526', fg='#CCCCCC', 
-                           activebackground='#007ACC', activeforeground='#FFFFFF',
-                           selectcolor='#007ACC')
+        context_menu = Menu(url_text, tearoff=0, bg=colors.select_bg, fg=colors.fg, 
+                           activebackground=colors.accent, activeforeground='#FFFFFF',
+                           selectcolor=colors.accent)
         context_menu.add_command(label="Paste", command=self._handle_right_Click_paste_text)
         self.url_text_context_menu = context_menu
         
@@ -2982,6 +3877,10 @@ class BandcampDownloaderGUI:
         # Tag protection: handle backspace/delete to remove entire tags
         url_text.bind('<BackSpace>', self._handle_url_tag_backspace, add='+')
         url_text.bind('<Delete>', self._handle_url_tag_delete, add='+')
+    
+    def _setup_path_section(self, main_frame):
+        """Setup download path section with Browse button and Settings icon."""
+        colors = self.theme_colors
         
         # Download path - compact
         # Moved to row 2 to avoid overlap with URL field and paste button (rows 0-1)
@@ -2989,9 +3888,9 @@ class BandcampDownloaderGUI:
             row=2, column=0, sticky=W, pady=2
         )
         path_entry = Entry(main_frame, textvariable=self.path_var, width=35, font=("Segoe UI", 9), 
-                          bg='#252526', fg='#CCCCCC', insertbackground='#D4D4D4',
+                          bg=colors.entry_bg, fg=colors.entry_fg, insertbackground=colors.fg,
                           relief='flat', borderwidth=1, highlightthickness=2,
-                          highlightbackground='#3E3E42', highlightcolor='#007ACC', state='normal')
+                          highlightbackground=colors.border, highlightcolor=colors.accent, state='normal')
         path_entry.grid(row=2, column=1, sticky=(W, E), pady=2, padx=(8, 0))
         self.path_entry = path_entry  # Store reference for unfocus handling
         
@@ -3002,7 +3901,7 @@ class BandcampDownloaderGUI:
         
         # Container frame for Browse button and Settings cog icon
         # Moved to row 2 to align with path field (row 2)
-        browse_container = Frame(main_frame, bg='#1E1E1E')
+        browse_container = Frame(main_frame, bg=colors.bg)
         browse_container.grid(row=2, column=2, sticky=(W, E), padx=(4, 0), pady=0)
         browse_container.columnconfigure(0, weight=1, minsize=80)  # Browse button expands with minimum width
         browse_container.columnconfigure(1, weight=0)  # Cog icon fixed width
@@ -3016,16 +3915,16 @@ class BandcampDownloaderGUI:
             browse_container,
             text=self._get_icon('settings'),
             font=("Segoe UI", 12),
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=colors.bg,
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=2,
             padx=4
         )
         self.settings_cog_btn.grid(row=0, column=1, padx=(8, 0))  # Increased left padding to push Browse button left and align with scrollbar
         self.settings_cog_btn.bind("<Button-1>", self._show_settings_menu)
-        self.settings_cog_btn.bind("<Enter>", lambda e: self.settings_cog_btn.config(fg='#D4D4D4'))
-        self.settings_cog_btn.bind("<Leave>", lambda e: self.settings_cog_btn.config(fg='#808080'))
+        self.settings_cog_btn.bind("<Enter>", lambda e: self.settings_cog_btn.config(fg=colors.hover_fg))
+        self.settings_cog_btn.bind("<Leave>", lambda e: self.settings_cog_btn.config(fg=colors.disabled_fg))
         
         # Create settings menu (will be shown on cog Click)
         self.settings_menu = None
@@ -3035,16 +3934,22 @@ class BandcampDownloaderGUI:
         self.folder_structure_var.trace_add('write', lambda *args: self.update_preview())
         # Note: URL changes are handled by direct event bindings, not trace_add
         # (trace_add would trigger on placeholder text changes)
+    
+    def _setup_settings_and_album_art_section(self, main_frame):
+        """Setup settings frame and album art panel side by side."""
+        colors = self.theme_colors
         
         # Settings section - reduced width to make room for album art panel
         # Moved to row 3 to avoid conflict with path field (row 2)
-        self.settings_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        # Settings frame: dark mode uses bg, light mode uses select_bg (white)
+        settings_frame_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        self.settings_frame = Frame(main_frame, bg=settings_frame_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         self.settings_frame.grid(row=3, column=0, columnspan=2, sticky=(W, E, N), pady=2, padx=0)
         self.settings_frame.grid_propagate(False)
         self.settings_frame.config(height=170)  # Reduced height with equal padding top and bottom
         
         # Inner frame for content
-        self.settings_content = Frame(self.settings_frame, bg='#1E1E1E')
+        self.settings_content = Frame(self.settings_frame, bg=settings_frame_bg)
         # Start at row 0 (no separate header row)
         self.settings_content.grid(row=0, column=0, sticky=(W, E), padx=6, pady=(4, 8))  # Balanced padding: less top, more bottom
         self.settings_frame.columnconfigure(0, weight=1)
@@ -3057,7 +3962,9 @@ class BandcampDownloaderGUI:
         self.settings_content.rowconfigure(2, uniform='settings_row', pad=0)
         
         # Album art panel (separate frame on the right, same height as settings, square for equal padding)
-        self.album_art_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        # Frame background: dark mode uses bg, light mode uses select_bg (white)
+        album_art_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        self.album_art_frame = Frame(main_frame, bg=album_art_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         # Moved to row 3 to align with settings_frame (row 3)
         self.album_art_frame.grid(row=3, column=2, sticky=(W, E, N), pady=2, padx=(6, 0))
         self.album_art_frame.grid_propagate(False)
@@ -3067,11 +3974,13 @@ class BandcampDownloaderGUI:
         self.album_art_frame.rowconfigure(0, weight=1)
         
         # Album art canvas with consistent padding all around (10px padding = 150x150 canvas)
+        # Canvas background: dark mode uses bg, light mode uses select_bg (white)
+        canvas_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
         self.album_art_canvas = Canvas(
             self.album_art_frame,
             width=150,
             height=150,
-            bg='#1E1E1E',
+            bg=canvas_bg,
             highlightthickness=0,
             borderwidth=0,
             cursor='hand2'  # Show hand cursor to indicate it's Clickable
@@ -3086,26 +3995,34 @@ class BandcampDownloaderGUI:
         self.album_art_canvas.create_text(
             75, 75,
             text="Album Art",
-            fill='#808080',
+            fill=colors.disabled_fg,
             font=("Segoe UI", 8)
         )
         
         # Audio Format (first) - with eye icon button on the right when album art is hidden
-        ttk.Label(self.settings_content, text="Format:", font=("Segoe UI", 8)).grid(row=0, column=0, padx=4, sticky=W, pady=1)
+        # Use Settings.TLabel style to match settings frame background (white in light mode)
+        format_label = ttk.Label(self.settings_content, text="Format:", font=("Segoe UI", 8), style='Settings.TLabel')
+        format_label.grid(row=0, column=0, padx=4, sticky=W, pady=1)
         
         def on_format_select(value):
             self.format_var.set(value)
             self.on_format_change()
             self.update_preview()
         
+        # Store references for dynamic updates
         format_menubutton, format_menu = self._create_menubutton_with_menu(
             self.settings_content,
             self.format_var,
-            ["Original", "mp3 (128kbps)", "flac", "ogg", "wav"],
+            self._get_format_menu_options(),
             width=21,
             callback=on_format_select
         )
         format_menubutton.grid(row=0, column=1, padx=4, sticky=W, pady=1)
+        self.format_menubutton = format_menubutton  # Store for dynamic updates
+        self.format_menu = format_menu  # Store for dynamic updates
+        
+        # Update format menu to match current skip re-encode setting and saved format
+        self.root.after_idle(self._update_format_menu)
         
         # Show album art button (hidden by default, shown when album art is hidden)
         # Placed in the same row as Audio Format, right-aligned
@@ -3117,8 +4034,8 @@ class BandcampDownloaderGUI:
             self.settings_content,
             text=eye_icon,
             font=eye_font,
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=colors.bg,
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=2
         )
@@ -3126,18 +4043,22 @@ class BandcampDownloaderGUI:
         # If album art is visible by default, don't add to grid initially to save space
         if self.album_art_mode == "hidden":
             self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
-            self.show_album_art_btn.config(fg='#808080', cursor='hand2')
+            self.show_album_art_btn.config(fg=colors.disabled_fg, cursor='hand2')
         # Always bind events (they'll work when the button is in grid)
         self.show_album_art_btn.bind("<Button-1>", lambda e: self.toggle_album_art())
-        self.show_album_art_btn.bind("<Enter>", lambda e: self.show_album_art_btn.config(fg='#D4D4D4'))
-        self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg='#808080'))
+        self.show_album_art_btn.bind("<Enter>", lambda e: self.show_album_art_btn.config(fg=colors.hover_fg))
+        self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg=colors.disabled_fg))
         
         # Numbering (second, below Audio Format)
-        ttk.Label(self.settings_content, text="Filename:", font=("Segoe UI", 8)).grid(row=1, column=0, padx=4, sticky=W, pady=1)
+        # Use Settings.TLabel style to match settings frame background
+        filename_label = ttk.Label(self.settings_content, text="Filename:", font=("Segoe UI", 8), style='Settings.TLabel')
+        filename_label.grid(row=1, column=0, padx=4, sticky=W, pady=1)
         
         # Create frame for dropdown and buttons (similar to folder structure)
-        filename_frame = Frame(self.settings_content, bg='#1E1E1E', highlightthickness=0, borderwidth=0)
+        # Use settings_frame_bg to match settings content background
+        filename_frame = Frame(self.settings_content, bg=settings_frame_bg, highlightthickness=0, borderwidth=0)
         filename_frame.grid(row=1, column=1, padx=4, sticky=(W, N), pady=1, columnspan=1)
+        self.filename_frame = filename_frame  # Store reference for theme updates
         
         # Create filename menubutton with custom menu (similar to folder structure)
         numbering_menubutton = ttk.Menubutton(
@@ -3166,16 +4087,16 @@ class BandcampDownloaderGUI:
             filename_frame,
             text=self._get_icon('pencil'),
             font=("Segoe UI", 12),
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=settings_frame_bg,
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=2,
             padx=0
         )
         filename_customize_btn.pack(side=LEFT, padx=(0, 0))
         filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog())
-        filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg='#D4D4D4'))
-        filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg='#808080'))
+        filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg=colors.hover_fg))
+        filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg=colors.disabled_fg))
         self.filename_customize_btn = filename_customize_btn  # Store reference
         
         # Update edit button state based on initial selection
@@ -3183,12 +4104,13 @@ class BandcampDownloaderGUI:
         
         # Manage button (🗑️) - trash can icon for managing/deleting filename formats
         has_custom_filename = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
+        disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'  # Lighter disabled for light mode
         filename_manage_btn = Label(
             filename_frame,
             text=self._get_icon('trash'),
             font=("Segoe UI", 12),
-            bg='#1E1E1E',
-            fg='#808080' if has_custom_filename else '#404040',  # Darker when disabled
+            bg=settings_frame_bg,
+            fg=colors.disabled_fg if has_custom_filename else disabled_color,
             cursor='hand2' if has_custom_filename else 'arrow',
             width=3,
             padx=4
@@ -3196,16 +4118,20 @@ class BandcampDownloaderGUI:
         filename_manage_btn.pack(side=LEFT, padx=(2, 0))
         if has_custom_filename:
             filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog())
-            filename_manage_btn.bind("<Enter>", lambda e: filename_manage_btn.config(fg='#D4D4D4') if has_custom_filename else None)
-            filename_manage_btn.bind("<Leave>", lambda e: filename_manage_btn.config(fg='#808080') if has_custom_filename else None)
+            filename_manage_btn.bind("<Enter>", lambda e: filename_manage_btn.config(fg=colors.hover_fg) if has_custom_filename else None)
+            filename_manage_btn.bind("<Leave>", lambda e: filename_manage_btn.config(fg=colors.disabled_fg) if has_custom_filename else None)
         self.filename_manage_btn = filename_manage_btn  # Store reference
         
         # Folder Structure (third, below Numbering)
-        ttk.Label(self.settings_content, text="Folder(s):", font=("Segoe UI", 8)).grid(row=2, column=0, padx=4, sticky=W, pady=1)
+        # Use Settings.TLabel style to match settings frame background
+        folder_label = ttk.Label(self.settings_content, text="Folder(s):", font=("Segoe UI", 8), style='Settings.TLabel')
+        folder_label.grid(row=2, column=0, padx=4, sticky=W, pady=1)
         
         # Create frame for dropdown and buttons
-        structure_frame = Frame(self.settings_content, bg='#1E1E1E', highlightthickness=0, borderwidth=0)
+        # Use settings_frame_bg to match settings content background
+        structure_frame = Frame(self.settings_content, bg=settings_frame_bg, highlightthickness=0, borderwidth=0)
         structure_frame.grid(row=2, column=1, padx=4, sticky=(W, N), pady=1, columnspan=1)  # Don't expand to avoid overlap with column 2
+        self.structure_frame = structure_frame  # Store reference for theme updates
         
         # Use Menubutton + Menu instead of Combobox for separator support
         # Create structure menubutton (custom menu building for separator support)
@@ -3389,25 +4315,26 @@ class BandcampDownloaderGUI:
             structure_frame,
             text=self._get_icon('pencil'),
             font=("Segoe UI", 12),
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=settings_frame_bg,
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=2,
             padx=0
         )
         customize_btn.pack(side=LEFT, padx=(0, 0))  # spacing between buttons
         customize_btn.bind("<Button-1>", lambda e: self._show_customize_dialog())
-        customize_btn.bind("<Enter>", lambda e: customize_btn.config(fg='#D4D4D4'))
-        customize_btn.bind("<Leave>", lambda e: customize_btn.config(fg='#808080'))
+        customize_btn.bind("<Enter>", lambda e: customize_btn.config(fg=colors.hover_fg))
+        customize_btn.bind("<Leave>", lambda e: customize_btn.config(fg=colors.disabled_fg))
         
         # Manage button (🗑️) - trash can icon for managing/deleting structures
         has_custom = hasattr(self, 'custom_structures') and self.custom_structures
+        disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'  # Lighter disabled for light mode
         manage_btn = Label(
             structure_frame,
             text=self._get_icon('trash'),
             font=("Segoe UI", 12),
-            bg='#1E1E1E',
-            fg='#808080' if has_custom else '#404040',  # Darker when disabled
+            bg=settings_frame_bg,
+            fg=colors.disabled_fg if has_custom else disabled_color,
             cursor='hand2' if has_custom else 'arrow',
             width=3,  # Increased width to give icon more room
             padx=4
@@ -3415,8 +4342,8 @@ class BandcampDownloaderGUI:
         manage_btn.pack(side=LEFT, padx=(2, 0))  # Left padding to prevent icon cutoff
         if has_custom:
             manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog())
-            manage_btn.bind("<Enter>", lambda e: manage_btn.config(fg='#D4D4D4') if has_custom else None)
-            manage_btn.bind("<Leave>", lambda e: manage_btn.config(fg='#808080') if has_custom else None)
+            manage_btn.bind("<Enter>", lambda e: manage_btn.config(fg=colors.hover_fg) if has_custom else None)
+            manage_btn.bind("<Leave>", lambda e: manage_btn.config(fg=colors.disabled_fg) if has_custom else None)
         
         # Store references (structure_menubutton and structure_menu already stored above)
         self.customize_btn = customize_btn
@@ -3432,11 +4359,11 @@ class BandcampDownloaderGUI:
             text="Skip post-processing (output original files)",
             variable=self.skip_postprocessing_var,
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            selectcolor='#1E1E1E',
-            activebackground='#1E1E1E',
-            activeforeground='#D4D4D4',
+            bg=settings_frame_bg,
+            fg=colors.fg,
+            selectcolor=settings_frame_bg,
+            activebackground=settings_frame_bg,
+            activeforeground=colors.fg,
             command=self.on_skip_postprocessing_change
         )
         skip_postprocessing_check.grid(row=3, column=0, columnspan=2, padx=4, sticky=W, pady=1)
@@ -3450,14 +4377,15 @@ class BandcampDownloaderGUI:
             text="Save copy of cover art in download folder",
             variable=self.download_cover_art_var,
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            selectcolor='#1E1E1E',
-            activebackground='#1E1E1E',
-            activeforeground='#D4D4D4',
+            bg=settings_frame_bg,
+            fg=colors.fg,
+            selectcolor=settings_frame_bg,
+            activebackground=settings_frame_bg,
+            activeforeground=colors.fg,
             command=self.on_download_cover_art_change
         )
         download_cover_art_check.grid(row=4, column=0, columnspan=2, padx=4, sticky=W, pady=1)
+        self.download_cover_art_check = download_cover_art_check  # Store reference for theme updates
         
         # Create playlist checkbox (below Save copy of cover art)
         create_playlist_check = Checkbutton(
@@ -3465,14 +4393,15 @@ class BandcampDownloaderGUI:
             text="Create playlist file (.m3u)",
             variable=self.create_playlist_var,
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            selectcolor='#1E1E1E',
-            activebackground='#1E1E1E',
-            activeforeground='#D4D4D4',
+            bg=settings_frame_bg,
+            fg=colors.fg,
+            selectcolor=settings_frame_bg,
+            activebackground=settings_frame_bg,
+            activeforeground=colors.fg,
             command=self.on_create_playlist_change
         )
         create_playlist_check.grid(row=5, column=0, columnspan=2, padx=4, sticky=W, pady=1)
+        self.create_playlist_check = create_playlist_check  # Store reference for theme updates
         
         # Download artist discography checkbox (below Create playlist)
         download_discography_check = Checkbutton(
@@ -3480,11 +4409,11 @@ class BandcampDownloaderGUI:
             text="Download artist discography",
             variable=self.download_discography_var,
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            selectcolor='#1E1E1E',
-            activebackground='#1E1E1E',
-            activeforeground='#D4D4D4',
+            bg=settings_frame_bg,
+            fg=colors.fg,
+            selectcolor=settings_frame_bg,
+            activebackground=settings_frame_bg,
+            activeforeground=colors.fg,
             command=self.on_download_discography_change
         )
         download_discography_check.grid(row=6, column=0, columnspan=2, padx=4, sticky=W, pady=1)
@@ -3494,22 +4423,30 @@ class BandcampDownloaderGUI:
         self.settings_content.columnconfigure(0, weight=0)  # Label column - fixed width
         self.settings_content.columnconfigure(1, weight=1)  # Combo column - can expand
         self.settings_content.columnconfigure(2, weight=0)  # Button column - fixed width
+    
+    def _setup_preview_section(self, main_frame):
+        """Setup preview section showing download path preview."""
+        colors = self.theme_colors
         
         # Preview container (below both settings and album art panels)
         # Moved to row 4 to avoid conflict with settings_frame and album_art_frame (row 3)
-        preview_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        # Preview frame: dark mode uses bg, light mode uses entry_bg (#F5F5F5) to match URL field
+        preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        preview_frame = Frame(main_frame, bg=preview_frame_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         preview_frame.grid(row=4, column=0, columnspan=3, sticky=(W, E), pady=(0, 6), padx=0)
+        self.preview_frame = preview_frame  # Store reference for theme updates
         
         # Preview display with "Preview: " in white and path in blue
         preview_label_prefix = Label(
             preview_frame,
             text="Preview: ",
             font=("Consolas", 8),
-            bg='#1E1E1E',
-            fg='#D4D4D4',  # White text
+            bg=preview_frame_bg,
+            fg=colors.fg,
             justify='left'
         )
         preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=0)
+        self.preview_label_prefix = preview_label_prefix  # Store reference for theme updates
         
         # Preview path label (blue, left-aligned, Clickable link)
         self.preview_var = StringVar(value="Select a download path")
@@ -3517,8 +4454,8 @@ class BandcampDownloaderGUI:
             preview_frame,
             textvariable=self.preview_var,
             font=("Consolas", 8),
-            bg='#1E1E1E',
-            fg="#2dacd5",  # Blue text
+            bg=preview_frame_bg,
+            fg=colors.preview_link,
             wraplength=400,  # Reduced to ensure proper wrapping
             justify='left',
             anchor='w',  # Left-align the text
@@ -3526,6 +4463,7 @@ class BandcampDownloaderGUI:
         )
         preview_label_path.grid(row=0, column=1, sticky=W, padx=(0, 6), pady=0)
         preview_frame.columnconfigure(1, weight=1)
+        self.preview_label_path = preview_label_path  # Store reference for theme updates
         
         # Make preview path Clickable - opens folder in Explorer
         def open_preview_path(event=None):
@@ -3587,16 +4525,20 @@ class BandcampDownloaderGUI:
                 messagebox.showerror("Error", f"Could not open path:\n{str(e)}")
         
         preview_label_path.bind('<Button-1>', open_preview_path)
-        preview_label_path.bind('<Enter>', lambda e: preview_label_path.config(fg='#4FC3F7'))  # Lighter blue on hover
-        preview_label_path.bind('<Leave>', lambda e: preview_label_path.config(fg='#2dacd5'))  # Original blue on leave
+        # Set up hover handlers with current theme colors
+        preview_label_path.bind('<Enter>', lambda e: preview_label_path.config(fg=colors.preview_link_hover))
+        preview_label_path.bind('<Leave>', lambda e: preview_label_path.config(fg=colors.preview_link))
+        # Store reference for theme updates
+        self.preview_label_path = preview_label_path
         
         # Format conversion warning (shown below preview when FLAC, OGG, or WAV is selected)
+        colors = self.theme_colors
         self.format_conversion_warning_label = Label(
             main_frame,
             text="⚠ Files are converted from 128kbps MP3 stream source. Quality is not improved. For higher quality, purchase/download directly from Bandcamp.",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg="#FFA500",  # Orange color for warning
+            bg=colors.bg,
+            fg=colors.warning,
             wraplength=480,
             justify='left'
         )
@@ -3608,8 +4550,8 @@ class BandcampDownloaderGUI:
             main_frame,
             text="⚠ Cover art must be embedded manually for OGG files",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg="#FFA500"  # Orange color for warning
+            bg=colors.bg,
+            fg=colors.warning
         )
         self.ogg_warning_label.grid(row=5, column=0, columnspan=3, padx=12, sticky=W, pady=(0, 6))
         self.ogg_warning_label.grid_remove()  # Hidden by default
@@ -3619,12 +4561,14 @@ class BandcampDownloaderGUI:
             main_frame,
             text="⚠ Metadata/cover art cannot be embedded for WAV files",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg="#FFA500"  # Orange color for warning
+            bg=colors.bg,
+            fg=colors.warning
         )
         self.wav_warning_label.grid(row=5, column=0, columnspan=3, padx=12, sticky=W, pady=(0, 2))
         self.wav_warning_label.grid_remove()  # Hidden by default
-        
+    
+    def _setup_download_section(self, main_frame):
+        """Setup download button and progress indicators."""
         # Download button - prominent with Bandcamp blue accent
         self.download_btn = ttk.Button(
             main_frame,
@@ -3671,41 +4615,51 @@ class BandcampDownloaderGUI:
         self.progress_bar.grid(row=8, column=0, columnspan=3, pady=0, sticky=(W, E))
         
         # Overall album progress bar (custom thin 3px bar using Canvas)
+        colors = self.theme_colors
+        # Background: dark mode uses bg, light mode uses entry_bg (#F5F5F5) to match URL field
+        progress_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
         self.overall_progress_bar = ThinProgressBar(
             main_frame,
             height=3,  # 3px thick as requested
-            bg_color='#1E1E1E',  # Match dark background
-            fg_color='#2dacd5'   # Blue color matching main progress bar
+            bg_color=progress_bg,  # Match theme background
+            fg_color=colors.success   # Blue color matching main progress bar
         )
         self.overall_progress_bar.config(mode='determinate', maximum=100, value=0)
         # Hide initially - will show when download starts
         self.overall_progress_bar.grid(row=9, column=0, columnspan=3, pady=(2, 2), sticky=(W, E))
         self.overall_progress_bar.grid_remove()
+    
+    def _setup_log_section(self, main_frame):
+        """Setup status log section with controls."""
+        colors = self.theme_colors
         
         # Status log - compact (using regular Frame for full control)
         # Reduced bottom padding slightly to make room for expand button
-        self.log_frame = Frame(main_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        # Log frame: dark mode uses bg, light mode uses entry_bg (#F5F5F5) to match URL field
+        log_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        self.log_frame = Frame(main_frame, bg=log_frame_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(2, 4), padx=0)
         
         # Label for the frame and controls on same row
-        log_label = Label(self.log_frame, text="Status", bg='#1E1E1E', fg='#D4D4D4', font=("Segoe UI", 9))
+        log_label = Label(self.log_frame, text="Status", bg=log_frame_bg, fg=colors.fg, font=("Segoe UI", 9))
         log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 2))
+        self.log_label = log_label  # Store reference for theme updates
         
         # Clear log button (between Status label and Debug toggle) - styled like Browse button
         # Use same font size as Debug toggle (8) for consistency in header
         # Create a custom style for the small button (based on TButton but with smaller padding and font)
         style = ttk.Style()
         style.configure('Small.TButton', 
-                       background='#252526',  # select_bg
-                       foreground='#D4D4D4',  # fg_color
-                       borderwidth=1,
-                       bordercolor='#3E3E42',  # border_color
+                       background=colors.entry_bg,  # Light gray like URL field
+                       foreground=colors.fg,
+                       borderwidth=0,
+                       bordercolor=colors.entry_bg,  # Match background to hide borders
                        relief='flat',
                        padding=(6, 2),
                        font=("Segoe UI", 8))
         style.map('Small.TButton',
-                 background=[('active', '#3E3E42'), ('pressed', '#1E1E1E')],  # hover_bg, bg_color
-                 bordercolor=[('active', '#3E3E42'), ('pressed', '#3E3E42')])  # border_color
+                 background=[('active', colors.hover_bg), ('pressed', colors.entry_bg)],
+                 bordercolor=[('active', colors.entry_bg), ('pressed', colors.entry_bg)])
         
         self.clear_log_btn = ttk.Button(
             self.log_frame,
@@ -3725,15 +4679,16 @@ class BandcampDownloaderGUI:
             self.log_frame,
             text="Word wrap",
             variable=self.word_wrap_var,
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            selectcolor='#252526',
-            activebackground='#1E1E1E',
-            activeforeground='#D4D4D4',
+            bg=log_frame_bg,
+            fg=colors.fg,
+            selectcolor=log_frame_bg,
+            activebackground=log_frame_bg,
+            activeforeground=colors.fg,
             font=("Segoe UI", 8),
             command=self._toggle_word_wrap
         )
         word_wrap_toggle.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(0, 0))
+        self.word_wrap_toggle = word_wrap_toggle  # Store reference for theme updates
         
         # Debug toggle checkbox (right-aligned on same row as Status label)
         self.debug_mode_var = BooleanVar(value=False)
@@ -3741,15 +4696,16 @@ class BandcampDownloaderGUI:
             self.log_frame,
             text="Debug",
             variable=self.debug_mode_var,
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            selectcolor='#252526',
-            activebackground='#1E1E1E',
-            activeforeground='#D4D4D4',
+            bg=log_frame_bg,
+            fg=colors.fg,
+            selectcolor=log_frame_bg,
+            activebackground=log_frame_bg,
+            activeforeground=colors.fg,
             font=("Segoe UI", 8),
             command=self._toggle_debug_mode
         )
         debug_toggle.grid(row=0, column=3, sticky=E, padx=6, pady=(0, 0))
+        self.debug_toggle = debug_toggle  # Store reference for theme updates
         
         # Configure column weights so controls stay on the right
         self.log_frame.columnconfigure(0, weight=1)
@@ -3759,7 +4715,7 @@ class BandcampDownloaderGUI:
         
         # Inner frame for content (spans all columns to stay full width)
         # Search bar will be at the bottom (row=2), log_content at row=1
-        log_content = Frame(self.log_frame, bg='#1E1E1E')
+        log_content = Frame(self.log_frame, bg=log_frame_bg)
         log_content.grid(row=1, column=0, columnspan=4, sticky=(W, E, N, S), padx=6, pady=(0, 6))
         self.log_frame.rowconfigure(1, weight=1)  # Log content row expands
         # Column 0: Text widget, Column 1: vertical scrollbar
@@ -3771,15 +4727,17 @@ class BandcampDownloaderGUI:
         wrap_mode = WORD if word_wrap_default else 'none'
         
         # Text widget with custom dark-themed ttk scrollbar
+        # Log background: dark mode uses bg (#1E1E1E), light mode uses entry_bg (#F5F5F5) to match URL field
+        log_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
         self.log_text = Text(
             log_content,
             height=6,
             width=55,
             font=("Consolas", 8),
             wrap=wrap_mode,
-            bg='#1E1E1E',
-            fg='#D4D4D4',
-            insertbackground='#D4D4D4',
+            bg=log_bg,
+            fg=colors.fg,
+            insertbackground=colors.fg,
             selectbackground='#264F78',
             selectforeground='#FFFFFF',
             borderwidth=0,
@@ -3789,14 +4747,21 @@ class BandcampDownloaderGUI:
         )
         self.log_text.grid(row=0, column=0, sticky=(W, E, N, S))
 
+        # Scrollbar: use default style in light mode, custom dark style in dark mode
+        scrollbar_style = 'TScrollbar' if self.current_theme == 'light' else 'Dark.Vertical.TScrollbar'
         log_scrollbar = ttk.Scrollbar(
             log_content,
             orient='vertical',
-            style='Dark.Vertical.TScrollbar',
+            style='TScrollbar',  # Start with base style
             command=self.log_text.yview
         )
+        self.log_scrollbar = log_scrollbar  # Store reference for theme updates
         log_scrollbar.grid(row=0, column=1, sticky=(N, S))
         self.log_text.configure(yscrollcommand=log_scrollbar.set)
+        # Apply the correct style after creation (ensures proper initialization)
+        if scrollbar_style != 'TScrollbar':
+            self.root.update_idletasks()  # Force update
+            log_scrollbar.configure(style=scrollbar_style)
         
         # Configure search tags for highlighting matches
         # Yellow for all matches
@@ -3826,8 +4791,8 @@ class BandcampDownloaderGUI:
             self.log_frame,  # Place in log_frame so it's at the bottom
             text="▼",  # Down triangle (like > rotated down)
             font=("Segoe UI", 7),
-            bg='#1E1E1E',
-            fg='#808080',
+            bg=log_frame_bg,  # Match log_frame background
+            fg=colors.disabled_fg,
             cursor='hand2',
             width=1,
             height=1,
@@ -3849,8 +4814,8 @@ class BandcampDownloaderGUI:
         self.log_frame.bind('<Configure>', lambda e: position_button())
         
         self.expand_collapse_btn.bind("<Button-1>", lambda e: self._toggle_window_height())
-        self.expand_collapse_btn.bind("<Enter>", lambda e: self.expand_collapse_btn.config(fg='#D4D4D4'))
-        self.expand_collapse_btn.bind("<Leave>", lambda e: self.expand_collapse_btn.config(fg='#808080'))
+        self.expand_collapse_btn.bind("<Enter>", lambda e: self.expand_collapse_btn.config(fg=colors.hover_fg))
+        self.expand_collapse_btn.bind("<Leave>", lambda e: self.expand_collapse_btn.config(fg=colors.disabled_fg))
         
         # Track if window is expanded
         self.is_expanded = False
@@ -3963,13 +4928,16 @@ class BandcampDownloaderGUI:
     
     def on_closing(self):
         """Handle window closing - also close console."""
+        # Cancel all pending timers
+        self._cancel_all_timers()
+        
         try:
             # Close console window
             kernel32 = ctypes.windll.kernel32
             hwnd = kernel32.GetConsoleWindow()
             if hwnd:
                 kernel32.FreeConsole()
-        except:
+        except (AttributeError, OSError):
             pass
         # Close the GUI
         self.root.destroy()
@@ -5153,7 +6121,7 @@ class BandcampDownloaderGUI:
         
         # Show resize handle when text widget is visible (place it just above bottom edge, centered)
         if hasattr(self, 'url_text_resize_handle'):
-            self.url_text_resize_handle.place(relx=0.5, rely=1.0, relwidth=0.9, anchor='s', height=5, y=-2)
+            self.url_text_resize_handle.place(relx=0.5, rely=1.0, width=405, anchor='s', height=5, y=-2, x=-9)
             self.url_text_resize_handle.lift()  # Bring to front so it's draggable
         
         # Paste button is now outside the URL field, so it's always visible
@@ -8461,7 +9429,7 @@ class BandcampDownloaderGUI:
                 try:
                     # Try to scroll to the same line index
                     self.log_text.see(first_visible)
-                except:
+                except (ValueError, IndexError, TclError):
                     # If that line doesn't exist anymore (e.g., it was a debug line), 
                     # try to maintain approximate position
                     try:
@@ -8476,7 +9444,7 @@ class BandcampDownloaderGUI:
                         if visible_count > 0:
                             target_line = f"{visible_count}.0"
                             self.log_text.see(target_line)
-                    except:
+                    except (ValueError, IndexError, TclError):
                         pass
             except Exception:
                 pass
@@ -8496,6 +9464,11 @@ class BandcampDownloaderGUI:
         if not hasattr(self, 'log_messages'):
             self.log_messages = []
         self.log_messages.append((message, is_debug))
+        
+        # Limit log history size to prevent memory issues
+        if len(self.log_messages) > self.LOG_HISTORY_MAX_SIZE:
+            # Remove oldest messages (keep most recent)
+            self.log_messages = self.log_messages[-self.LOG_HISTORY_MAX_SIZE:]
         
         # Only display if it's not a debug message, or if debug mode is on
         if not is_debug or self.debug_mode:
@@ -8547,23 +9520,24 @@ class BandcampDownloaderGUI:
     
     def _create_search_bar(self):
         """Create the search bar UI."""
-        self.search_frame = Frame(self.log_frame, bg='#252526', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+        colors = self.theme_colors
+        self.search_frame = Frame(self.log_frame, bg=colors.select_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         
         # Search label
-        search_label = Label(self.search_frame, text="Find:", bg='#252526', fg='#D4D4D4', font=("Segoe UI", 8))
+        search_label = Label(self.search_frame, text="Find:", bg=colors.select_bg, fg=colors.fg, font=("Segoe UI", 8))
         search_label.grid(row=0, column=0, sticky=W, padx=(6, 4), pady=4)
         
         # Search entry
         self.search_var = StringVar()
         self.search_entry = Entry(self.search_frame, textvariable=self.search_var, width=25, 
-                                 font=("Segoe UI", 8), bg='#1E1E1E', fg='#CCCCCC', 
-                                 insertbackground='#CCCCCC', relief='flat', borderwidth=1, 
-                                 highlightthickness=1, highlightbackground='#3E3E42',
-                                 highlightcolor='#007ACC')
+                                 font=("Segoe UI", 8), bg=colors.entry_bg, fg=colors.entry_fg, 
+                                 insertbackground=colors.fg, relief='flat', borderwidth=1, 
+                                 highlightthickness=1, highlightbackground=colors.border,
+                                 highlightcolor=colors.accent)
         self.search_entry.grid(row=0, column=1, sticky=(W, E), padx=(0, 4), pady=4)
         
         # Match count label (shows "X of Y" or "No matches") - between search field and buttons
-        self.search_count_label = Label(self.search_frame, text="", bg='#252526', fg='#808080',
+        self.search_count_label = Label(self.search_frame, text="", bg=colors.select_bg, fg=colors.disabled_fg,
                                        font=("Segoe UI", 8))
         self.search_count_label.grid(row=0, column=2, sticky=W, padx=(0, 4), pady=4)
         
@@ -8578,7 +9552,7 @@ class BandcampDownloaderGUI:
         prev_btn.grid(row=0, column=4, sticky=W, padx=(0, 2), pady=4)
         
         # Close button (X)
-        self.search_close_btn = Label(self.search_frame, text="✕", bg='#252526', fg='#808080',
+        self.search_close_btn = Label(self.search_frame, text="✕", bg=colors.select_bg, fg=colors.disabled_fg,
                                      font=("Segoe UI", 9), cursor='hand2', width=1, height=1)
         self.search_close_btn.grid(row=0, column=5, sticky=E, padx=(4, 6), pady=4)
         
@@ -8588,8 +9562,8 @@ class BandcampDownloaderGUI:
             return "break"  # Prevent event propagation
         
         self.search_close_btn.bind("<Button-1>", on_close_Click)
-        self.search_close_btn.bind("<Enter>", lambda e: self.search_close_btn.config(fg='#D4D4D4'))
-        self.search_close_btn.bind("<Leave>", lambda e: self.search_close_btn.config(fg='#808080'))
+        self.search_close_btn.bind("<Enter>", lambda e: self.search_close_btn.config(fg=colors.hover_fg))
+        self.search_close_btn.bind("<Leave>", lambda e: self.search_close_btn.config(fg=colors.disabled_fg))
         
         # Configure column weights
         self.search_frame.columnconfigure(1, weight=1)
@@ -9014,10 +9988,12 @@ class BandcampDownloaderGUI:
         
         match_count = len(self.search_matches)
         if match_count == 0:
-            self.search_count_label.config(text="No matches", fg='#808080')
+            colors = self.theme_colors
+            self.search_count_label.config(text="No matches", fg=colors.disabled_fg)
         else:
+            colors = self.theme_colors
             current = self.current_match_index + 1 if self.current_match_index >= 0 else 1
-            self.search_count_label.config(text=f"{current} of {match_count}", fg='#D4D4D4')
+            self.search_count_label.config(text=f"{current} of {match_count}", fg=colors.fg)
     
     def _find_next(self):
         """Find next match."""
@@ -13637,15 +14613,21 @@ class BandcampDownloaderGUI:
     def _show_settings_menu(self, event):
         """Show settings menu when cog icon is Clicked."""
         if self.settings_menu is None:
+            # Use theme colors for settings menu
+            colors = self.theme_colors
+            # Main container background: dark mode uses entry_bg, light mode uses select_bg (white)
+            menu_bg = colors.select_bg if self.current_theme == 'light' else colors.entry_bg
+            menu_fg = colors.fg
+            
             # Create settings menu
             self.settings_menu = Menu(
                 self.root,
                 tearoff=0,
-                bg='#252526',
-                fg='#CCCCCC',
-                activebackground='#007ACC',
+                bg=menu_bg,
+                fg=menu_fg,
+                activebackground=colors.accent,
                 activeforeground='#FFFFFF',
-                selectcolor='#007ACC',
+                selectcolor=colors.accent,
                 borderwidth=1,
                 relief='flat'
             )
@@ -13666,24 +14648,23 @@ class BandcampDownloaderGUI:
             # Separator
             self.settings_menu.add_separator()
             
-            # Additional Settings
+            # Theme toggle - Switch to Light/Dark Mode
+            theme_label = "Switch to Light Mode" if self.current_theme == 'dark' else "Switch to Dark Mode"
             self.settings_menu.add_command(
-                label="Additional Settings",
-                command=self._show_additional_settings
+                label=theme_label,
+                command=self.toggle_theme
             )
             
-            # Separator
-            self.settings_menu.add_separator()
-            
             # URL Tag Color Scheme submenu
+            colors = self.theme_colors
             self.color_scheme_menu = Menu(
                 self.settings_menu,
                 tearoff=0,
-                bg='#252526',
-                fg='#CCCCCC',
-                activebackground='#007ACC',
+                bg=colors.select_bg,
+                fg=colors.fg,
+                activebackground=colors.accent,
                 activeforeground='#FFFFFF',
-                selectcolor='#007ACC',
+                selectcolor=colors.accent,
                 borderwidth=1,
                 relief='flat'
             )
@@ -13697,6 +14678,15 @@ class BandcampDownloaderGUI:
             self._build_color_scheme_menu()
             
             # Separator
+            self.settings_menu.add_separator()             
+            
+            # Additional Settings
+            self.settings_menu.add_command(
+                label="Additional Settings",
+                command=self._show_additional_settings
+            )           
+            
+            # Separator
             self.settings_menu.add_separator()
             
             # About
@@ -13704,9 +14694,6 @@ class BandcampDownloaderGUI:
                 label="About",
                 command=self._show_about_dialog
             )
-            
-            # Separator
-            self.settings_menu.add_separator()
             
             # Open GitHub Repository
             self.settings_menu.add_command(
@@ -13827,18 +14814,25 @@ class BandcampDownloaderGUI:
             total_width = text_padding + text_width + gap + squares_width + 8  # Right padding
             total_height = max(square_size, text_height) + 4  # Add vertical padding
             
+            # Use theme colors for preview image
+            theme_colors = self.theme_colors
+            # Main container background: dark mode uses entry_bg, light mode uses select_bg (white)
+            preview_bg = theme_colors.select_bg if self.current_theme == 'light' else theme_colors.entry_bg
+            preview_fg = theme_colors.fg
+            preview_border = theme_colors.border
+            
             # Create image with menu background color
-            img = Image.new('RGB', (total_width, total_height), color='#252526')
+            img = Image.new('RGB', (total_width, total_height), color=preview_bg)
             draw = ImageDraw.Draw(img)
             
             # Draw scheme name text (left side)
             text_x = text_padding
             text_y = (total_height - text_height) // 2
             if font:
-                draw.text((text_x, text_y), display_name, fill='#CCCCCC', font=font)
+                draw.text((text_x, text_y), display_name, fill=preview_fg, font=font)
             else:
                 # Fallback: draw text without font (basic rendering)
-                draw.text((text_x, text_y), display_name, fill='#CCCCCC')
+                draw.text((text_x, text_y), display_name, fill=preview_fg)
             
             # Draw colored squares (right side)
             squares_x = text_padding + text_width + gap
@@ -13860,7 +14854,7 @@ class BandcampDownloaderGUI:
                 draw.rectangle(
                     [x1, y1, x2, y2],
                     fill=(r, g, b),
-                    outline='#3E3E42',  # Subtle border
+                    outline=preview_border,  # Theme-aware border
                     width=1
                 )
             
@@ -14188,17 +15182,22 @@ class BandcampDownloaderGUI:
             )
             return
         
+        # Use theme colors
+        colors = self.theme_colors
+        # Main container background: dark mode uses bg, light mode uses select_bg (white)
+        main_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        
         # Show loading dialog first
         loading_dialog = self._create_dialog_base("Loading Themes", 400, 120)
-        loading_frame = Frame(loading_dialog, bg='#1E1E1E')
+        loading_frame = Frame(loading_dialog, bg=main_bg)
         loading_frame.pack(fill=BOTH, expand=True, padx=20, pady=20)
         
         loading_label = Label(
             loading_frame,
             text="Loading theme previews...",
             font=("Segoe UI", 10),
-            bg='#1E1E1E',
-            fg='#CCCCCC'
+            bg=main_bg,
+            fg=colors.fg
         )
         loading_label.pack(pady=(0, 10))
         
@@ -14254,7 +15253,7 @@ class BandcampDownloaderGUI:
             """Build the dialog UI with placeholder colors (lazy loading)."""
             
             # Main container
-            main_frame = Frame(dialog, bg='#1E1E1E')
+            main_frame = Frame(dialog, bg=main_bg)
             main_frame.pack(fill=BOTH, expand=True, padx=8, pady=8)
             
             # Title
@@ -14262,8 +15261,8 @@ class BandcampDownloaderGUI:
                 main_frame,
                 text="Available Themes",
                 font=("Segoe UI", 11, "bold"),
-                bg='#1E1E1E',
-                fg='#D4D4D4'
+                bg=main_bg,
+                fg=colors.fg
             )
             title_label.pack(pady=(0, 5))
             
@@ -14272,19 +15271,21 @@ class BandcampDownloaderGUI:
                 main_frame,
                 text="Select themes to download. Your custom themes will be preserved.",
                 font=("Segoe UI", 8),
-                bg='#1E1E1E',
-                fg='#808080',
+                bg=main_bg,
+                fg=colors.disabled_fg,
                 wraplength=630
             )
             desc_label.pack(pady=(0, 8))
             
             # Scrollable frame for theme list
-            list_container = Frame(main_frame, bg='#1E1E1E')
+            list_container = Frame(main_frame, bg=main_bg)
             list_container.pack(fill=BOTH, expand=True, pady=(0, 10))
             
-            canvas = Canvas(list_container, bg='#1E1E1E', highlightthickness=0)
-            scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview, style='Dark.Vertical.TScrollbar')
-            scrollable_frame = Frame(canvas, bg='#1E1E1E')
+            canvas = Canvas(list_container, bg=main_bg, highlightthickness=0)
+            # Use theme-appropriate scrollbar style
+            scrollbar_style = 'TScrollbar' if self.current_theme == 'light' else 'Dark.Vertical.TScrollbar'
+            scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview, style=scrollbar_style)
+            scrollable_frame = Frame(canvas, bg=main_bg)
             
             def on_frame_configure(event):
                 canvas.configure(scrollregion=canvas.bbox("all"))
@@ -14309,9 +15310,12 @@ class BandcampDownloaderGUI:
             dialog.theme_checkboxes = {}
             dialog.theme_data = {}
             
+            # Theme item background: use entry_bg for a slightly different shade
+            item_bg = colors.entry_bg if self.current_theme == 'light' else colors.entry_bg
+            
             # Create theme items
             for theme in available_themes:
-                theme_frame = Frame(scrollable_frame, bg='#252526', relief='flat', borderwidth=1)
+                theme_frame = Frame(scrollable_frame, bg=item_bg, relief='flat', borderwidth=1, highlightbackground=colors.border, highlightthickness=1)
                 theme_frame.pack(fill=X, padx=4, pady=3)
                 
                 # Checkbox
@@ -14319,17 +15323,17 @@ class BandcampDownloaderGUI:
                 checkbox = Checkbutton(
                     theme_frame,
                     variable=var,
-                    bg='#252526',
-                    fg='#CCCCCC',
-                    activebackground='#252526',
-                    activeforeground='#CCCCCC',
-                    selectcolor='#1E1E1E'
+                    bg=item_bg,
+                    fg=colors.fg,
+                    activebackground=item_bg,
+                    activeforeground=colors.fg,
+                    selectcolor=main_bg
                 )
                 checkbox.pack(side=LEFT, padx=6, pady=6)
                 dialog.theme_checkboxes[theme["filename"]] = var
                 
                 # Color preview frame (store reference for lazy loading)
-                preview_frame = Frame(theme_frame, bg='#252526')
+                preview_frame = Frame(theme_frame, bg=item_bg)
                 preview_frame.pack(side=LEFT, padx=(0, 8), pady=6)
                 preview_frames[theme["filename"]] = preview_frame  # Store for updating
                 
@@ -14350,7 +15354,7 @@ class BandcampDownloaderGUI:
                         pass
                 
                 # Theme info frame
-                info_frame = Frame(theme_frame, bg='#252526')
+                info_frame = Frame(theme_frame, bg=item_bg)
                 info_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 6), pady=6)
                 
                 # Theme name and description
@@ -14362,8 +15366,8 @@ class BandcampDownloaderGUI:
                     info_frame,
                     text=name_text,
                     font=("Segoe UI", 9),
-                    bg='#252526',
-                    fg='#D4D4D4',
+                    bg=item_bg,
+                    fg=colors.fg,
                     anchor='w',
                     wraplength=400
                 )
@@ -14387,7 +15391,7 @@ class BandcampDownloaderGUI:
                 dialog.theme_data[theme["filename"]] = {"theme": theme, "conflict": False}
             
             # Buttons frame
-            buttons_frame = Frame(main_frame, bg='#1E1E1E')
+            buttons_frame = Frame(main_frame, bg=main_bg)
             buttons_frame.pack(fill=X, pady=(8, 0))
             
             # Select All / Deselect All buttons
@@ -14454,11 +15458,12 @@ class BandcampDownloaderGUI:
                     widget.destroy()
                 
                 # Create new color swatches with actual colors
+                # Use item_bg for the label background (matches preview_frame background)
                 for i, color in enumerate(colors[:6]):
                     try:
                         color_label = Label(
                             preview_frame,
-                            bg=color,
+                            bg=color,  # The actual theme color
                             width=1,
                             height=1,
                             relief='flat',
@@ -14687,17 +15692,22 @@ class BandcampDownloaderGUI:
             selected_themes: List of theme filenames to install
             conflict_resolution: How to handle conflicts ("overwrite", "rename", or "skip")
         """
+        # Use theme colors
+        colors = self.theme_colors
+        # Main container background: dark mode uses bg, light mode uses select_bg (white)
+        main_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        
         # Create progress dialog
         progress_dialog = self._create_dialog_base("Installing Themes", 400, 150)
-        progress_frame = Frame(progress_dialog, bg='#1E1E1E')
+        progress_frame = Frame(progress_dialog, bg=main_bg)
         progress_frame.pack(fill=BOTH, expand=True, padx=20, pady=20)
         
         status_label = Label(
             progress_frame,
             text="Downloading themes...",
             font=("Segoe UI", 9),
-            bg='#1E1E1E',
-            fg='#CCCCCC'
+            bg=main_bg,
+            fg=colors.fg
         )
         status_label.pack(pady=(0, 10))
         
@@ -14706,8 +15716,8 @@ class BandcampDownloaderGUI:
             progress_frame,
             textvariable=progress_var,
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#808080'
+            bg=main_bg,
+            fg=colors.disabled_fg
         )
         progress_label.pack()
         
@@ -14859,8 +15869,13 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         """
         dialog = self._create_dialog_base("Customize Folder Structure", 580, 350)
         
+        # Use theme colors
+        colors = self.theme_colors
+        # Main container background: dark mode uses bg, light mode uses select_bg (white)
+        main_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        
         # Main container for all content
-        main_container = Frame(dialog, bg='#1E1E1E')
+        main_container = Frame(dialog, bg=main_bg)
         main_container.pack(fill=BOTH, expand=True, padx=10, pady=5)
         
         # Title
@@ -14868,8 +15883,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             main_container,
             text="Customize Folder Structure",
             font=("Segoe UI", 10, "bold"),
-            bg='#1E1E1E',
-            fg='#D4D4D4'
+            bg=main_bg,
+            fg=colors.fg
         )
         title_label.pack(pady=(3, 2))
         
@@ -14878,17 +15893,17 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             main_container,
             text="Type a template using tags like Artist, Album, etc. Use / to separate folder levels",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#808080'
+            bg=main_bg,
+            fg=colors.disabled_fg
         )
         instructions.pack(pady=(0, 5))
         
         # Template input section
-        template_frame = Frame(main_container, bg='#1E1E1E')
+        template_frame = Frame(main_container, bg=main_bg)
         template_frame.pack(fill=X, pady=(0, 5))
         
         # Label row (horizontal frame for label + warning)
-        label_row = Frame(template_frame, bg='#1E1E1E')
+        label_row = Frame(template_frame, bg=main_bg)
         label_row.pack(anchor=W, pady=(0, 3))
         
         # Label for template input
@@ -14896,8 +15911,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             label_row,
             text="Folder structure:",
             font=("Segoe UI", 9),
-            bg='#1E1E1E',
-            fg='#D4D4D4'
+            bg=main_bg,
+            fg=colors.fg
         )
         template_label.pack(side=LEFT)
         
@@ -14905,14 +15920,14 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         template_text = Text(
             template_frame,
             font=("Segoe UI", 9),
-            bg='#252526',
-            fg='#CCCCCC',
-            insertbackground='#D4D4D4',
+            bg=colors.entry_bg,
+            fg=colors.entry_fg,
+            insertbackground=colors.fg,
             relief='flat',
             borderwidth=1,
             highlightthickness=2,
-            highlightbackground='#3E3E42',
-            highlightcolor='#007ACC',
+            highlightbackground=colors.border,
+            highlightcolor=colors.accent,
             height=3,
             wrap=WORD,
             padx=5,
@@ -14924,11 +15939,11 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Add character filtering for folder (blocks: : * ? " < > |, allows \ /)
         self._setup_folder_character_filter(dialog, template_text, template_frame)
         
-        # Configure tag styling
-        template_text.tag_configure("tag", background='#007ACC', foreground='#FFFFFF', 
+        # Configure tag styling - use accent color (blue) for tags
+        template_text.tag_configure("tag", background=colors.accent, foreground='#FFFFFF', 
                                    relief='flat', borderwidth=0, 
                                    font=("Segoe UI", 9))
-        template_text.tag_configure("tag_bg", background='#007ACC', foreground='#FFFFFF')
+        template_text.tag_configure("tag_bg", background=colors.accent, foreground='#FFFFFF')
         
         # Store tag positions for deletion handling
         dialog.tag_positions = {}  # {tag_id: (start, end)}
@@ -14948,13 +15963,13 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             template_frame,
             text="Quick insert:",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#808080'
+            bg=main_bg,
+            fg=colors.disabled_fg
         )
         tags_label.pack(anchor=W, pady=(0, 3))
         
         # Container for tag buttons (will wrap using grid)
-        tags_container = Frame(template_frame, bg='#1E1E1E')
+        tags_container = Frame(template_frame, bg=main_bg)
         tags_container.pack(fill=X, pady=(0, 5))
         
         # Create tag buttons with wrapping (folder tags + "/" for level separator)
@@ -15078,8 +16093,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         template_text.bind('<Control-y>', lambda e: self._handle_folder_template_redo(dialog, e))
         
         # Create right-Click context menu for tag deletion
-        tag_context_menu = Menu(template_text, tearoff=0, bg='#252526', fg='#D4D4D4',
-                                activebackground='#3E3E42', activeforeground='#FFFFFF')
+        tag_context_menu = Menu(template_text, tearoff=0, bg=colors.entry_bg, fg=colors.fg,
+                                activebackground=colors.hover_bg, activeforeground=colors.select_fg)
         
         def show_tag_context_menu(event):
             """Show context menu when right-Clicking on a tag."""
@@ -15148,7 +16163,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self._update_folder_preview(dialog)
         
         # Buttons frame
-        buttons_frame = Frame(main_container, bg='#1E1E1E')
+        buttons_frame = Frame(main_container, bg=main_bg)
         buttons_frame.pack(pady=(3, 5))
         
         # Show different buttons when editing existing structure vs creating new
@@ -16658,7 +17673,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             return
         
         dialog = Toplevel(self.root)
-        dialog.title("Delete Custom Folder Structures")
+        dialog.title(" Delete Custom Folder Structures")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -16669,21 +17684,26 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 150
         dialog.geometry(f"400x300+{x}+{y}")
         
+        # Use theme colors
+        colors = self.theme_colors
+        # Main container background: dark mode uses bg, light mode uses select_bg (white)
+        main_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        
         # Configure dialog background
-        dialog.configure(bg='#1E1E1E')
+        dialog.configure(bg=main_bg)
         
         # Title
         title_label = Label(
             dialog,
             text="Delete Custom Folder Structures",
             font=("Segoe UI", 10, "bold"),
-            bg='#1E1E1E',
-            fg='#D4D4D4'
+            bg=main_bg,
+            fg=colors.fg
         )
         title_label.pack(pady=(10, 10))
         
         # Container for structure list
-        list_frame = Frame(dialog, bg='#1E1E1E')
+        list_frame = Frame(dialog, bg=main_bg)
         list_frame.pack(pady=10, padx=20, fill=BOTH, expand=True)
         
         # Create list of structures with delete buttons
@@ -16691,7 +17711,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # First show old format structures
         if has_old_structures:
             for structure in self.custom_structures:
-                structure_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+                structure_frame = Frame(list_frame, bg=main_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
                 structure_frame.pack(fill=X, pady=2, padx=5)
                 
                 # Structure label
@@ -16700,8 +17720,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                     structure_frame,
                     text=formatted,
                     font=("Segoe UI", 9),
-                    bg='#1E1E1E',
-                    fg='#D4D4D4',
+                    bg=main_bg,
+                    fg=colors.fg,
                     anchor=W
                 )
                 structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
@@ -16718,7 +17738,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Then show template structures (new format) - newest at end
         if has_templates:
             for template_data in self.custom_structure_templates:
-                structure_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+                structure_frame = Frame(list_frame, bg=main_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
                 structure_frame.pack(fill=X, pady=2, padx=5)
                 
                 # Structure label
@@ -16727,8 +17747,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                     structure_frame,
                     text=formatted,
                     font=("Segoe UI", 9),
-                    bg='#1E1E1E',
-                    fg='#D4D4D4',
+                    bg=main_bg,
+                    fg=colors.fg,
                     anchor=W
                 )
                 structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
@@ -16826,8 +17846,13 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         """
         dialog = self._create_dialog_base("Customize Filename Format", 580, 350)
         
+        # Use theme colors
+        colors = self.theme_colors
+        # Main container background: dark mode uses bg, light mode uses select_bg (white)
+        main_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        
         # Main container for all content
-        main_container = Frame(dialog, bg='#1E1E1E')
+        main_container = Frame(dialog, bg=main_bg)
         main_container.pack(fill=BOTH, expand=True, padx=10, pady=5)
         
         # Title
@@ -16835,8 +17860,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             main_container,
             text="Customize Filename Format",
             font=("Segoe UI", 10, "bold"),
-            bg='#1E1E1E',
-            fg='#D4D4D4'
+            bg=main_bg,
+            fg=colors.fg
         )
         title_label.pack(pady=(3, 2))
         
@@ -16845,17 +17870,17 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             main_container,
             text="Type a template using tags like 01, Track, Artist, etc. (tags are automatically detected)",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#808080'
+            bg=main_bg,
+            fg=colors.disabled_fg
         )
         instructions.pack(pady=(0, 5))
         
         # Template input section
-        template_frame = Frame(main_container, bg='#1E1E1E')
+        template_frame = Frame(main_container, bg=main_bg)
         template_frame.pack(fill=X, pady=(0, 5))
         
         # Label row (horizontal frame for label + warning)
-        label_row = Frame(template_frame, bg='#1E1E1E')
+        label_row = Frame(template_frame, bg=main_bg)
         label_row.pack(anchor=W, pady=(0, 3))
         
         # Label for template input
@@ -16863,8 +17888,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             label_row,
             text="Filename format:",
             font=("Segoe UI", 9),
-            bg='#1E1E1E',
-            fg='#D4D4D4'
+            bg=main_bg,
+            fg=colors.fg
         )
         template_label.pack(side=LEFT)
         
@@ -16872,14 +17897,14 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         template_text = Text(
             template_frame,
             font=("Segoe UI", 9),
-            bg='#252526',
-            fg='#CCCCCC',
-            insertbackground='#D4D4D4',
+            bg=colors.entry_bg,
+            fg=colors.entry_fg,
+            insertbackground=colors.fg,
             relief='flat',
             borderwidth=1,
             highlightthickness=2,
-            highlightbackground='#3E3E42',
-            highlightcolor='#007ACC',
+            highlightbackground=colors.border,
+            highlightcolor=colors.accent,
             height=3,
             wrap=WORD,
             padx=5,
@@ -16891,11 +17916,11 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Add character filtering for filename (blocks: \ / : * ? " < > |)
         self._setup_filename_character_filter(dialog, template_text, template_frame)
         
-        # Configure tag styling
-        template_text.tag_configure("tag", background='#007ACC', foreground='#FFFFFF', 
+        # Configure tag styling - use accent color (blue) for tags
+        template_text.tag_configure("tag", background=colors.accent, foreground='#FFFFFF', 
                                    relief='flat', borderwidth=0, 
                                    font=("Segoe UI", 9))
-        template_text.tag_configure("tag_bg", background='#007ACC', foreground='#FFFFFF')
+        template_text.tag_configure("tag_bg", background=colors.accent, foreground='#FFFFFF')
         
         # Store tag positions for deletion handling
         dialog.tag_positions = {}  # {tag_id: (start, end)}
@@ -16915,13 +17940,13 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             template_frame,
             text="Quick insert:",
             font=("Segoe UI", 8),
-            bg='#1E1E1E',
-            fg='#808080'
+            bg=main_bg,
+            fg=colors.disabled_fg
         )
         tags_label.pack(anchor=W, pady=(0, 3))
         
         # Container for tag buttons (will wrap using grid)
-        tags_container = Frame(template_frame, bg='#1E1E1E')
+        tags_container = Frame(template_frame, bg=main_bg)
         tags_container.pack(fill=X, pady=(0, 5))
         
         # Create tag buttons with wrapping (no curly brackets)
@@ -17017,8 +18042,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         template_text.bind('<Control-y>', lambda e: self._handle_template_redo(dialog, e))
         
         # Create right-Click context menu for tag deletion
-        tag_context_menu = Menu(template_text, tearoff=0, bg='#252526', fg='#D4D4D4',
-                                activebackground='#3E3E42', activeforeground='#FFFFFF')
+        tag_context_menu = Menu(template_text, tearoff=0, bg=colors.entry_bg, fg=colors.fg,
+                                activebackground=colors.hover_bg, activeforeground=colors.select_fg)
         
         def show_tag_context_menu(event):
             """Show context menu when right-Clicking on a tag."""
@@ -17089,7 +18114,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         self._update_filename_preview(dialog)
         
         # Buttons frame
-        buttons_frame = Frame(main_container, bg='#1E1E1E')
+        buttons_frame = Frame(main_container, bg=main_bg)
         buttons_frame.pack(pady=(3, 5))
         
         # Show different buttons when editing existing format vs creating new
@@ -18062,7 +19087,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             return
         
         dialog = Toplevel(self.root)
-        dialog.title("Delete Custom Filename Formats")
+        dialog.title(" Delete Custom Filename Formats")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -18073,26 +19098,31 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 150
         dialog.geometry(f"400x300+{x}+{y}")
         
+        # Use theme colors
+        colors = self.theme_colors
+        # Main container background: dark mode uses bg, light mode uses select_bg (white)
+        main_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        
         # Configure dialog background
-        dialog.configure(bg='#1E1E1E')
+        dialog.configure(bg=main_bg)
         
         # Title
         title_label = Label(
             dialog,
             text="Delete Custom Filename Formats",
             font=("Segoe UI", 10, "bold"),
-            bg='#1E1E1E',
-            fg='#D4D4D4'
+            bg=main_bg,
+            fg=colors.fg
         )
         title_label.pack(pady=(10, 10))
         
         # Container for format list
-        list_frame = Frame(dialog, bg='#1E1E1E')
+        list_frame = Frame(dialog, bg=main_bg)
         list_frame.pack(pady=10, padx=20, fill=BOTH, expand=True)
         
         # Create list of formats with delete buttons
         for format_data in self.custom_filename_formats:
-            format_frame = Frame(list_frame, bg='#1E1E1E', relief='flat', bd=1, highlightbackground='#3E3E42', highlightthickness=1)
+            format_frame = Frame(list_frame, bg=main_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
             format_frame.pack(fill=X, pady=2, padx=5)
             
             # Format label
@@ -18101,8 +19131,8 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 format_frame,
                 text=formatted,
                 font=("Segoe UI", 9),
-                bg='#1E1E1E',
-                fg='#D4D4D4',
+                bg=main_bg,
+                fg=colors.fg,
                 anchor=W
             )
             format_label.pack(side=LEFT, padx=10, fill=X, expand=True)
@@ -18163,9 +19193,11 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         """Update filename edit button state based on current selection."""
         if hasattr(self, 'filename_customize_btn'):
             numbering_style = self.numbering_var.get()
+            colors = self.theme_colors
             # Disable edit button when "Original" is selected (nothing to customize)
             if numbering_style == "Original":
-                self.filename_customize_btn.config(fg='#404040', cursor='arrow')
+                disabled_color = '#404040' if self.current_theme == 'dark' else '#A0A0A0'
+                self.filename_customize_btn.config(fg=disabled_color, cursor='arrow')
                 # Unbind events
                 try:
                     self.filename_customize_btn.unbind("<Button-1>")
@@ -18175,24 +19207,26 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                     pass
             else:
                 # Enable edit button for other formats
-                self.filename_customize_btn.config(fg='#808080', cursor='hand2')
+                self.filename_customize_btn.config(fg=colors.disabled_fg, cursor='hand2')
                 # Rebind events
                 self.filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog())
-                self.filename_customize_btn.bind("<Enter>", lambda e: self.filename_customize_btn.config(fg='#D4D4D4'))
-                self.filename_customize_btn.bind("<Leave>", lambda e: self.filename_customize_btn.config(fg='#808080'))
+                self.filename_customize_btn.bind("<Enter>", lambda e: self.filename_customize_btn.config(fg=colors.hover_fg))
+                self.filename_customize_btn.bind("<Leave>", lambda e: self.filename_customize_btn.config(fg=colors.disabled_fg))
     
     def _update_filename_manage_button(self):
         """Update filename manage button state based on whether custom formats exist."""
         if hasattr(self, 'filename_manage_btn'):
+            colors = self.theme_colors
             has_custom = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
             if has_custom:
-                self.filename_manage_btn.config(fg='#808080', cursor='hand2')
+                self.filename_manage_btn.config(fg=colors.disabled_fg, cursor='hand2')
                 # Rebind events
                 self.filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog())
-                self.filename_manage_btn.bind("<Enter>", lambda e: self.filename_manage_btn.config(fg='#D4D4D4'))
-                self.filename_manage_btn.bind("<Leave>", lambda e: self.filename_manage_btn.config(fg='#808080'))
+                self.filename_manage_btn.bind("<Enter>", lambda e: self.filename_manage_btn.config(fg=colors.hover_fg))
+                self.filename_manage_btn.bind("<Leave>", lambda e: self.filename_manage_btn.config(fg=colors.disabled_fg))
             else:
-                self.filename_manage_btn.config(fg='#404040', cursor='arrow')
+                disabled_color = '#404040' if self.current_theme == 'dark' else '#A0A0A0'
+                self.filename_manage_btn.config(fg=disabled_color, cursor='arrow')
                 # Unbind events
                 try:
                     self.filename_manage_btn.unbind("<Button-1>")
