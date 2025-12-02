@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import sys
 import subprocess
@@ -7878,14 +7878,35 @@ class BandcampDownloaderGUI:
                     # Extract all available fields
                     all_metadata = {}
                     
-                    # Basic info
-                    all_metadata['artist'] = info.get("artist") or info.get("uploader") or info.get("channel") or info.get("creator")
-                    all_metadata['album'] = info.get("album") or info.get("title")
-                    all_metadata['title'] = info.get("title")
-                    all_metadata['album_artist'] = info.get("album_artist") or info.get("albumartist") or all_metadata.get('artist')
+                    # Basic info - check top-level first, then entries
+                    entries = info.get("entries", [])
+                    first_entry = entries[0] if entries else None
                     
-                    # Dates
-                    release_date = info.get("release_date") or info.get("upload_date")
+                    # Artist: try top-level, then first entry, then uploader/channel/creator
+                    all_metadata['artist'] = (info.get("artist") or 
+                                            (first_entry.get("artist") if first_entry else None) or
+                                            info.get("uploader") or 
+                                            info.get("channel") or 
+                                            info.get("creator"))
+                    
+                    # Album: try top-level, then first entry
+                    all_metadata['album'] = (info.get("album") or 
+                                           (first_entry.get("album") if first_entry else None) or
+                                           info.get("title"))
+                    all_metadata['title'] = info.get("title")
+                    
+                    # Album Artist: try top-level, then first entry, then fallback to artist
+                    all_metadata['album_artist'] = (info.get("album_artist") or 
+                                                  info.get("albumartist") or
+                                                  (first_entry.get("album_artist") if first_entry else None) or
+                                                  (first_entry.get("albumartist") if first_entry else None) or
+                                                  all_metadata.get('artist'))
+                    
+                    # Dates - check top-level and first entry
+                    release_date = (info.get("release_date") or 
+                                  info.get("upload_date") or
+                                  (first_entry.get("release_date") if first_entry else None) or
+                                  (first_entry.get("upload_date") if first_entry else None))
                     if release_date:
                         all_metadata['date'] = release_date
                         if len(release_date) >= 4:
