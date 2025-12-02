@@ -2,7 +2,7 @@
 
 # <img src="images/icon-title.png" width="32" height="32" alt="Icon"> Bandcamp Downloader (Python Edition)
 
-[![Download](images/download-button.png)](https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.0)
+[![Download](images/download-button.png)]([https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.7))
 
 </div>
 
@@ -48,7 +48,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 
 **Installation**
 
-1. Download [BandcampDownloader.exe](https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.0) and run it! (everything else is automatic)
+1. Download [BandcampDownloader.exe](https://github.com/kameryn1811/Bandcamp-Downloader/releases/tag/Launcher_v1.2.7) and run it! (everything else is automatic)
 2. **Note:** You may see a Windows Defender SmartScreen Warning, see [Troubleshooting](#troubleshooting) for more information. 
 3. What it Does:
    - Downloads the latest `bandcamp_dl_gui.py` script from GitHub and Launches it
