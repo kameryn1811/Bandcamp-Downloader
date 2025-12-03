@@ -4,7 +4,7 @@ Self-contained launcher that bundles Python, ffmpeg, and auto-updates the main s
 """
 
 # Launcher version (update this when releasing a new launcher.exe)
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 import sys
 import os
@@ -515,9 +515,9 @@ def apply_launcher_update(show_dialog=True):
         except:
             pass  # Windows doesn't need chmod
         
-        # Launch the new exe
-        write_update_status("Launcher updated successfully. Launching new version...")
-        launch_new_exe_and_cleanup(old_exe_backup)
+        # Clean up old exe and close application
+        write_update_status("Launcher updated successfully. Closing application...")
+        cleanup_old_exe_and_close(old_exe_backup)
         
         return True
     except Exception as e:
@@ -662,18 +662,19 @@ def show_launcher_update_dialog(current_version, latest_version, download_url, f
                 show_manual_update_instructions(download_url, latest_version)
                 return
             
-            # Step 3: Ask if ready to restart
+            # Step 3: Ask if ready to apply update
             restart_msg = (
                 f"Launcher v{version} has been downloaded successfully!\n\n"
-                f"The application will now close, apply the update, and restart automatically.\n\n"
-                f"Ready to restart now?"
+                f"The application will now close to apply the update.\n\n"
+                f"Please relaunch the application after it closes to finish the update.\n\n"
+                f"Ready to apply the update now?"
             )
             
             restart_response = messagebox.askyesno("Update Ready", restart_msg)
             
             if restart_response:
-                # Apply update and restart automatically
-                write_update_status("Applying update and restarting...")
+                # Apply update (will close app, user needs to manually restart)
+                write_update_status("Applying update...")
                 apply_launcher_update(show_dialog=False)
             else:
                 write_update_status("Update will be applied on next launch.")
@@ -818,78 +819,27 @@ del /f "%~f0"
         return False
 
 
-def launch_new_exe_and_cleanup(old_exe_path):
-    """Launch the new exe and schedule cleanup of old exe using a batch script.
+def cleanup_old_exe_and_close(old_exe_path):
+    """Clean up old exe file after update is applied and close the application.
     
-    Uses a batch script approach that waits for the current process to exit,
-    then deletes the old exe and launches the new one.
+    Creates a simple batch script to delete the old exe file after the process exits.
+    User will need to manually restart the application.
     
     Args:
         old_exe_path: Path to the old exe file that should be deleted
     """
     try:
-        # Get current process ID for the batch script to wait for
-        current_pid = os.getpid()
-        current_exe = sys.executable if hasattr(sys, 'frozen') else sys.argv[0]
+        # Create a simple batch script to clean up the old exe file
+        batch_script = LAUNCHER_DIR / "cleanup_old_exe.bat"
         
-        # Create a batch script that will:
-        # 1. Wait for current process to exit
-        # 2. Delete old exe file
-        # 3. Launch new exe
-        batch_script = LAUNCHER_DIR / "restart_launcher.bat"
-        
-        # Escape paths for batch script
-        old_exe_escaped = str(old_exe_path).replace('\\', '\\\\')
-        new_exe_escaped = str(LAUNCHER_EXE_PATH).replace('\\', '\\\\')
-        
-        # Get the exe name for process checking
-        exe_name = LAUNCHER_EXE_PATH.name
+        old_exe_escaped = str(old_exe_path)
         
         with open(batch_script, 'w') as f:
             f.write(f"""@echo off
-setlocal enabledelayedexpansion
+REM Wait for the process to fully exit
+timeout /t 3 /nobreak >nul
 
-REM Wait for the current process to fully exit (check both PID and exe name)
-:wait_process
-REM Check by PID
-tasklist /FI "PID eq {current_pid}" 2>NUL | find /I /N "{current_pid}">NUL
-if "%ERRORLEVEL%"=="0" (
-    timeout /t 1 /nobreak >nul
-    goto wait_process
-)
-
-REM Also check if exe is still running by name
-tasklist /FI "IMAGENAME eq {exe_name}" 2>NUL | find /I /N "{exe_name}">NUL
-if "%ERRORLEVEL%"=="0" (
-    timeout /t 1 /nobreak >nul
-    goto wait_process
-)
-
-REM Additional wait to ensure all file handles are released
-timeout /t 5 /nobreak >nul
-
-REM Wait for old exe file to be unlocked by trying to rename it
-set file_unlocked=0
-set unlock_retries=0
-:wait_unlock
-if exist "{old_exe_escaped}" (
-    REM Try to rename the file (this will fail if it's locked)
-    ren "{old_exe_escaped}" "{old_exe_escaped}.test" 2>nul
-    if exist "{old_exe_escaped}.test" (
-        REM Successfully renamed, so file is unlocked - rename it back
-        ren "{old_exe_escaped}.test" "{old_exe_escaped}" 2>nul
-        set file_unlocked=1
-    ) else (
-        REM File is still locked, wait and retry
-        set /a unlock_retries+=1
-        if !unlock_retries! lss 20 (
-            timeout /t 1 /nobreak >nul
-            goto wait_unlock
-        )
-    )
-)
-
-REM Now try to delete old exe file
+REM Try to delete old exe file
 if exist "{old_exe_escaped}" (
     del /f /q "{old_exe_escaped}" 2>nul
     REM If still exists, try renaming and deleting
@@ -902,19 +852,8 @@ if exist "{old_exe_escaped}" (
     )
 )
 
-REM Launch new exe (always launch, even if old file cleanup failed)
-if exist "{new_exe_escaped}" (
-    REM Small delay before launching to ensure everything is ready
-    timeout /t 1 /nobreak >nul
-    start "" "{new_exe_escaped}"
-) else (
-    REM New exe doesn't exist - something went wrong
-    echo Error: New launcher exe not found at {new_exe_escaped}
-    pause
-)
-
-REM Clean up this batch script (with delay to ensure it's not in use)
-timeout /t 5 /nobreak >nul
+REM Clean up this batch script
+timeout /t 2 /nobreak >nul
 del /f /q "%~f0" 2>nul
 """)
         
@@ -922,7 +861,7 @@ del /f /q "%~f0" 2>nul
         # Use a VBScript wrapper to hide the command window
         if sys.platform == 'win32':
             # Create a VBScript to run the batch file hidden
-            vbscript = LAUNCHER_DIR / "restart_launcher.vbs"
+            vbscript = LAUNCHER_DIR / "cleanup_old_exe.vbs"
             with open(vbscript, 'w') as f:
                 f.write(f"""Set WshShell = CreateObject("WScript.Shell")
 WshShell.Run chr(34) & "{batch_script}" & chr(34), 0, False
@@ -935,7 +874,7 @@ Set WshShell = Nothing
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
             )
             
-            # Clean up VBScript after a delay (batch script will handle its own cleanup)
+            # Clean up VBScript after a delay
             def cleanup_vbs():
                 time.sleep(10)
                 try:
@@ -945,21 +884,12 @@ Set WshShell = Nothing
                     pass
             
             threading.Thread(target=cleanup_vbs, daemon=True).start()
-        else:
-            # Unix-like: use nohup or similar
-            subprocess.Popen(
-                ['nohup', 'sh', str(batch_script)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
         
-        write_update_status("Update complete. Closing application to restart with new version...")
+        write_update_status("Update applied. Closing application...")
         
-        # Force close GUI window if possible
+        # Force close GUI window if possible (no dialog, just close)
         try:
             import tkinter as tk
-            # Try to get the root window and destroy it
-            # This is a bit of a hack, but we can try to find and close any tkinter windows
             root = tk._default_root
             if root:
                 root.quit()
@@ -970,26 +900,16 @@ Set WshShell = Nothing
         # Small delay to let GUI close
         time.sleep(0.5)
         
-        # Exit current process (this will close the GUI if it hasn't already)
-        os._exit(0)  # Use os._exit() instead of sys.exit() to force immediate exit
+        # Exit current process
+        os._exit(0)
         
     except Exception as e:
-        write_update_status(f"Error setting up restart: {e}")
-        # Fallback: try direct launch
+        write_update_status(f"Error during update: {e}")
+        # Still try to exit
         try:
-            if sys.platform == 'win32':
-                subprocess.Popen(
-                    [str(LAUNCHER_EXE_PATH)] + sys.argv[1:],
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-                )
-            else:
-                subprocess.Popen(
-                    [str(LAUNCHER_EXE_PATH)] + sys.argv[1:],
-                    start_new_session=True
-                )
+            os._exit(0)
+        except:
             sys.exit(0)
-        except Exception:
-            pass
 
 
 def cleanup_old_exe():
@@ -1025,41 +945,54 @@ def main():
             # Continue with old version
     
     # Show update complete message if we just updated
+    # Use after() to show message after GUI is fully initialized (non-blocking)
     if was_updated:
-        try:
-            import tkinter.messagebox as messagebox
-            messagebox.showinfo(
-                "Update Complete",
-                "Launcher has been successfully updated!\n\nThe application is now running the latest version."
-            )
-        except Exception:
-            pass
-    
-    # Extract bundled files to launcher directory if needed
-    if hasattr(sys, 'frozen') and hasattr(sys, '_MEIPASS'):
-        bundle_dir = Path(sys._MEIPASS)
+        def show_update_complete():
+            try:
+                # Wait for GUI to be ready - use a small delay
+                time.sleep(0.5)
+                import tkinter.messagebox as messagebox
+                messagebox.showinfo(
+                    "Update Complete",
+                    "Launcher has been successfully updated!\n\nThe application is now running the latest version."
+                )
+            except Exception:
+                pass
         
-        # Extract ffmpeg.exe from bundle if it doesn't exist
-        ffmpeg_path = LAUNCHER_DIR / "ffmpeg.exe"
-        if not ffmpeg_path.exists():
-            bundled_ffmpeg = bundle_dir / "ffmpeg.exe"
-            if bundled_ffmpeg.exists():
-                try:
-                    shutil.copy2(bundled_ffmpeg, ffmpeg_path)
-                except Exception:
-                    pass
-        
-        # Extract icon.ico from bundle if it doesn't exist
-        icon_path = LAUNCHER_DIR / "icon.ico"
-        if not icon_path.exists():
-            bundled_icon = bundle_dir / "icon.ico"
-            if bundled_icon.exists():
-                try:
-                    shutil.copy2(bundled_icon, icon_path)
-                except Exception:
-                    pass
+        # Show message in background thread to avoid blocking startup
+        threading.Thread(target=show_update_complete, daemon=True).start()
     
-    # If script doesn't exist, try to extract from bundled version first
+    # Extract bundled files to launcher directory if needed (defer to background for faster startup)
+    def extract_bundled_files():
+        """Extract bundled files in background to avoid blocking startup."""
+        if hasattr(sys, 'frozen') and hasattr(sys, '_MEIPASS'):
+            bundle_dir = Path(sys._MEIPASS)
+            
+            # Extract ffmpeg.exe from bundle if it doesn't exist
+            ffmpeg_path = LAUNCHER_DIR / "ffmpeg.exe"
+            if not ffmpeg_path.exists():
+                bundled_ffmpeg = bundle_dir / "ffmpeg.exe"
+                if bundled_ffmpeg.exists():
+                    try:
+                        shutil.copy2(bundled_ffmpeg, ffmpeg_path)
+                    except Exception:
+                        pass
+            
+            # Extract icon.ico from bundle if it doesn't exist
+            icon_path = LAUNCHER_DIR / "icon.ico"
+            if not icon_path.exists():
+                bundled_icon = bundle_dir / "icon.ico"
+                if bundled_icon.exists():
+                    try:
+                        shutil.copy2(bundled_icon, icon_path)
+                    except Exception:
+                        pass
+    
+    # Extract files in background thread (non-blocking)
+    extraction_thread = threading.Thread(target=extract_bundled_files, daemon=True)
+    extraction_thread.start()
+    
+    # If script doesn't exist, extract immediately (required for app to run)
     if not SCRIPT_PATH.exists() and BUNDLED_SCRIPT and BUNDLED_SCRIPT.exists():
         try:
             shutil.copy2(BUNDLED_SCRIPT, SCRIPT_PATH)
@@ -1067,10 +1000,10 @@ def main():
             pass
     
     # Launch the script immediately (using bundled version if available)
-    # Check for updates in background AFTER launching (non-blocking)
+    # Check for updates in background AFTER launching (non-blocking, delayed to not affect startup)
     def check_updates_background():
-        # Small delay to let app start first
-        time.sleep(2)
+        # Delay to let app start first (non-blocking, doesn't affect startup performance)
+        time.sleep(3)  # Increased delay to ensure app is fully loaded before checking
         # Check for script updates silently
         check_and_update_script(silent=True)
         # Check for launcher updates (show dialog if update available)
@@ -1078,7 +1011,7 @@ def main():
         check_launcher_update(silent=False)
         # If updates were downloaded, they will be used on next launch
     
-    # Start update check in background (non-blocking)
+    # Start update check in background (non-blocking, doesn't affect startup)
     update_thread = threading.Thread(target=check_updates_background, daemon=True)
     update_thread.start()
     

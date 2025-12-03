@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 import sys
 import subprocess
@@ -837,12 +837,13 @@ class BandcampDownloaderGUI:
         self.load_saved_path()
         # Defer update_preview until after UI is shown (optimization - no URL/metadata yet anyway)
         self.root.after_idle(self.update_preview)
-        # Initialize URL count and button text
-        self.root.after(100, self._update_url_count_and_button)
-        # Initialize clear button visibility
-        self.root.after(100, self._update_url_clear_button)
-        # Initialize expand button icon (should be expand icon ⤢ in single-line mode)
-        self.root.after(100, self._update_url_expand_button)
+        # Initialize UI elements in a single batch (reduces timer overhead)
+        def initialize_ui_elements():
+            self._update_url_count_and_button()
+            self._update_url_clear_button()
+            self._update_url_expand_button()
+        
+        self.root.after(100, initialize_ui_elements)
         # Show format warnings if selected on startup
         format_val = self.format_var.get()
         base_format = self._extract_format(format_val)
@@ -854,9 +855,8 @@ class BandcampDownloaderGUI:
             self.wav_warning_label.grid()
         
         # Defer icon setting to after UI is shown (non-critical for startup speed)
-        self.root.after_idle(self.set_icon)
-        self.root.after(100, self.set_icon)
-        self.root.after(1000, self.set_icon)
+        # Only set once after UI is ready (removed redundant calls)
+        self.root.after(200, self.set_icon)
         
         # Window will be brought to front after fade-in completes (handled in _show_window_with_fade)
         
