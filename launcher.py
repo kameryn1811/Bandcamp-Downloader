@@ -11,6 +11,7 @@ import os
 import threading
 import time
 import runpy
+import subprocess
 from pathlib import Path
 import json
 import shutil
@@ -67,7 +68,8 @@ def get_launcher_version():
     except Exception:
         pass
     
-    # Fallback: return embedded version
+    # Fallback: return embedded version (this is the version compiled into the exe)
+    # For old launchers that don't have launcher.py in the directory, this will return the old version
     return __version__
 
 
@@ -457,10 +459,13 @@ def download_launcher_update(download_url, expected_version, expected_size=0):
         return False
 
 
-def apply_launcher_update():
-    """Apply downloaded launcher update by replacing old exe.
+def apply_launcher_update(show_dialog=True):
+    """Apply downloaded launcher update by replacing old exe and relaunching.
     
-    This should be called on next launch, not during current session.
+    Uses Windows-safe approach: rename old exe first, then move new one, then launch new exe.
+    
+    Args:
+        show_dialog: If True, show confirmation dialog. If False, proceed automatically.
     """
     if not LAUNCHER_UPDATE_TEMP.exists():
         return False
@@ -469,12 +474,39 @@ def apply_launcher_update():
         return False
     
     try:
-        # Create backup
-        backup_path = LAUNCHER_EXE_PATH.with_suffix('.exe.backup')
-        if LAUNCHER_EXE_PATH.exists():
-            shutil.copy2(LAUNCHER_EXE_PATH, backup_path)
+        # Show user feedback only if requested
+        if show_dialog:
+            try:
+                import tkinter.messagebox as messagebox
+                response = messagebox.askyesno(
+                    "Apply Launcher Update",
+                    "A launcher update is ready to be applied.\n\nThe application will close and restart automatically with the new version.\n\nProceed now?"
+                )
+                if not response:
+                    write_update_status("Launcher update declined by user.")
+                    return False
+            except Exception:
+                pass  # If GUI not available, continue automatically
         
-        # Replace old exe with new one
+        # Windows-safe approach: can't replace a file that's in use
+        # Strategy: rename old exe, then move new one into place
+        old_exe_backup = LAUNCHER_EXE_PATH.with_suffix('.exe.old')
+        
+        # Remove any existing .old file
+        if old_exe_backup.exists():
+            try:
+                old_exe_backup.unlink()
+            except Exception:
+                pass  # Ignore if can't delete
+        
+        # Rename current exe to .old (this works even if file is in use on Windows)
+        try:
+            LAUNCHER_EXE_PATH.rename(old_exe_backup)
+        except Exception as e:
+            write_update_status(f"Error: Could not rename old exe: {e}")
+            return False
+        
+        # Now move new exe into place (old one is renamed, so this should work)
         shutil.move(LAUNCHER_UPDATE_TEMP, LAUNCHER_EXE_PATH)
         
         # Make sure it's executable (Unix-like systems)
@@ -482,6 +514,10 @@ def apply_launcher_update():
             os.chmod(LAUNCHER_EXE_PATH, 0o755)
         except:
             pass  # Windows doesn't need chmod
+        
+        # Launch the new exe
+        write_update_status("Launcher updated successfully. Launching new version...")
+        launch_new_exe_and_cleanup(old_exe_backup)
         
         return True
     except Exception as e:
@@ -507,10 +543,18 @@ def check_launcher_update(silent=False):
         latest_version, download_url, file_size = get_latest_launcher_version()
         
         if not latest_version or not download_url:
+            if not silent:
+                write_update_status(f"Could not check for launcher updates (version: {current_version})")
             return False
         
+        # Debug: log version comparison
+        if not silent:
+            write_update_status(f"Checking launcher update: current={current_version}, latest={latest_version}")
+        
         # Compare versions
-        if compare_versions(latest_version, current_version) > 0:
+        comparison = compare_versions(latest_version, current_version)
+        if comparison > 0:
+            # Update available
             if not silent:
                 # Show update dialog
                 show_launcher_update_dialog(current_version, latest_version, download_url, file_size)
@@ -518,62 +562,183 @@ def check_launcher_update(silent=False):
                 # Silent mode: just download
                 return download_launcher_update(download_url, latest_version, file_size)
         elif not silent:
-            print(f"Launcher is up to date (v{current_version})")
+            write_update_status(f"Launcher is up to date (v{current_version})")
         
         return False
     except Exception as e:
+        error_msg = f"Error checking for launcher updates: {e}"
         if not silent:
-            print(f"Error checking for launcher updates: {e}")
+            write_update_status(error_msg)
         return False
 
 
 def show_launcher_update_dialog(current_version, latest_version, download_url, file_size=0):
-    """Show dialog for launcher update with options."""
+    """Show dialog for launcher update, download with progress, then prompt for restart."""
     try:
         import tkinter.messagebox as messagebox
+        import tkinter as tk
         
         size_info = ""
         if file_size > 0:
             size_mb = file_size / (1024 * 1024)
             size_info = f"\nFile size: {size_mb:.1f} MB"
         
+        # Step 1: Ask if user wants to update
         message = (
             f"A new launcher version is available!\n\n"
             f"Current version: v{current_version}\n"
             f"Latest version: v{latest_version}{size_info}\n\n"
             f"Would you like to download and install the update?\n\n"
-            f"Note: The app will need to restart to apply the update.\n"
-            f"If automatic update fails, you can download manually."
+            f"The application will close and restart automatically after the update."
         )
         
         response = messagebox.askyesno("Launcher Update Available", message)
         
-        if response:
-            # Try automatic update
-            if download_launcher_update(download_url, latest_version, file_size):
-                # Show restart prompt
-                restart_msg = (
-                    f"Launcher v{latest_version} has been downloaded.\n\n"
-                    f"Please close this application and restart it to apply the update.\n\n"
-                    f"The update will be applied automatically on next launch."
-                )
-                messagebox.showinfo("Update Ready", restart_msg)
-            else:
-                # Automatic update failed, show manual instructions
-                show_manual_update_instructions(download_url, latest_version)
-        else:
-            # User declined, offer manual download option
+        if not response:
+            # User declined
             manual_response = messagebox.askyesno(
                 "Manual Update",
                 "Would you like to open the download page in your browser instead?"
             )
             if manual_response:
                 import webbrowser
-                # Use the download URL (should have dl=1 for direct download)
                 webbrowser.open(download_url)
+            return
+        
+        # Step 2: Download with progress feedback
+        write_update_status(f"Downloading launcher v{latest_version}...", latest_version)
+        
+        # Show downloading dialog
+        download_dialog = tk.Toplevel()
+        download_dialog.title("Downloading Update")
+        download_dialog.geometry("400x150")
+        download_dialog.transient()
+        download_dialog.grab_set()
+        
+        # Center the dialog
+        download_dialog.update_idletasks()
+        x = (download_dialog.winfo_screenwidth() // 2) - (download_dialog.winfo_width() // 2)
+        y = (download_dialog.winfo_screenheight() // 2) - (download_dialog.winfo_height() // 2)
+        download_dialog.geometry(f"+{x}+{y}")
+        
+        label = tk.Label(
+            download_dialog,
+            text=f"Downloading launcher v{latest_version}...\n\nPlease wait...",
+            font=("Segoe UI", 10),
+            justify=tk.CENTER
+        )
+        label.pack(pady=20)
+        
+        progress_label = tk.Label(
+            download_dialog,
+            text="",
+            font=("Segoe UI", 9),
+            fg="gray"
+        )
+        progress_label.pack()
+        
+        download_dialog.update()
+        
+        # Download in background thread to keep UI responsive
+        def download_thread():
+            try:
+                success = download_launcher_update_with_progress(download_url, latest_version, file_size, progress_label, download_dialog)
+                download_dialog.after(0, lambda: download_complete(success, latest_version))
+            except Exception as e:
+                download_dialog.after(0, lambda: download_complete(False, latest_version, str(e)))
+        
+        threading.Thread(target=download_thread, daemon=True).start()
+        
+        def download_complete(success, version, error_msg=None):
+            download_dialog.destroy()
+            
+            if not success:
+                if error_msg:
+                    write_update_status(f"Download failed: {error_msg}")
+                messagebox.showerror(
+                    "Download Failed",
+                    f"Failed to download launcher update.\n\n{error_msg or 'Please try again later or download manually.'}"
+                )
+                show_manual_update_instructions(download_url, latest_version)
+                return
+            
+            # Step 3: Ask if ready to restart
+            restart_msg = (
+                f"Launcher v{version} has been downloaded successfully!\n\n"
+                f"The application will now close, apply the update, and restart automatically.\n\n"
+                f"Ready to restart now?"
+            )
+            
+            restart_response = messagebox.askyesno("Update Ready", restart_msg)
+            
+            if restart_response:
+                # Apply update and restart automatically
+                write_update_status("Applying update and restarting...")
+                apply_launcher_update(show_dialog=False)
+            else:
+                write_update_status("Update will be applied on next launch.")
+                messagebox.showinfo(
+                    "Update Pending",
+                    "The update will be applied automatically the next time you start the application."
+                )
+        
     except Exception as e:
-        # Fallback: show manual instructions
+        write_update_status(f"Error in update dialog: {e}")
         show_manual_update_instructions(download_url, latest_version)
+
+
+def download_launcher_update_with_progress(download_url, expected_version, expected_size, progress_label, dialog):
+    """Download launcher update with progress feedback.
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        import requests
+        
+        response = requests.get(download_url, timeout=60, stream=True)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        
+        with open(LAUNCHER_UPDATE_TEMP, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    # Update progress
+                    if total_size > 0:
+                        percent = (downloaded / total_size) * 100
+                        size_mb = downloaded / (1024 * 1024)
+                        total_mb = total_size / (1024 * 1024)
+                        progress_text = f"{percent:.1f}% ({size_mb:.1f} MB / {total_mb:.1f} MB)"
+                    else:
+                        size_mb = downloaded / (1024 * 1024)
+                        progress_text = f"{size_mb:.1f} MB downloaded"
+                    
+                    dialog.after(0, lambda t=progress_text: progress_label.config(text=t))
+                    dialog.update()
+        
+        # Verify download
+        if total_size > 0 and downloaded != total_size:
+            write_update_status(f"Warning: Download size mismatch (expected {total_size}, got {downloaded})")
+            return False
+        
+        # Verify file size
+        if LAUNCHER_UPDATE_TEMP.stat().st_size < 1000:
+            write_update_status("Error: Downloaded file appears to be invalid")
+            LAUNCHER_UPDATE_TEMP.unlink(missing_ok=True)
+            return False
+        
+        write_update_status(f"Launcher v{expected_version} downloaded successfully.", expected_version)
+        return True
+        
+    except Exception as e:
+        write_update_status(f"Error downloading launcher update: {e}")
+        LAUNCHER_UPDATE_TEMP.unlink(missing_ok=True)
+        return False
 
 
 def show_manual_update_instructions(download_url, latest_version):
@@ -623,22 +788,252 @@ def launch_script():
         sys.exit(1)
 
 
+def create_update_batch_script():
+    """Create a batch script to apply launcher update after exe closes.
+    
+    Returns:
+        True if script created, False otherwise
+    """
+    try:
+        batch_script = LAUNCHER_DIR / "apply_update.bat"
+        with open(batch_script, 'w') as f:
+            f.write(f"""@echo off
+timeout /t 2 /nobreak >nul
+if exist "{LAUNCHER_UPDATE_TEMP}" (
+    if exist "{LAUNCHER_EXE_PATH}" (
+        del /f "{LAUNCHER_EXE_PATH}"
+    )
+    move "{LAUNCHER_UPDATE_TEMP}" "{LAUNCHER_EXE_PATH}"
+    if exist "{LAUNCHER_EXE_PATH}" (
+        start "" "{LAUNCHER_EXE_PATH}"
+    )
+)
+if exist "{LAUNCHER_EXE_PATH.with_suffix('.exe.old')}" (
+    del /f "{LAUNCHER_EXE_PATH.with_suffix('.exe.old')}"
+)
+del /f "%~f0"
+""")
+        return True
+    except Exception:
+        return False
+
+
+def launch_new_exe_and_cleanup(old_exe_path):
+    """Launch the new exe and schedule cleanup of old exe using a batch script.
+    
+    Uses a batch script approach that waits for the current process to exit,
+    then deletes the old exe and launches the new one.
+    
+    Args:
+        old_exe_path: Path to the old exe file that should be deleted
+    """
+    try:
+        # Get current process ID for the batch script to wait for
+        current_pid = os.getpid()
+        current_exe = sys.executable if hasattr(sys, 'frozen') else sys.argv[0]
+        
+        # Create a batch script that will:
+        # 1. Wait for current process to exit
+        # 2. Delete old exe file
+        # 3. Launch new exe
+        batch_script = LAUNCHER_DIR / "restart_launcher.bat"
+        
+        # Escape paths for batch script
+        old_exe_escaped = str(old_exe_path).replace('\\', '\\\\')
+        new_exe_escaped = str(LAUNCHER_EXE_PATH).replace('\\', '\\\\')
+        
+        # Get the exe name for process checking
+        exe_name = LAUNCHER_EXE_PATH.name
+        
+        with open(batch_script, 'w') as f:
+            f.write(f"""@echo off
+setlocal enabledelayedexpansion
+
+REM Wait for the current process to fully exit (check both PID and exe name)
+:wait_process
+REM Check by PID
+tasklist /FI "PID eq {current_pid}" 2>NUL | find /I /N "{current_pid}">NUL
+if "%ERRORLEVEL%"=="0" (
+    timeout /t 1 /nobreak >nul
+    goto wait_process
+)
+
+REM Also check if exe is still running by name
+tasklist /FI "IMAGENAME eq {exe_name}" 2>NUL | find /I /N "{exe_name}">NUL
+if "%ERRORLEVEL%"=="0" (
+    timeout /t 1 /nobreak >nul
+    goto wait_process
+)
+
+REM Additional wait to ensure all file handles are released
+timeout /t 5 /nobreak >nul
+
+REM Wait for old exe file to be unlocked by trying to rename it
+set file_unlocked=0
+set unlock_retries=0
+:wait_unlock
+if exist "{old_exe_escaped}" (
+    REM Try to rename the file (this will fail if it's locked)
+    ren "{old_exe_escaped}" "{old_exe_escaped}.test" 2>nul
+    if exist "{old_exe_escaped}.test" (
+        REM Successfully renamed, so file is unlocked - rename it back
+        ren "{old_exe_escaped}.test" "{old_exe_escaped}" 2>nul
+        set file_unlocked=1
+    ) else (
+        REM File is still locked, wait and retry
+        set /a unlock_retries+=1
+        if !unlock_retries! lss 20 (
+            timeout /t 1 /nobreak >nul
+            goto wait_unlock
+        )
+    )
+)
+
+REM Now try to delete old exe file
+if exist "{old_exe_escaped}" (
+    del /f /q "{old_exe_escaped}" 2>nul
+    REM If still exists, try renaming and deleting
+    if exist "{old_exe_escaped}" (
+        timeout /t 1 /nobreak >nul
+        ren "{old_exe_escaped}" "{old_exe_escaped}.delete" 2>nul
+        if exist "{old_exe_escaped}.delete" (
+            del /f /q "{old_exe_escaped}.delete" 2>nul
+        )
+    )
+)
+
+REM Launch new exe (always launch, even if old file cleanup failed)
+if exist "{new_exe_escaped}" (
+    REM Small delay before launching to ensure everything is ready
+    timeout /t 1 /nobreak >nul
+    start "" "{new_exe_escaped}"
+) else (
+    REM New exe doesn't exist - something went wrong
+    echo Error: New launcher exe not found at {new_exe_escaped}
+    pause
+)
+
+REM Clean up this batch script (with delay to ensure it's not in use)
+timeout /t 5 /nobreak >nul
+del /f /q "%~f0" 2>nul
+""")
+        
+        # Launch the batch script (detached, so it continues after we exit)
+        # Use a VBScript wrapper to hide the command window
+        if sys.platform == 'win32':
+            # Create a VBScript to run the batch file hidden
+            vbscript = LAUNCHER_DIR / "restart_launcher.vbs"
+            with open(vbscript, 'w') as f:
+                f.write(f"""Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run chr(34) & "{batch_script}" & chr(34), 0, False
+Set WshShell = Nothing
+""")
+            
+            # Launch the VBScript (which will run the batch file hidden)
+            subprocess.Popen(
+                ['wscript.exe', str(vbscript)],
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            )
+            
+            # Clean up VBScript after a delay (batch script will handle its own cleanup)
+            def cleanup_vbs():
+                time.sleep(10)
+                try:
+                    if vbscript.exists():
+                        vbscript.unlink()
+                except:
+                    pass
+            
+            threading.Thread(target=cleanup_vbs, daemon=True).start()
+        else:
+            # Unix-like: use nohup or similar
+            subprocess.Popen(
+                ['nohup', 'sh', str(batch_script)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        
+        write_update_status("Update complete. Closing application to restart with new version...")
+        
+        # Force close GUI window if possible
+        try:
+            import tkinter as tk
+            # Try to get the root window and destroy it
+            # This is a bit of a hack, but we can try to find and close any tkinter windows
+            root = tk._default_root
+            if root:
+                root.quit()
+                root.destroy()
+        except Exception:
+            pass
+        
+        # Small delay to let GUI close
+        time.sleep(0.5)
+        
+        # Exit current process (this will close the GUI if it hasn't already)
+        os._exit(0)  # Use os._exit() instead of sys.exit() to force immediate exit
+        
+    except Exception as e:
+        write_update_status(f"Error setting up restart: {e}")
+        # Fallback: try direct launch
+        try:
+            if sys.platform == 'win32':
+                subprocess.Popen(
+                    [str(LAUNCHER_EXE_PATH)] + sys.argv[1:],
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                )
+            else:
+                subprocess.Popen(
+                    [str(LAUNCHER_EXE_PATH)] + sys.argv[1:],
+                    start_new_session=True
+                )
+            sys.exit(0)
+        except Exception:
+            pass
+
+
+def cleanup_old_exe():
+    """Clean up old exe file from previous update.
+    
+    Returns:
+        True if an old exe was found and cleaned up (indicating we just updated)
+    """
+    try:
+        old_exe = LAUNCHER_EXE_PATH.with_suffix('.exe.old')
+        if old_exe.exists():
+            old_exe.unlink()
+            return True  # Indicates we just updated
+    except Exception:
+        pass  # Ignore cleanup errors
+    return False
+
+
 def main():
     """Main launcher entry point."""
+    # Clean up old exe from previous update (if any)
+    was_updated = cleanup_old_exe()
+    
     # Check for pending launcher update first (from previous session)
     if hasattr(sys, 'frozen') and LAUNCHER_UPDATE_TEMP.exists() and LAUNCHER_EXE_PATH:
         try:
-            if apply_launcher_update():
-                write_update_status("Launcher updated successfully! Restarting...")
-                # Restart with new exe
-                try:
-                    os.execv(str(LAUNCHER_EXE_PATH), sys.argv)
-                except Exception:
-                    # If execv fails (Windows), just continue with old version
-                    pass
+            if apply_launcher_update(show_dialog=False):
+                # apply_launcher_update() will handle launching the new exe and exiting
+                # If we reach here, something went wrong
+                write_update_status("Launcher update applied, but failed to launch new version. Please restart manually.")
         except Exception as e:
             write_update_status(f"Error applying launcher update: {e}")
             # Continue with old version
+    
+    # Show update complete message if we just updated
+    if was_updated:
+        try:
+            import tkinter.messagebox as messagebox
+            messagebox.showinfo(
+                "Update Complete",
+                "Launcher has been successfully updated!\n\nThe application is now running the latest version."
+            )
+        except Exception:
+            pass
     
     # Extract bundled files to launcher directory if needed
     if hasattr(sys, 'frozen') and hasattr(sys, '_MEIPASS'):
@@ -678,8 +1073,9 @@ def main():
         time.sleep(2)
         # Check for script updates silently
         check_and_update_script(silent=True)
-        # Check for launcher updates silently (won't show dialog, just download)
-        check_launcher_update(silent=True)
+        # Check for launcher updates (show dialog if update available)
+        # Use silent=False to show dialog when update is found
+        check_launcher_update(silent=False)
         # If updates were downloaded, they will be used on next launch
     
     # Start update check in background (non-blocking)
