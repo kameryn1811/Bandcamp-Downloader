@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 import sys
 import subprocess
@@ -43,6 +43,64 @@ from tkinter import (
     Tk, Toplevel, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, LEFT, RIGHT, X, Y, END, WORD, BOTH,
     Frame, Label, Canvas, Checkbutton, Menu, Entry, Button, Listbox, EXTENDED, INSERT, Text, TclError
 )
+
+# tkinterdnd2 for drag-and-drop support (optional)
+# Auto-install if running as standalone Python script (not bundled)
+HAS_DND = False
+TkinterDnD = None
+DND_FILES = None
+DND_TEXT = None
+
+def _install_tkinterdnd2_if_needed():
+    """Auto-install tkinterdnd2 if running as standalone Python (not bundled)."""
+    # Only auto-install if running as standalone script (not PyInstaller bundle)
+    if hasattr(sys, 'frozen'):
+        return False  # Bundled, don't auto-install
+    
+    try:
+        import subprocess
+        # sys is already imported at module level, don't import again
+        
+        # Check if already installed
+        try:
+            from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
+            return True  # Already installed
+        except ImportError:
+            pass
+        
+        # Try to install
+        print("Installing tkinterdnd2 for drag-and-drop support...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "tkinterdnd2"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode == 0:
+            print("tkinterdnd2 installed successfully!")
+            return True
+        else:
+            print(f"Warning: Could not auto-install tkinterdnd2: {result.stderr}")
+            return False
+    except Exception as e:
+        # Silently fail - drag-and-drop is optional
+        return False
+
+# Try to import tkinterdnd2
+try:
+    from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
+    HAS_DND = True
+except ImportError:
+    # If import fails and we're running standalone, try to install it
+    if not hasattr(sys, 'frozen'):
+        if _install_tkinterdnd2_if_needed():
+            # Retry import after installation
+            try:
+                from tkinterdnd2 import DND_FILES, DND_TEXT, TkinterDnD
+                HAS_DND = True
+            except ImportError:
+                pass
 
 # yt-dlp will be imported after checking if it's installed
 try:
@@ -641,6 +699,9 @@ class BandcampDownloaderGUI:
         # URL tag hover overlay
         self.url_tag_overlay = None  # Current hover overlay window
         self.url_tag_overlay_tag_id = None  # Tag ID currently showing overlay
+        # Drag-and-drop overlay
+        self._drag_overlay_frame = None  # Transparent overlay Frame for drag detection
+        self._original_download_button_text = None  # Store original download button text during drag
         # URL metadata cache: stores metadata for each URL (url -> {artist, album, etc.})
         self.url_metadata_cache = {}  # {url: {artist, album, title, ...}}
         # URL tag metadata cache: stores only HTML extraction (stage 1) metadata for tags (url -> {artist, album, etc.})
@@ -3739,6 +3800,9 @@ class BandcampDownloaderGUI:
         self._setup_preview_section(main_frame)
         self._setup_download_section(main_frame)
         self._setup_log_section(main_frame)
+        
+        # Setup global drag-and-drop (after UI is created)
+        self._setup_global_drag_and_drop()
     
     def _setup_url_section(self, main_frame):
         """Setup URL input section with Entry and Text widgets."""
@@ -3865,6 +3929,9 @@ class BandcampDownloaderGUI:
         url_entry.bind('<Control-z>', lambda e: "break")  # Disable undo (Ctrl+Z)
         url_entry.bind('<Control-Shift-Z>', lambda e: "break")  # Disable redo (Ctrl+Shift+Z)
         url_entry.bind('<Control-y>', lambda e: "break")  # Disable redo (Ctrl+Y - alternative)
+        
+        # NOTE: Drag-and-drop is disabled on URL fields to prevent direct drops
+        # All drag-and-drop is handled by the global overlay, which routes to paste handler
         
         # Multi-line Text widget with custom scrollbar (primary URL input - starts collapsed)
         url_text_frame = Frame(self.url_container_frame, bg=colors.bg)
@@ -4002,6 +4069,552 @@ class BandcampDownloaderGUI:
         # Tag protection: handle backspace/delete to remove entire tags
         url_text.bind('<BackSpace>', self._handle_url_tag_backspace, add='+')
         url_text.bind('<Delete>', self._handle_url_tag_delete, add='+')
+        
+        # NOTE: Drag-and-drop is disabled on URL fields to prevent direct drops
+        # All drag-and-drop is handled by the global overlay, which routes to paste handler
+    
+    def _setup_global_drag_and_drop(self):
+        """Setup global drag-and-drop using transparent overlay for better detection.
+        
+        IMPORTANT: 
+        - Uses a transparent standard Tk Frame overlay (not ttk) to avoid style conflicts
+        - Covers entire window for better drag detection
+        - Intercepts all drag-and-drop events before they reach fields
+        - All dropped URLs are routed through the paste handler (not directly into fields)
+        - Supports both event name variants for maximum compatibility
+        
+        Best practices:
+        - Use only tkinterdnd2's Python API (no direct tk.eval() calls)
+        - Use standard Tk widgets (Frame) for overlay, never ttk widgets
+        - Keep drag-and-drop handlers isolated from theme/styling code
+        """
+        if not HAS_DND:
+            return
+        
+        try:
+            # Create transparent overlay Frame (standard Tk, not ttk - safe for styles)
+            # This provides better event detection than root window alone
+            # The overlay covers the entire window and intercepts drag events
+            overlay_frame = Frame(
+                self.root,
+                bg='',  # Transparent background
+                highlightthickness=0,
+                borderwidth=0,
+                relief='flat'  # No relief to prevent any visual artifacts
+            )
+            # Cover entire window using place() - this ensures it covers everything
+            # Use place() instead of grid/pack to avoid affecting layout
+            overlay_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+            # Lower it so it doesn't block clicks, but still receives drag events
+            overlay_frame.lower()
+            overlay_frame.takefocus = False  # Don't interfere with keyboard navigation
+            
+            # Bind to window focus loss to hide feedback if window loses focus
+            self.root.bind('<FocusOut>', lambda e: self._hide_drag_feedback())
+            
+            # Register drag-and-drop on overlay (standard Tk widget - safe)
+            overlay_frame.drop_target_register(DND_TEXT, DND_FILES)
+            
+            # Use both event name variants for maximum compatibility
+            # <<DropEnter>>/<<DropLeave>> seem more reliable in some tkinterdnd2 versions
+            # <<DragEnter>>/<<DragMotion>>/<<DragLeave>> are also supported
+            overlay_frame.dnd_bind('<<DropEnter>>', self._on_drag_enter)
+            overlay_frame.dnd_bind('<<DropLeave>>', self._on_drag_leave)
+            overlay_frame.dnd_bind('<<Drop>>', self._handle_global_drop)
+            
+            # Also bind alternative event names for compatibility
+            overlay_frame.dnd_bind('<<DragEnter>>', self._on_drag_enter)
+            overlay_frame.dnd_bind('<<DragMotion>>', self._on_drag_motion)
+            overlay_frame.dnd_bind('<<DragLeave>>', self._on_drag_leave)
+            
+            # Store overlay reference for cleanup
+            self._drag_overlay_frame = overlay_frame
+            
+            # Also register on root window as fallback
+            self.root.drop_target_register(DND_TEXT, DND_FILES)
+            self.root.dnd_bind('<<DropEnter>>', self._on_drag_enter)
+            self.root.dnd_bind('<<DropLeave>>', self._on_drag_leave)
+            self.root.dnd_bind('<<DragEnter>>', self._on_drag_enter)
+            self.root.dnd_bind('<<DragMotion>>', self._on_drag_motion)
+            self.root.dnd_bind('<<DragLeave>>', self._on_drag_leave)
+            self.root.dnd_bind('<<Drop>>', self._handle_global_drop)
+            
+        except Exception as e:
+            # Debug: print error if in development
+            if not hasattr(sys, 'frozen'):
+                print(f"Drag-and-drop setup error: {e}")
+            pass  # Silently fail if drag-and-drop can't be enabled
+    
+    def _on_drag_enter(self, event):
+        """Show visual feedback when drag enters the app (fires once)."""
+        # Change download button text when drag enters
+        self._show_drag_feedback()
+    
+    def _bring_window_to_front_windows(self):
+        """Force window to front on Windows using API calls."""
+        try:
+            if sys.platform == 'win32':
+                # Get the window handle from Tkinter
+                hwnd = self.root.winfo_id()
+                
+                if hwnd:
+                    # Use Windows API to bring window to front
+                    # SW_RESTORE = 9 (restore if minimized), SW_SHOW = 5 (show)
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # Restore if minimized
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                    ctypes.windll.user32.BringWindowToTop(hwnd)
+                    # Also try SetActiveWindow for good measure
+                    ctypes.windll.user32.SetActiveWindow(hwnd)
+        except Exception as e:
+            # Silently fail - fallback to Tkinter methods
+            pass
+    
+    def _on_drag_motion(self, event):
+        """Handle drag motion - ensure feedback stays visible while dragging over app.
+        
+        This is called continuously while dragging over the app.
+        We just ensure the button text is changed (it should already be from drag enter).
+        """
+        # If button text hasn't been changed yet, change it (fallback in case drag enter didn't fire)
+        if not hasattr(self, '_original_download_button_text') or self._original_download_button_text is None:
+            self._show_drag_feedback()
+    
+    def _show_drag_feedback(self):
+        """Show drag feedback by changing download button text.
+        
+        IMPORTANT: This handler must NOT modify ttk styles or theme settings.
+        Only changes button text, which is safe.
+        """
+        try:
+            # Don't change if already showing feedback
+            if hasattr(self, '_original_download_button_text') and self._original_download_button_text is not None:
+                return  # Already showing feedback
+            
+            # Store original button text if not already stored
+            if hasattr(self, 'download_btn') and self.download_btn:
+                self._original_download_button_text = self.download_btn.cget('text')
+                
+                # Change button text to show drag feedback
+                self.download_btn.config(text="Drop URL to Paste")
+            
+            # Aggressively bring window to front using multiple methods
+            # Method 1: Windows API (most reliable on Windows)
+            self._bring_window_to_front_windows()
+            
+            # Method 2: Tkinter methods
+            self.root.lift()
+            self.root.attributes('-topmost', True)
+            self.root.after(200, lambda: self.root.attributes('-topmost', False))  # Reset after a moment
+            self.root.focus_force()
+            self.root.update_idletasks()
+            
+            # Bind ESC key to hide feedback (in case it wasn't already bound)
+            self.root.bind('<Escape>', lambda e: self._hide_drag_feedback())
+            
+        except Exception as e:
+            # Debug: print error if in development
+            if not hasattr(sys, 'frozen'):
+                print(f"Show drag feedback error: {e}")
+            pass
+    
+    def _on_drag_leave(self, event):
+        """Hide visual feedback when dragging leaves the app or is released.
+        
+        This is called when:
+        - Drag leaves the app window entirely
+        - User releases drag outside the window
+        - User cancels the drag operation
+        
+        The button text should only change when actively dragging over the app.
+        """
+        # Always hide feedback when drag leaves - this ensures button resets
+        # immediately when user drags away from the interface
+        self._hide_drag_feedback()
+    
+    def _hide_drag_feedback(self):
+        """Hide drag feedback by restoring download button text.
+        
+        IMPORTANT: This handler must NOT modify ttk styles or theme settings.
+        Only restores button text, which is safe.
+        
+        This is called when:
+        - Drag leaves the app window
+        - User presses ESC
+        - Drop operation completes
+        - Window loses focus
+        """
+        try:
+            # Only restore if we're currently showing drag feedback
+            if hasattr(self, '_original_download_button_text') and self._original_download_button_text is not None:
+                if hasattr(self, 'download_btn') and self.download_btn:
+                    try:
+                        # Restore original button text
+                        self.download_btn.config(text=self._original_download_button_text)
+                        # Force update to ensure text change is visible
+                        self.root.update_idletasks()
+                    except (TclError, AttributeError):
+                        # Button might have been destroyed, just clear reference
+                        pass
+                
+                # Clear stored text to indicate we're no longer in drag feedback mode
+                self._original_download_button_text = None
+            
+            # Unbind ESC key from root (to avoid conflicts)
+            try:
+                self.root.unbind('<Escape>')
+            except:
+                pass
+                
+        except Exception as e:
+            # Debug: print error if in development
+            if not hasattr(sys, 'frozen'):
+                print(f"Hide drag feedback error: {e}")
+            pass
+    
+    def _resolve_url_redirects(self, url):
+        """Resolve URL redirects to get final destination.
+        
+        Only resolves URLs that don't already contain 'bandcamp.com'.
+        If the URL already contains 'bandcamp.com', returns it unchanged.
+        If resolution succeeds and final URL contains 'bandcamp.com', returns the final URL.
+        If resolution fails or final URL doesn't contain 'bandcamp.com', returns None.
+        
+        Args:
+            url: URL string to resolve
+            
+        Returns:
+            Final URL after redirects (if it resolves to Bandcamp), original URL (if already Bandcamp),
+            or None (if resolution fails or doesn't resolve to Bandcamp)
+        """
+        if not url or not isinstance(url, str):
+            return None
+        
+        url = url.strip()
+        url_lower = url.lower()
+        
+        # If URL already contains bandcamp.com, no need to resolve
+        if 'bandcamp.com' in url_lower:
+            return url
+        
+        # Only resolve URLs that start with http:// or https://
+        if not (url_lower.startswith('http://') or url_lower.startswith('https://')):
+            return None
+        
+        # Log that we're resolving the URL
+        self.log(f"Resolving redirect: {url}")
+        
+        try:
+            import urllib.request
+            from urllib.parse import urlparse
+            
+            # Create a request with a timeout and follow redirects
+            # Use HEAD request first (faster, doesn't download body)
+            req = urllib.request.Request(url, method='HEAD')
+            req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            
+            # Open with redirect handling and timeout
+            with urllib.request.urlopen(req, timeout=5) as response:
+                # Get the final URL after redirects
+                final_url = response.geturl()
+                
+                # Check if final URL contains bandcamp.com
+                if 'bandcamp.com' in final_url.lower():
+                    self.log(f"✓ Resolved to: {final_url}")
+                    return final_url
+                else:
+                    # Resolved but not to Bandcamp - reject
+                    self.log(f"⚠ Resolved URL is not a Bandcamp link: {final_url}")
+                    return None
+                    
+        except urllib.error.HTTPError as e:
+            # HTTP error (404, 500, etc.) - try GET request as fallback
+            # Some servers don't respond to HEAD requests
+            try:
+                req = urllib.request.Request(url)
+                req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    final_url = response.geturl()
+                    if 'bandcamp.com' in final_url.lower():
+                        self.log(f"✓ Resolved to: {final_url}")
+                        return final_url
+                    self.log(f"⚠ Resolved URL is not a Bandcamp link: {final_url}")
+                    return None
+            except Exception as e:
+                self.log(f"✗ Failed to resolve redirect: {str(e)}")
+                return None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # Network error, timeout, or connection refused
+            self.log(f"✗ Network error resolving redirect: {str(e)}")
+            return None
+        except Exception as e:
+            # Any other error
+            self.log(f"✗ Error resolving redirect: {str(e)}")
+            return None
+    
+    def _extract_and_resolve_urls_from_text(self, text):
+        """Extract all URLs from text and resolve redirects for non-Bandcamp URLs.
+        
+        This method extracts all URLs (both Bandcamp and non-Bandcamp) from the given text,
+        resolves redirects for non-Bandcamp URLs, and returns only URLs that are Bandcamp URLs
+        (either originally or after resolution).
+        
+        Args:
+            text: Text string that may contain URLs
+            
+        Returns:
+            List of Bandcamp URLs (original or resolved from redirects)
+        """
+        if not text or not isinstance(text, str):
+            return []
+        
+        import re
+        # Extract all URLs (both Bandcamp and non-Bandcamp)
+        url_pattern = r'https?://[^\s,;]+'
+        all_urls = re.findall(url_pattern, text, re.IGNORECASE)
+        
+        if not all_urls:
+            return []
+        
+        # Count non-Bandcamp URLs that need resolution
+        non_bandcamp_urls = [url for url in all_urls if 'bandcamp.com' not in url.lower()]
+        
+        # Log if we're processing multiple URLs or resolving redirects
+        if len(non_bandcamp_urls) > 0:
+            if len(all_urls) > 1:
+                self.log(f"Processing {len(all_urls)} URL(s), resolving {len(non_bandcamp_urls)} redirect(s)...")
+            elif len(non_bandcamp_urls) == 1:
+                # Single URL that needs resolution - logging will happen in _resolve_url_redirects
+                pass
+        
+        resolved_bandcamp_urls = []
+        for url in all_urls:
+            url = url.rstrip(' \t,;')
+            # If it's already a Bandcamp URL, add it
+            if 'bandcamp.com' in url.lower():
+                if url not in resolved_bandcamp_urls:
+                    resolved_bandcamp_urls.append(url)
+            else:
+                # Try to resolve redirects for non-Bandcamp URLs
+                resolved_url = self._resolve_url_redirects(url)
+                if resolved_url and resolved_url not in resolved_bandcamp_urls:
+                    resolved_bandcamp_urls.append(resolved_url)
+        
+        # Log summary if we resolved multiple URLs
+        if len(non_bandcamp_urls) > 1:
+            resolved_count = len([url for url in resolved_bandcamp_urls if url not in all_urls])
+            if resolved_count > 0:
+                self.log(f"Resolved {resolved_count} of {len(non_bandcamp_urls)} redirect(s)")
+        
+        return resolved_bandcamp_urls
+    
+    def _validate_bandcamp_url(self, url):
+        """Validate that a URL is a Bandcamp URL.
+        
+        This validates URLs that already contain 'bandcamp.com'.
+        For URLs that don't contain 'bandcamp.com', use _resolve_url_redirects()
+        first to check if they redirect to a Bandcamp URL.
+        """
+        if not url or not isinstance(url, str):
+            return False
+        
+        url_lower = url.lower().strip()
+        
+        # Must contain bandcamp.com
+        if 'bandcamp.com' not in url_lower:
+            return False
+        
+        # Must be a valid URL (starts with http:// or https://)
+        if not (url_lower.startswith('http://') or url_lower.startswith('https://')):
+            return False
+        
+        return True
+    
+    def _handle_global_drop(self, event):
+        """Handle drag-and-drop anywhere on the app - route to paste handler.
+        
+        This intercepts all drag-and-drop events before they reach fields.
+        All dropped URLs are treated as if the user pressed the paste button,
+        ensuring consistent handling and proper tag formatting.
+        """
+        # Hide feedback immediately
+        self._hide_drag_feedback()
+        
+        try:
+            # Get dropped data
+            data = event.data
+            
+            # Parse the data - could be file paths or URLs
+            urls = []
+            
+            # Check if it's file paths (wrapped in curly braces)
+            if data.startswith('{') and '}' in data:
+                # Remove outer braces and split by } {
+                paths = data.strip('{}').split('} {')
+                for path in paths:
+                    path = path.strip()
+                    # If it's a URL, resolve redirects and validate it
+                    if path.startswith('http://') or path.startswith('https://'):
+                        # Resolve redirects for non-Bandcamp URLs
+                        resolved_url = self._resolve_url_redirects(path)
+                        if resolved_url and self._validate_bandcamp_url(resolved_url):
+                            urls.append(resolved_url)
+            else:
+                # Single URL or text
+                text = data.strip()
+                # Check if it's a URL
+                if text.startswith('http://') or text.startswith('https://'):
+                    # Resolve redirects for non-Bandcamp URLs
+                    resolved_url = self._resolve_url_redirects(text)
+                    if resolved_url and self._validate_bandcamp_url(resolved_url):
+                        urls.append(resolved_url)
+                else:
+                    # Try to find URLs in the text
+                    import re
+                    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+                    found_urls = re.findall(url_pattern, text)
+                    for url in found_urls:
+                        # Resolve redirects for non-Bandcamp URLs
+                        resolved_url = self._resolve_url_redirects(url)
+                        if resolved_url and self._validate_bandcamp_url(resolved_url):
+                            urls.append(resolved_url)
+            
+            # If we found valid Bandcamp URLs, route to paste handler
+            # This treats the drop as if the user pressed the paste button
+            if urls:
+                # Join URLs with newlines (same format as clipboard paste)
+                url_text = '\n'.join(urls)
+                
+                # Route to paste handler - this ensures proper tag formatting
+                # and consistent behavior with manual paste
+                self._paste_dropped_urls(url_text)
+            else:
+                # Show error message for invalid URLs
+                try:
+                    import tkinter.messagebox as messagebox
+                    messagebox.showwarning(
+                        "Invalid URL",
+                        "Only Bandcamp URLs are accepted.\n\n"
+                        "Please drag a URL from a Bandcamp page."
+                    )
+                except:
+                    pass
+            
+        except Exception as e:
+            # Silently fail if drag-and-drop processing fails
+            pass
+    
+    def _paste_dropped_urls(self, url_text):
+        """Paste dropped URLs by simulating the paste button click."""
+        # Set clipboard to the dropped URLs
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url_text)
+        
+        # Simulate paste button click - this uses the existing paste logic
+        # which properly handles tags and formatting
+        self._handle_paste_button_Click()
+    
+    def _handle_drop(self, event, widget):
+        """Handle drag-and-drop of URLs into the URL field (widget-specific).
+        
+        NOTE: This method is kept for compatibility but should not be called
+        since fields no longer accept direct drag-and-drop.
+        """
+        # Hide feedback if it exists
+        self._hide_drag_feedback()
+        
+        try:
+            # Get dropped data
+            data = event.data
+            
+            # Parse the data - could be file paths or URLs
+            urls = []
+            
+            # Check if it's file paths (wrapped in curly braces)
+            if data.startswith('{') and '}' in data:
+                paths = data.strip('{}').split('} {')
+                for path in paths:
+                    path = path.strip()
+                    if path.startswith('http://') or path.startswith('https://'):
+                        # Resolve redirects for non-Bandcamp URLs
+                        resolved_url = self._resolve_url_redirects(path)
+                        if resolved_url and self._validate_bandcamp_url(resolved_url):
+                            urls.append(resolved_url)
+            else:
+                # Single URL or text
+                text = data.strip()
+                if text.startswith('http://') or text.startswith('https://'):
+                    # Resolve redirects for non-Bandcamp URLs
+                    resolved_url = self._resolve_url_redirects(text)
+                    if resolved_url and self._validate_bandcamp_url(resolved_url):
+                        urls.append(resolved_url)
+                else:
+                    # Try to find URLs in the text
+                    import re
+                    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+                    found_urls = re.findall(url_pattern, text)
+                    for url in found_urls:
+                        # Resolve redirects for non-Bandcamp URLs
+                        resolved_url = self._resolve_url_redirects(url)
+                        if resolved_url and self._validate_bandcamp_url(resolved_url):
+                            urls.append(resolved_url)
+            
+            # If we found valid Bandcamp URLs, paste them
+            if urls:
+                url_text = '\n'.join(urls)
+                
+                # Use the appropriate paste handler based on widget type
+                if widget == self.url_entry_widget:
+                    if '\n' in url_text:
+                        self._handle_entry_return(None)
+                        if self.url_text_widget:
+                            self.url_text_widget.insert(END, url_text)
+                            self.url_text_widget.mark_set(INSERT, END)
+                            # Focus the widget to ensure tags are visible
+                            self.url_text_widget.focus_set()
+                            self.url_text_widget.update_idletasks()
+                    else:
+                        current_text = widget.get()
+                        if current_text and current_text.strip():
+                            widget.insert(END, '\n' + url_text)
+                            self._handle_entry_return(None)
+                            if self.url_text_widget:
+                                self.url_text_widget.focus_set()
+                                self.url_text_widget.update_idletasks()
+                        else:
+                            widget.delete(0, END)
+                            widget.insert(0, url_text)
+                            # Focus the widget to ensure tags are visible
+                            widget.focus_set()
+                            widget.update_idletasks()
+                    self.on_url_change()
+                elif widget == self.url_text_widget:
+                    try:
+                        cursor_pos = widget.index(INSERT)
+                    except:
+                        cursor_pos = END
+                    
+                    widget.insert(cursor_pos, url_text)
+                    widget.mark_set(INSERT, END)
+                    # Focus the widget to ensure tags are visible
+                    widget.focus_set()
+                    # Force update to refresh display
+                    widget.update_idletasks()
+                    self.on_url_change()
+            else:
+                # Show error for invalid URLs
+                try:
+                    import tkinter.messagebox as messagebox
+                    messagebox.showwarning(
+                        "Invalid URL",
+                        "Only Bandcamp URLs are accepted.\n\n"
+                        "Please drag a URL from a Bandcamp page."
+                    )
+                except:
+                    pass
+            
+        except Exception as e:
+            # Silently fail if drag-and-drop processing fails
+            pass
     
     def _setup_path_section(self, main_frame):
         """Setup download path section with Browse button and Settings icon."""
@@ -5403,6 +6016,17 @@ class BandcampDownloaderGUI:
             if not clipboard_text:
                 return
             
+            # Extract URLs from clipboard and resolve redirects for non-Bandcamp URLs
+            clipboard_urls = self._extract_and_resolve_urls_from_text(clipboard_text)
+            
+            # If resolved URLs were found, use those instead of raw clipboard text
+            if clipboard_urls:
+                # Use resolved URLs (space-separated)
+                text_to_paste = ' '.join(clipboard_urls)
+            else:
+                # No URLs found, use clipboard text as-is (might be non-URL text)
+                text_to_paste = clipboard_text.strip()
+            
             # Get current content (don't strip yet - need original for URL check)
             current_content_raw = self.url_var.get()
             current_content = current_content_raw.strip()
@@ -5421,9 +6045,9 @@ class BandcampDownloaderGUI:
             
             # Prepare new content: append with space separator if content exists
             if current_content:
-                new_content = current_content + " " + clipboard_text.strip()
+                new_content = current_content + " " + text_to_paste
             else:
-                new_content = clipboard_text.strip()
+                new_content = text_to_paste
             
             # Set new content
             self.url_var.set(new_content)
@@ -5492,10 +6116,8 @@ class BandcampDownloaderGUI:
                 pass
             
             # No selection - always append to end with proper spacing
-            # Extract URLs from clipboard
-            import re
-            url_pattern = r'(?:https?://)?[^\s]*bandcamp\.com[^\s,;]*'
-            clipboard_urls = re.findall(url_pattern, clipboard_text, re.IGNORECASE)
+            # Extract URLs from clipboard and resolve redirects for non-Bandcamp URLs
+            clipboard_urls = self._extract_and_resolve_urls_from_text(clipboard_text)
             
             # Get current content
             current_content = self.url_text_widget.get(1.0, END).rstrip('\n')
@@ -5636,6 +6258,17 @@ class BandcampDownloaderGUI:
         if not clipboard_text:
             return "break"
         
+        # Extract URLs from clipboard and resolve redirects for non-Bandcamp URLs
+        clipboard_urls = self._extract_and_resolve_urls_from_text(clipboard_text)
+        
+        # If resolved URLs were found, use those instead of raw clipboard text
+        if clipboard_urls:
+            # Use resolved URLs (space-separated)
+            text_to_paste = ' '.join(clipboard_urls)
+        else:
+            # No URLs found, use clipboard text as-is (might be non-URL text)
+            text_to_paste = clipboard_text.strip()
+        
         # Get current cursor position BEFORE checking selection
         try:
             cursor_pos = widget.index("insert")
@@ -5672,7 +6305,7 @@ class BandcampDownloaderGUI:
         
         if had_selection:
             # There was a selection - insert at cursor position (which is now at sel_start)
-            widget.insert("insert", clipboard_text.strip())
+            widget.insert("insert", text_to_paste)
         else:
             # No selection - check if cursor is at end
             # widget.index("end") returns position AFTER last character
@@ -5693,7 +6326,7 @@ class BandcampDownloaderGUI:
                 pass
             
             # Cursor is in the middle - insert at cursor position (normal paste behavior, no space)
-            widget.insert("insert", clipboard_text.strip())
+            widget.insert("insert", text_to_paste)
         
         # Handle newlines and updates
         new_content = self.url_var.get()
@@ -7338,7 +7971,7 @@ class BandcampDownloaderGUI:
         # Copy button - inherit tag colors
         # Using 🔗 (link symbol) for copy URL
         def copy_handler(e):
-            self._copy_tag_url(tag_id)
+            self._copy_tag_url(tag_id, copy_btn)
             return "break"  # Stop event propagation
         copy_btn = Button(button_frame, text="🔗", font=("Segoe UI", 10), 
                          bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
@@ -8085,17 +8718,31 @@ class BandcampDownloaderGUI:
         metadata_text.bind('<Key>', prevent_edit)
         extract_btn.config(state='normal', text="Extract All Metadata")
     
-    def _copy_tag_url(self, tag_id):
+    def _copy_tag_url(self, tag_id, copy_button=None):
         """Copy tag URL to clipboard."""
         if tag_id not in self.url_tag_mapping:
             return
         
         url = self.url_tag_mapping[tag_id]
         
-        # Hide overlay immediately before clipboard operations to prevent flicker
-        # Clipboard operations can cause window updates that interfere with fade animation
-        # So we hide it first, then do clipboard operations
+        # Get button position before hiding overlay (for tooltip positioning)
+        tooltip_x = None
+        tooltip_y = None
+        tag_bg = None
+        tag_fg = None
+        
         if self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id:
+            # Get button position and colors before hiding
+            if copy_button:
+                try:
+                    tooltip_x = copy_button.winfo_rootx() + (copy_button.winfo_width() // 2)
+                    tooltip_y = copy_button.winfo_rooty() - 5
+                    # Get colors from button
+                    tag_bg = copy_button.cget('bg')
+                    tag_fg = copy_button.cget('fg')
+                except:
+                    pass
+            
             # Cancel any pending show/hide timers
             if hasattr(self, '_tag_overlay_show_timer') and self._tag_overlay_show_timer:
                 try:
@@ -8116,6 +8763,62 @@ class BandcampDownloaderGUI:
         # Do clipboard operations after starting fade
         self.root.clipboard_clear()
         self.root.clipboard_append(url)
+        
+        # Show "Copied" tooltip if we have position info
+        if tooltip_x is not None and tooltip_y is not None:
+            self._show_copied_tooltip(tooltip_x, tooltip_y, tag_bg, tag_fg)
+    
+    def _show_copied_tooltip(self, x, y, bg_color=None, fg_color=None):
+        """Show a 'Copied' tooltip at the specified position."""
+        # Use theme colors if not provided
+        if bg_color is None or fg_color is None:
+            colors = self.theme_colors
+            bg_color = bg_color or colors.bg
+            fg_color = fg_color or colors.fg
+        
+        # Destroy any existing copied tooltip
+        if hasattr(self, '_copied_tooltip') and self._copied_tooltip:
+            try:
+                self._copied_tooltip.destroy()
+            except:
+                pass
+        
+        # Create tooltip window
+        tooltip = Toplevel(self.root)
+        tooltip.overrideredirect(True)
+        tooltip.attributes('-topmost', True)
+        tooltip.configure(bg=bg_color, highlightthickness=0, bd=0)
+        
+        # Create label with "Copied" text
+        tooltip_label = Label(tooltip, text="Copied", bg=bg_color, fg=fg_color,
+                             font=("Segoe UI", 9), relief='flat', bd=0,
+                             padx=8, pady=4)
+        tooltip_label.pack()
+        
+        # Update to get size
+        tooltip.update_idletasks()
+        tooltip_width = tooltip.winfo_reqwidth()
+        tooltip_height = tooltip.winfo_reqheight()
+        
+        # Position tooltip centered above the button
+        tooltip_x = x - (tooltip_width // 2)
+        tooltip_y = y - tooltip_height - 8  # 8px above button
+        
+        tooltip.geometry(f"{tooltip_width}x{tooltip_height}+{tooltip_x}+{tooltip_y}")
+        
+        # Store reference
+        self._copied_tooltip = tooltip
+        
+        # Auto-hide after 1.5 seconds
+        def hide_tooltip():
+            if hasattr(self, '_copied_tooltip') and self._copied_tooltip == tooltip:
+                try:
+                    tooltip.destroy()
+                except:
+                    pass
+                self._copied_tooltip = None
+        
+        self.root.after(1500, hide_tooltip)
     
     def _delete_tag(self, tag_id):
         """Delete tag from URL field while protecting surrounding tags."""
@@ -8577,13 +9280,22 @@ class BandcampDownloaderGUI:
             for tag_id, full_url in self.url_tag_mapping.items():
                 all_urls.append(full_url)
             # Also check for any non-tagged URLs in content (fallback for URLs that weren't converted)
+            # This includes both Bandcamp URLs and potential proxy URLs that redirect to Bandcamp
             import re
-            url_pattern = r'(?:https?://)?[^\s]*bandcamp\.com[^\s,;]*'
+            # Find all URLs (both Bandcamp and non-Bandcamp)
+            url_pattern = r'https?://[^\s,;]+'
             remaining_matches = re.findall(url_pattern, content, re.IGNORECASE)
             for match in remaining_matches:
                 url = match.rstrip(' \t,;')
-                if 'bandcamp.com' in url.lower() and url not in all_urls:
-                    all_urls.append(url)
+                # If it's already a Bandcamp URL, add it
+                if 'bandcamp.com' in url.lower():
+                    if url not in all_urls:
+                        all_urls.append(url)
+                else:
+                    # Try to resolve redirects for non-Bandcamp URLs
+                    resolved_url = self._resolve_url_redirects(url)
+                    if resolved_url and resolved_url not in all_urls:
+                        all_urls.append(resolved_url)
             return all_urls if all_urls else []
         
         # No tags - use existing extraction logic
@@ -8623,15 +9335,26 @@ class BandcampDownloaderGUI:
                     # Clean up the URL (remove trailing whitespace, commas, semicolons)
                     url = url.rstrip(' \t,;')
                     
-                    # Validate it contains bandcamp.com
+                    # If it's already a Bandcamp URL, add it
                     if 'bandcamp.com' in url.lower():
                         all_urls.append(url)
+                    else:
+                        # Try to resolve redirects for non-Bandcamp URLs
+                        resolved_url = self._resolve_url_redirects(url)
+                        if resolved_url:
+                            all_urls.append(resolved_url)
             else:
                 # Single URL (or no URL) - check if it's a valid Bandcamp URL
                 # Also handle URLs without protocol
                 url = line.rstrip(' \t,;')
+                # If it's already a Bandcamp URL, add it
                 if 'bandcamp.com' in url.lower():
                     all_urls.append(url)
+                elif url.startswith('http://') or url.startswith('https://'):
+                    # Try to resolve redirects for non-Bandcamp URLs
+                    resolved_url = self._resolve_url_redirects(url)
+                    if resolved_url:
+                        all_urls.append(resolved_url)
         
         return all_urls
     
@@ -21468,7 +22191,11 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
 
 def main():
     """Main entry point."""
-    root = Tk()
+    # Use TkinterDnD.Tk if available for drag-and-drop support
+    if HAS_DND:
+        root = TkinterDnD.Tk()
+    else:
+        root = Tk()
     app = BandcampDownloaderGUI(root)
     root.mainloop()
 
