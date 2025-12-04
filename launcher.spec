@@ -28,6 +28,9 @@ a = Analysis(
         'hashlib',
         'ctypes',
         'ctypes.wintypes',
+        'urllib.request',  # URL redirect resolution
+        'urllib.parse',  # URL parsing
+        'urllib.error',  # URL error handling
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',
@@ -36,7 +39,11 @@ a = Analysis(
         'PIL',
         'PIL.Image',
         'PIL.ImageTk',
+        'PIL.ImageDraw',
+        'PIL.ImageFont',
+        'PIL._tkinter_finder',
         'yt_dlp',
+        'tkinterdnd2',  # Drag-and-drop support for URL field
     ],
     hookspath=[],
     hooksconfig={},
