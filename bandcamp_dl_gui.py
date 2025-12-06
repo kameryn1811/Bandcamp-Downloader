@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.6"
+__version__ = "1.3.7"
 
 import sys
 import subprocess
@@ -106,6 +106,62 @@ except ImportError:
 yt_dlp = None
 _ytdlp_preloaded = False
 _ytdlp_preload_failed = False
+
+# mutagen for MP3 artwork embedding (Windows Explorer compatible)
+HAS_MUTAGEN = False
+mutagen = None
+
+def _install_mutagen_if_needed():
+    """Auto-install mutagen if running as standalone Python (not bundled)."""
+    # Only auto-install if running as standalone script (not PyInstaller bundle)
+    if hasattr(sys, 'frozen'):
+        return False  # Bundled, don't auto-install
+    
+    try:
+        # Check if already installed
+        try:
+            import mutagen
+            from mutagen.id3 import ID3, APIC, PictureType
+            from mutagen.mp3 import MP3
+            return True  # Already installed
+        except ImportError:
+            pass
+        
+        # Try to install
+        print("Installing mutagen for MP3 artwork embedding...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "mutagen"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode == 0:
+            print("mutagen installed successfully!")
+            return True
+        else:
+            print(f"Warning: Could not auto-install mutagen: {result.stderr}")
+            return False
+    except Exception as e:
+        # Silently fail - will fall back to FFmpeg method
+        return False
+
+# Try to import mutagen
+try:
+    from mutagen.id3 import ID3, APIC, PictureType
+    from mutagen.mp3 import MP3
+    HAS_MUTAGEN = True
+except ImportError:
+    # If import fails and we're running standalone, try to install it
+    if not hasattr(sys, 'frozen'):
+        if _install_mutagen_if_needed():
+            # Retry import after installation
+            try:
+                from mutagen.id3 import ID3, APIC, PictureType
+                from mutagen.mp3 import MP3
+                HAS_MUTAGEN = True
+            except ImportError:
+                pass
 
 
 class ThinProgressBar:
@@ -603,6 +659,26 @@ class BandcampDownloaderGUI:
             return "wav"
         return format_val.lower() if format_val else format_val
     
+    def _normalize_url(self, url):
+        """Normalize URL for consistent cache lookup.
+        
+        Args:
+            url: URL string to normalize
+            
+        Returns:
+            Normalized URL (lowercase, with protocol, no trailing slash)
+        """
+        if not url:
+            return ""
+        # Clean whitespace and trailing characters
+        normalized = url.rstrip(' \t,;')
+        # Add protocol if missing
+        if not normalized.startswith(('http://', 'https://')):
+            normalized = 'https://' + normalized
+        # Remove trailing slash and convert to lowercase
+        normalized = normalized.rstrip('/').lower()
+        return normalized
+    
     def _clean_title(self, title, artist=None):
         """
         Clean title to remove artist prefix if present.
@@ -828,6 +904,7 @@ class BandcampDownloaderGUI:
         self.skip_postprocessing_var = BooleanVar(value=self.load_saved_skip_postprocessing())
         self.create_playlist_var = BooleanVar(value=self.load_saved_create_playlist())
         self.download_cover_art_var = BooleanVar(value=self.load_saved_download_cover_art())
+        self.download_bio_pic_var = BooleanVar(value=self.load_saved_download_bio_pic())
         self.download_extras_var = BooleanVar(value=self.load_saved_download_extras())
         self.download_discography_var = BooleanVar(value=False)  # Always default to off, not persistent
         self.auto_check_updates_var = BooleanVar(value=self.load_saved_auto_check_updates())
@@ -856,6 +933,7 @@ class BandcampDownloaderGUI:
         
         # Batch URL mode tracking
         self.batch_mode = False  # Track if we're in batch mode (multiple URLs)
+        self.is_singles_download = False  # Track if current download is singles-only (no albums)
         self.url_entry_widget = None  # Store reference to Entry widget
         self.url_text_widget = None  # Store reference to ScrolledText widget
         self.url_container_frame = None  # Container frame for URL widgets
@@ -1012,6 +1090,13 @@ class BandcampDownloaderGUI:
         # Check for updates in background after UI is ready (non-blocking) - only if auto-check is enabled
         if self.auto_check_updates_var.get():
             self.root.after(2000, self._check_for_updates_background)  # Wait 2 seconds after startup
+        
+        # Log mutagen availability for debugging
+        if self.debug_mode:
+            if HAS_MUTAGEN:
+                self._log_debug("mutagen is available for MP3 artwork embedding (Windows Explorer compatible)")
+            else:
+                self._log_debug("mutagen is not available - will use FFmpeg for MP3 artwork (may not show thumbnails in Windows Explorer)")
         
         # Show window with smooth fade-in effect after all UI is loaded
         self.root.after_idle(self._show_window_with_fade)
@@ -1688,7 +1773,7 @@ class BandcampDownloaderGUI:
         
         # Update checkboxes in settings section - dark mode uses bg, light mode uses select_bg
         checkbox_attrs = [
-            'skip_postprocessing_check', 'download_cover_art_check', 'download_extras_check',
+            'skip_postprocessing_check', 'download_cover_art_check', 'download_bio_pic_check', 'download_extras_check',
             'create_playlist_check', 'download_discography_check'
         ]
         checkbox_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
@@ -2081,6 +2166,7 @@ class BandcampDownloaderGUI:
                 "skip_postprocessing": self.skip_postprocessing_var.get(),
                 "create_playlist": self.create_playlist_var.get(),
                 "download_cover_art": self.download_cover_art_var.get(),
+                "download_bio_pic": self.download_bio_pic_var.get(),
                 "download_extras": self.download_extras_var.get(),
                 # download_discography is intentionally not saved - always defaults to off
                 "album_art_mode": self.album_art_mode,
@@ -4150,8 +4236,42 @@ class BandcampDownloaderGUI:
         """Handle download cover art checkbox change."""
         self.save_download_cover_art()
     
+    def load_saved_download_bio_pic(self):
+        """Load saved download bio pic preference, default to False if not found.
+        
+        For backward compatibility: if old 'download_extras' was True, enable bio pic.
+        """
+        settings = self._load_settings()
+        bio_pic = settings.get("download_bio_pic", None)
+        
+        # Backward compatibility: if bio_pic setting doesn't exist, check old download_extras
+        if bio_pic is None:
+            old_extras = settings.get("download_extras", False)
+            if old_extras:
+                # Migrate: if old extras was enabled, enable bio pic
+                # This ensures existing users don't lose functionality
+                bio_pic = True
+                # Save the migrated setting
+                settings["download_bio_pic"] = True
+                self._save_settings(settings, debounce=False)
+            else:
+                bio_pic = False
+        
+        return bio_pic
+    
+    def save_download_bio_pic(self):
+        """Save download bio pic preference."""
+        self._save_settings()
+    
+    def on_download_bio_pic_change(self):
+        """Handle download bio pic checkbox change."""
+        self.save_download_bio_pic()
+    
     def load_saved_download_extras(self):
-        """Load saved download extras preference, default to False if not found."""
+        """Load saved download extras preference, default to False if not found.
+        
+        Note: 'extras' now refers only to extra artwork, not bio pic.
+        """
         settings = self._load_settings()
         return settings.get("download_extras", False)
     
@@ -4831,13 +4951,8 @@ class BandcampDownloaderGUI:
     
     def _on_drag_enter(self, event):
         """Show visual feedback when drag enters the app (fires once)."""
-        # If downloading, show not-allowed cursor
+        # If downloading, don't show normal drag feedback
         if self._is_downloading():
-            # Set cursor to 'no' (not-allowed) on the root window
-            try:
-                self.root.config(cursor='no')
-            except:
-                pass
             return  # Don't show normal drag feedback during download
         
         # Change download button text when drag enters
@@ -4868,12 +4983,8 @@ class BandcampDownloaderGUI:
         This is called continuously while dragging over the app.
         We just ensure the button text is changed (it should already be from drag enter).
         """
-        # If downloading, ensure not-allowed cursor is shown
+        # If downloading, don't show normal drag feedback
         if self._is_downloading():
-            try:
-                self.root.config(cursor='no')
-            except:
-                pass
             return  # Don't show normal drag feedback during download
         
         # If button text hasn't been changed yet, change it (fallback in case drag enter didn't fire)
@@ -4928,13 +5039,6 @@ class BandcampDownloaderGUI:
         
         The button text should only change when actively dragging over the app.
         """
-        # Restore cursor if it was changed during download
-        if self._is_downloading():
-            try:
-                self.root.config(cursor='')
-            except:
-                pass
-        
         # Always hide feedback when drag leaves - this ensures button resets
         # immediately when user drags away from the interface
         self._hide_drag_feedback()
@@ -5841,10 +5945,20 @@ class BandcampDownloaderGUI:
         cover_art_extras_frame = Frame(self.settings_content, bg=settings_frame_bg, highlightthickness=0, borderwidth=0)
         cover_art_extras_frame.grid(row=4, column=0, columnspan=2, padx=4, sticky=W, pady=1)
         
-        # Save cover art checkbox (renamed, on left)
+        # Label for the group
+        save_copy_label = Label(
+            cover_art_extras_frame,
+            text="Include:",
+            font=("Segoe UI", 8),
+            bg=settings_frame_bg,
+            fg=colors.fg
+        )
+        save_copy_label.pack(side=LEFT, padx=(0, 8))
+        
+        # Save cover art checkbox
         download_cover_art_check = Checkbutton(
             cover_art_extras_frame,
-            text="Save copy of cover art",
+            text="Cover Art",
             variable=self.download_cover_art_var,
             font=("Segoe UI", 8),
             bg=settings_frame_bg,
@@ -5858,10 +5972,27 @@ class BandcampDownloaderGUI:
         self.download_cover_art_check = download_cover_art_check  # Store reference for theme updates
         self._create_tooltip(download_cover_art_check, "Save album art to the download folder.")
         
-        # Save extras checkbox (new, on right)
+        # Save bio pic checkbox
+        download_bio_pic_check = Checkbutton(
+            cover_art_extras_frame,
+            text="Bio Pic",
+            variable=self.download_bio_pic_var,
+            font=("Segoe UI", 8),
+            bg=settings_frame_bg,
+            fg=colors.fg,
+            selectcolor=settings_frame_bg,
+            activebackground=settings_frame_bg,
+            activeforeground=colors.fg,
+            command=self.on_download_bio_pic_change
+        )
+        download_bio_pic_check.pack(side=LEFT, padx=(0, 12))
+        self.download_bio_pic_check = download_bio_pic_check  # Store reference for theme updates
+        self._create_tooltip(download_bio_pic_check, "Save artist bio pic image to the download folder.")
+        
+        # Save extras checkbox (extra artwork only, not bio pic)
         download_extras_check = Checkbutton(
             cover_art_extras_frame,
-            text="Save extras",
+            text="Extras",
             variable=self.download_extras_var,
             font=("Segoe UI", 8),
             bg=settings_frame_bg,
@@ -5873,7 +6004,7 @@ class BandcampDownloaderGUI:
         )
         download_extras_check.pack(side=LEFT)
         self.download_extras_check = download_extras_check  # Store reference for theme updates
-        self._create_tooltip(download_extras_check, "Save additional artwork and bio pic images to the download folder.")
+        self._create_tooltip(download_extras_check, "Save additional artwork to the download folder.")
         
         # Create playlist checkbox (below Save copy of cover art)
         create_playlist_check = Checkbutton(
@@ -6593,19 +6724,50 @@ class BandcampDownloaderGUI:
     
     def on_closing(self):
         """Handle window closing - save state, fade out then close console and destroy."""
-        # Save window linking state and geometry before closing
-        self._save_window_linking_settings()
+        # Save window linking state and geometry before closing (immediately, not debounced)
+        # This ensures settings are saved before application closes
+        try:
+            settings = self._load_settings(use_cache=False)
+            settings["status_window_linked"] = self.status_window_linked
+            
+            # Save detached window relative offset and size if detached
+            if self.detached_window and self.detached_window.winfo_exists():
+                try:
+                    # Calculate and save relative offset
+                    main_x = self.root.winfo_x()
+                    main_y = self.root.winfo_y()
+                    detached_x = self.detached_window.winfo_x()
+                    detached_y = self.detached_window.winfo_y()
+                    relative_offset = (detached_x - main_x, detached_y - main_y)
+                    settings["status_window_offset"] = list(relative_offset)
+                    
+                    # Save window size (extract from geometry)
+                    geometry = self.detached_window.geometry()
+                    if 'x' in geometry:
+                        size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
+                        settings["status_window_size"] = size_part
+                    
+                    settings["status_window_detached"] = True
+                except Exception:
+                    pass
+            else:
+                settings["status_window_detached"] = False
+            
+            # Save immediately (not debounced) to ensure it persists across sessions
+            self._save_settings(settings, debounce=False)
+        except Exception:
+            pass
+        
         # Close detached window if it exists
         if self.detached_window and self.detached_window.winfo_exists():
-            # Calculate and save relative offset before closing
             try:
+                # Also update instance variables for consistency
                 main_x = self.root.winfo_x()
                 main_y = self.root.winfo_y()
                 detached_x = self.detached_window.winfo_x()
                 detached_y = self.detached_window.winfo_y()
                 self.window_offset = (detached_x - main_x, detached_y - main_y)
                 
-                # Save window size
                 geometry = self.detached_window.geometry()
                 if 'x' in geometry:
                     size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
@@ -11519,6 +11681,9 @@ class BandcampDownloaderGUI:
         # Update batch mode
         self.batch_mode = (url_count > 1)
         
+        # Detect if this is a singles-only download (for special handling)
+        self.is_singles_download = (track_count > 0 and album_count == 0)
+        
         # Update download button text
         if hasattr(self, 'download_btn'):
             # Check if discography mode is enabled (for single URL or no URL)
@@ -12106,13 +12271,80 @@ class BandcampDownloaderGUI:
                 first_track_title = None
                 first_track_number = None
                 
-                # Look for track list in HTML - Bandcamp typically has tracks in a list
+                # Check if this is a track page (single track, not album)
+                is_track_page = '/track/' in url if url else False
+                
+                # For track pages, extract title from page title or Open Graph meta tags first
+                if is_track_page and not first_track_title:
+                    # Pattern 1: Extract from Open Graph title (most reliable for track pages)
+                    og_title_patterns = [
+                        r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
+                        r'property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
+                    ]
+                    for pattern in og_title_patterns:
+                        match = re.search(pattern, html_content, re.IGNORECASE)
+                        if match:
+                            try:
+                                og_title = match.group(1).strip()
+                                # Decode HTML entities
+                                og_title = html.unescape(og_title)
+                                # For track pages, title is usually just the track name (e.g., "Insight")
+                                # But sometimes it's "Track Name by Artist" - extract just the track name
+                                if ' by ' in og_title.lower():
+                                    # Split on " by " and take the first part (track name)
+                                    first_track_title = og_title.split(' by ', 1)[0].strip()
+                                    # Remove trailing comma if present (some Bandcamp pages have "Track, by Artist")
+                                    first_track_title = first_track_title.rstrip(',')
+                                else:
+                                    first_track_title = og_title.strip()
+                                    # Remove trailing comma if present
+                                    first_track_title = first_track_title.rstrip(',')
+                                if first_track_title:
+                                    break
+                            except (ValueError, IndexError):
+                                continue
+                    
+                    # Pattern 2: Extract from page title tag
+                    if not first_track_title:
+                        title_pattern = r'<title>([^<]+)</title>'
+                        match = re.search(title_pattern, html_content, re.IGNORECASE)
+                        if match:
+                            try:
+                                page_title = match.group(1).strip()
+                                # Decode HTML entities
+                                page_title = html.unescape(page_title)
+                                # For track pages, title format is usually "Track Name by Artist" or "Track Name | Artist"
+                                # Extract just the track name
+                                if ' by ' in page_title.lower():
+                                    first_track_title = page_title.split(' by ', 1)[0].strip()
+                                    # Remove trailing comma if present (some Bandcamp pages have "Track, by Artist")
+                                    first_track_title = first_track_title.rstrip(',')
+                                elif ' | ' in page_title:
+                                    first_track_title = page_title.split(' | ', 1)[0].strip()
+                                    # Remove trailing comma if present
+                                    first_track_title = first_track_title.rstrip(',')
+                                else:
+                                    first_track_title = page_title.strip()
+                                    # Remove trailing comma if present
+                                    first_track_title = first_track_title.rstrip(',')
+                            except (ValueError, IndexError):
+                                pass
+                
+                # Look for track list in HTML - Bandcamp typically has tracks in a list (for album pages)
                 # Pattern 1: Look for tracklist items with track numbers (HTML structure)
                 tracklist_patterns = [
+                    # Standard list item with track number and title
                     r'<li[^>]*class=["\'][^"]*track[^"]*["\'][^>]*>.*?<span[^>]*class=["\'][^"]*track-number[^"]*["\'][^>]*>(\d+)</span>.*?<span[^>]*class=["\'][^"]*track-title[^"]*["\'][^>]*>([^<]+)</span>',
+                    # Div-based track structure
                     r'<div[^>]*class=["\'][^"]*track[^"]*["\'][^>]*>.*?<span[^>]*class=["\'][^"]*track-number[^"]*["\'][^>]*>(\d+)</span>.*?<span[^>]*class=["\'][^"]*track-title[^"]*["\'][^>]*>([^<]+)</span>',
+                    # Data attributes (more flexible)
                     r'data-track-number=["\'](\d+)["\'][^>]*data-track-title=["\']([^"\']+)["\']',
+                    # JavaScript object format
                     r'track_number["\']:\s*(\d+).*?track_title["\']:\s*["\']([^"\']+)["\']',
+                    # More flexible: any element with track number and title (non-greedy)
+                    r'<[^>]*track-number[^>]*>(\d+)</[^>]*>.*?<[^>]*track-title[^>]*>([^<]+)</[^>]*>',
+                    # Table row format (some Bandcamp pages use tables)
+                    r'<tr[^>]*class=["\'][^"]*track[^"]*["\'][^>]*>.*?<td[^>]*>(\d+)</td>.*?<td[^>]*>([^<]+)</td>',
                 ]
                 
                 for pattern in tracklist_patterns:
@@ -12131,10 +12363,22 @@ class BandcampDownloaderGUI:
                 # Pattern 2: Look for JavaScript data structures (Bandcamp embeds track data in JS)
                 if not first_track_title:
                     # Look for tracklist in JavaScript objects/arrays
+                    # Improved patterns to catch more variations
                     js_track_patterns = [
+                        # Standard trackinfo array (most common)
                         r'trackinfo["\']?\s*[:=]\s*\[.*?\{[^}]*"title"\s*:\s*["\']([^"\']+)["\']',
+                        # Tracks array
                         r'"tracks"\s*:\s*\[.*?\{[^}]*"title"\s*:\s*["\']([^"\']+)["\']',
+                        # TrackList array
                         r'trackList["\']?\s*[:=]\s*\[.*?\{[^}]*"title"\s*:\s*["\']([^"\']+)["\']',
+                        # Embedded in page data (var trackinfo = [...])
+                        r'var\s+trackinfo\s*=\s*\[.*?\{[^}]*"title"\s*:\s*["\']([^"\']+)["\']',
+                        # Embedded in TralbumData
+                        r'TralbumData["\']?\s*[:=]\s*\{[^}]*trackinfo["\']?\s*[:=]\s*\[.*?\{[^}]*"title"\s*:\s*["\']([^"\']+)["\']',
+                        # More flexible: any array with title field
+                        r'\[.*?\{[^}]*"title"\s*:\s*["\']([^"\']+)["\']',
+                        # Single track object (for track pages)
+                        r'\{"title"\s*:\s*["\']([^"\']+)["\']',
                     ]
                     for pattern in js_track_patterns:
                         match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
@@ -12143,7 +12387,9 @@ class BandcampDownloaderGUI:
                                 first_track_title = match.group(1).strip()
                                 # Decode HTML entities (e.g., &#39; -> ', &amp; -> &)
                                 first_track_title = html.unescape(first_track_title)
-                                if first_track_title:
+                                # Clean up any extra whitespace
+                                first_track_title = first_track_title.strip()
+                                if first_track_title and len(first_track_title) > 0:
                                     break
                             except (ValueError, IndexError):
                                 continue
@@ -12224,37 +12470,90 @@ class BandcampDownloaderGUI:
                         def fetch_first_track_title():
                             """Quickly fetch just the first track title for preview."""
                             try:
+                                # Check if URL is still current before doing expensive operations
+                                if not (hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url):
+                                    return
+                                
                                 # Do a quick yt-dlp extraction with extract_flat to get entry URLs
                                 yt_dlp = self._ensure_ytdlp_loaded()
-                                if yt_dlp:
-                                    quick_opts = {
-                                        "quiet": True,
-                                        "no_warnings": True,
-                                        "extract_flat": True,  # Fast - just get structure
-                                        "socket_timeout": 20,
-                                        "retries": 2,
-                                        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                        "referer": "https://bandcamp.com/",
-                                    }
-                                    with yt_dlp.YoutubeDL(quick_opts) as ydl:
-                                        info = ydl.extract_info(url, download=False)
-                                        if info and info.get("entries"):
-                                            entries = [e for e in info.get("entries", []) if e]
-                                            if entries and entries[0].get("url"):
-                                                # Extract first track with full extraction to get title
-                                                track_url = entries[0].get("url")
+                                if not yt_dlp:
+                                    return
+                                
+                                quick_opts = {
+                                    "quiet": True,
+                                    "no_warnings": True,
+                                    "extract_flat": True,  # Fast - just get structure
+                                    "socket_timeout": 15,  # Reduced timeout for faster response
+                                    "retries": 2,
+                                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                    "referer": "https://bandcamp.com/",
+                                }
+                                
+                                with yt_dlp.YoutubeDL(quick_opts) as ydl:
+                                    info = ydl.extract_info(url, download=False)
+                                    
+                                    # Check again if URL is still current
+                                    if not (hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url):
+                                        return
+                                    
+                                    if info and info.get("entries"):
+                                        entries = [e for e in info.get("entries", []) if e]
+                                        if entries:
+                                            first_entry = entries[0]
+                                            
+                                            # Try to get title from flat extraction first (sometimes available)
+                                            flat_title = first_entry.get("title")
+                                            if flat_title:
+                                                # Clean the title
+                                                entry_artist = first_entry.get("artist") or first_entry.get("uploader") or first_entry.get("creator")
+                                                track_title = self._clean_title(flat_title, entry_artist)
+                                                track_number = first_entry.get("track_number") or first_entry.get("track")
+                                                
+                                                # Parse track number
+                                                if track_number:
+                                                    try:
+                                                        if isinstance(track_number, str):
+                                                            import re
+                                                            match = re.search(r'(\d+)', str(track_number))
+                                                            if match:
+                                                                track_number = int(match.group(1))
+                                                            else:
+                                                                track_number = None
+                                                        elif isinstance(track_number, (int, float)):
+                                                            track_number = int(track_number)
+                                                        else:
+                                                            track_number = None
+                                                    except:
+                                                        track_number = None
+                                                
+                                                # Update album_info with first track title from flat extraction
+                                                if hasattr(self, 'album_info') and self.album_info and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                                                    self.album_info["first_track_title"] = track_title
+                                                    if track_number:
+                                                        self.album_info["first_track_number"] = track_number
+                                                    self.root.after(0, self.update_preview)
+                                                return  # Success - no need for full extraction
+                                            
+                                            # If flat extraction didn't have title, do full extraction of first track
+                                            track_url = first_entry.get("url")
+                                            if track_url:
                                                 track_opts = {
                                                     "quiet": True,
                                                     "no_warnings": True,
                                                     "extract_flat": False,  # Full extraction for title
-                                                    "socket_timeout": 15,  # Quick timeout
+                                                    "socket_timeout": 10,  # Reduced timeout for faster response
                                                     "retries": 2,
                                                     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                                                     "referer": "https://bandcamp.com/",
                                                 }
                                                 with yt_dlp.YoutubeDL(track_opts) as track_ydl:
                                                     track_info = track_ydl.extract_info(track_url, download=False)
-                                                    if track_info and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                                                    
+                                                    # Check again if URL is still current
+                                                    if not (hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url):
+                                                        return
+                                                    
+                                                    if track_info:
                                                         raw_title = track_info.get("title", "")
                                                         if raw_title:
                                                             entry_artist = track_info.get("artist") or track_info.get("uploader") or track_info.get("creator")
@@ -12277,7 +12576,7 @@ class BandcampDownloaderGUI:
                                                                     track_number = None
                                                             
                                                             # Update album_info with first track title
-                                                            if hasattr(self, 'album_info') and self.album_info:
+                                                            if hasattr(self, 'album_info') and self.album_info and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
                                                                 self.album_info["first_track_title"] = track_title
                                                                 if track_number:
                                                                     self.album_info["first_track_number"] = track_number
@@ -13184,10 +13483,28 @@ class BandcampDownloaderGUI:
                 
                 # Look for bio pic in the bio-container section
                 # Pattern: <div class="artists-bio-pic"> ... <a class="popupImage" href="..."> or <img class="band-photo" src="...">
+                # Note: Some pages have nested divs like <div class="artists-bio-pic"><div class="signed-out bio-pic"><a class="popupImage">
                 bio_pic_patterns = [
-                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    # Primary patterns - specific class/ID combinations (with nested div support)
+                    # Pattern 1: artists-bio-pic > (nested divs) > popupImage href
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>(?:[^<]|<(?!a[^>]*popupImage))*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    # Pattern 2: artists-bio-pic > (nested divs) > band-photo img src
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>(?:[^<]|<(?!img[^>]*band-photo))*?<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    # Pattern 3: popupImage href that contains band-photo img (simpler, more direct)
                     r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
+                    # Pattern 4: More flexible - look for popupImage within artists-bio-pic (allows any nesting)
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    # Pattern 5: More flexible - look for band-photo within artists-bio-pic (allows any nesting)
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    # Pattern 6: Look for band-photo class anywhere (fallback)
+                    r'<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*data-src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    # Pattern 7: Look for popupImage that's likely a bio pic (has bio-pic in nearby context)
+                    r'<div[^>]*class=["\'][^"]*bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    # Pattern 8: Look for artist photo in about section
+                    r'<div[^>]*class=["\'][^"]*about[^"]*["\'][^>]*>.*?<img[^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>',
+                    # Pattern 9: Look for any image in artist info section
+                    r'<div[^>]*class=["\'][^"]*artist-info[^"]*["\'][^>]*>.*?<img[^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
                 ]
                 
                 for pattern in bio_pic_patterns:
@@ -13202,7 +13519,14 @@ class BandcampDownloaderGUI:
                             from urllib.parse import urlparse
                             parsed = urlparse(url)
                             bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
-                        break
+                        # Verify it's not the album art (check if it contains common album art indicators)
+                        if bio_pic_url and 'tralbum-art' not in bio_pic_url.lower() and 'album-art' not in bio_pic_url.lower():
+                            # Also verify it's different from the thumbnail
+                            if not thumbnail_url or (bio_pic_url != thumbnail_url and bio_pic_url not in thumbnail_url and thumbnail_url not in bio_pic_url):
+                                if self.debug_mode:
+                                    self.log(f"Bio pic found via pattern: ...{bio_pic_url[-40:]}")
+                                break
+                        bio_pic_url = None  # Reset if it's actually album art or matches thumbnail
                 
                 # If bio pic not found with popupImage, try finding it in bio-container more broadly
                 if not bio_pic_url:
@@ -13210,16 +13534,51 @@ class BandcampDownloaderGUI:
                     bio_container_match = re.search(r'<div[^>]*id=["\']bio-container["\'][^>]*>(.*?)</div>', html_content, re.IGNORECASE | re.DOTALL)
                     if bio_container_match:
                         bio_content = bio_container_match.group(1)
-                        # Look for any image URL in the bio container
-                        img_match = re.search(r'(?:href|src)=["\']([^"\']+\.(jpg|jpeg|png|webp))', bio_content, re.IGNORECASE)
-                        if img_match:
-                            bio_pic_url = img_match.group(1)
-                            if bio_pic_url.startswith('//'):
-                                bio_pic_url = 'https:' + bio_pic_url
-                            elif bio_pic_url.startswith('/'):
+                        # Look for any image URL in the bio container (but exclude album art)
+                        img_matches = re.finditer(r'(?:href|src|data-src)=["\']([^"\']+\.(jpg|jpeg|png|webp))', bio_content, re.IGNORECASE)
+                        for img_match in img_matches:
+                            candidate_url = img_match.group(1)
+                            # Make sure it's a full URL
+                            if candidate_url.startswith('//'):
+                                candidate_url = 'https:' + candidate_url
+                            elif candidate_url.startswith('/'):
                                 from urllib.parse import urlparse
                                 parsed = urlparse(url)
-                                bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                                candidate_url = f"{parsed.scheme}://{parsed.netloc}{candidate_url}"
+                            # Verify it's not the album art
+                            if 'tralbum-art' not in candidate_url.lower() and 'album-art' not in candidate_url.lower():
+                                # Check if it's different from the thumbnail
+                                if thumbnail_url and candidate_url != thumbnail_url and candidate_url not in thumbnail_url:
+                                    bio_pic_url = candidate_url
+                                    break
+                
+                # Final fallback: Look for any popupImage link that's not the album art
+                if not bio_pic_url:
+                    # Find all popupImage links
+                    popup_matches = re.finditer(r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))', html_content, re.IGNORECASE)
+                    for popup_match in popup_matches:
+                        candidate_url = popup_match.group(1)
+                        # Make sure it's a full URL
+                        if candidate_url.startswith('//'):
+                            candidate_url = 'https:' + candidate_url
+                        elif candidate_url.startswith('/'):
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            candidate_url = f"{parsed.scheme}://{parsed.netloc}{candidate_url}"
+                        # Verify it's not the album art and different from thumbnail
+                        if ('tralbum-art' not in candidate_url.lower() and 
+                            'album-art' not in candidate_url.lower() and
+                            candidate_url != thumbnail_url and
+                            candidate_url not in thumbnail_url):
+                            # Check if it's in the about/bio section (look backwards in HTML)
+                            match_pos = popup_match.start()
+                            # Look for context around this match (check 2000 chars before)
+                            context_start = max(0, match_pos - 2000)
+                            context = html_content[context_start:match_pos]
+                            # If we see "about" or "bio" nearby, it's likely the bio pic
+                            if re.search(r'(about|bio|artist)', context, re.IGNORECASE):
+                                bio_pic_url = candidate_url
+                                break
                 
                 # Upgrade thumbnail and bio pic URLs to higher quality BEFORE extracting extra artwork
                 # This ensures we filter out the correct (upgraded) URLs from extra artwork
@@ -13258,10 +13617,28 @@ class BandcampDownloaderGUI:
                 self.current_thumbnail_url = high_quality_thumbnail if thumbnail_url else None
                 self.current_bio_pic_url = high_quality_bio_pic if bio_pic_url else None
                 
+                # Also store in metadata cache for later retrieval during download
+                # This is important for batch downloads where current_bio_pic_url might be cleared
+                if url:
+                    try:
+                        normalized_url = self._normalize_url(url)
+                        if normalized_url not in self.url_tag_metadata_cache:
+                            self.url_tag_metadata_cache[normalized_url] = {}
+                        self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = high_quality_bio_pic if bio_pic_url else None
+                        self.url_tag_metadata_cache[normalized_url]['thumbnail_url'] = high_quality_thumbnail if thumbnail_url else None
+                        self.url_tag_metadata_cache[normalized_url]['extra_artwork_urls'] = extra_artwork_urls
+                        if self.debug_mode and high_quality_bio_pic:
+                            self.log(f"DEBUG: Stored bio pic in metadata cache for: {normalized_url[:60]}...")
+                    except Exception as e:
+                        if self.debug_mode:
+                            self.log(f"DEBUG: Could not store bio pic in metadata cache: {str(e)}")
+                
                 if self.current_bio_pic_url and self.debug_mode:
                     self.log(f"Bio pic found: ...{self.current_bio_pic_url[-40:]}")
                 elif not self.current_bio_pic_url and self.debug_mode:
-                    self.log("Bio pic not found in HTML")
+                    # Check if this is a track URL (singles)
+                    is_track = '/track/' in url if url else False
+                    self.log(f"Bio pic not found in HTML for URL: {url[:60] if url else 'None'}... (is_track: {is_track})")
                 
                 # If found, display the artwork (only if this URL is still the current one being processed)
                 # Check current_url_being_processed to ensure we only display artwork for the latest URL
@@ -14197,7 +14574,15 @@ class BandcampDownloaderGUI:
         # Use real metadata if available, otherwise use placeholders
         # Sanitize names to remove invalid filename characters
         artist = self.sanitize_filename(self.album_info.get("artist")) or "Artist"
-        album = self.sanitize_filename(self.album_info.get("album")) or "Album"
+        # For singles, use "Singles" instead of "Album" or "NA"
+        album_raw = self.album_info.get("album")
+        if self.is_singles_download:
+            # For singles, use "Singles" as the album name in preview
+            album = "Singles"
+        elif album_raw:
+            album = self.sanitize_filename(album_raw)
+        else:
+            album = "Album"
         
         # Use first track title if available, otherwise fall back to "Track"
         first_track_title = self.album_info.get("first_track_title")
@@ -14651,6 +15036,8 @@ class BandcampDownloaderGUI:
         Button should be enabled if:
         - We have log messages AND we're not currently downloading, OR
         - We have an undo snapshot available
+        
+        Updates both main window and detached window buttons if they exist.
         """
         try:
             if not hasattr(self, 'clear_log_btn'):
@@ -14680,6 +15067,18 @@ class BandcampDownloaderGUI:
             else:
                 # No messages and no undo - disable button
                 self.clear_log_btn.config(text="Clear Log", command=self._clear_log, state='disabled', cursor='arrow')
+            
+            # Also update detached window button if it exists
+            if hasattr(self, 'detached_clear_log_btn') and self.detached_clear_log_btn:
+                try:
+                    if has_undo:
+                        self.detached_clear_log_btn.config(text="Undo Clear", command=self._undo_clear_log, state='normal', cursor='hand2')
+                    elif has_messages and not is_downloading:
+                        self.detached_clear_log_btn.config(text="Clear Log", command=self._clear_log, state='normal', cursor='hand2')
+                    else:
+                        self.detached_clear_log_btn.config(text="Clear Log", command=self._clear_log, state='disabled', cursor='arrow')
+                except Exception:
+                    pass
         except Exception:
             pass
     
@@ -15007,8 +15406,33 @@ class BandcampDownloaderGUI:
         # Update state
         self.status_detached = True
         
-        # Save settings
-        self._save_window_linking_settings()
+        # Save settings immediately (not debounced) when detaching to ensure size/position persist
+        # This ensures the state is saved for next attach/detach cycle and across sessions
+        try:
+            settings = self._load_settings(use_cache=False)
+            settings["status_window_linked"] = self.status_window_linked
+            settings["status_window_detached"] = True
+            
+            # Save current offset and size if window exists
+            if self.detached_window and self.detached_window.winfo_exists():
+                try:
+                    main_x = self.root.winfo_x()
+                    main_y = self.root.winfo_y()
+                    detached_x = self.detached_window.winfo_x()
+                    detached_y = self.detached_window.winfo_y()
+                    relative_offset = (detached_x - main_x, detached_y - main_y)
+                    settings["status_window_offset"] = list(relative_offset)
+                    
+                    geometry = self.detached_window.geometry()
+                    if 'x' in geometry:
+                        size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
+                        settings["status_window_size"] = size_part
+                except Exception:
+                    pass
+            
+            self._save_settings(settings, debounce=False)  # Save immediately
+        except Exception:
+            pass
     
     def _get_url_field_height_px(self):
         """Get current URL field height in pixels."""
@@ -15324,7 +15748,8 @@ class BandcampDownloaderGUI:
         if self.status_window_linked:
             self._deinitialize_window_linking()
         
-        # Calculate and save relative offset before closing
+        # Calculate and save relative offset and size before closing
+        # Save immediately (not debounced) so it's available for next detach
         if self.detached_window and self.detached_window.winfo_exists():
             try:
                 # Calculate current relative offset
@@ -15339,6 +15764,14 @@ class BandcampDownloaderGUI:
                 if 'x' in geometry:
                     size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
                     self.status_window_size = size_part
+                    
+                    # Save to settings immediately (not debounced) so it persists for next detach
+                    settings = self._load_settings(use_cache=False)
+                    settings["status_window_size"] = size_part
+                    settings["status_window_offset"] = list(self.window_offset)
+                    settings["status_window_linked"] = self.status_window_linked
+                    settings["status_window_detached"] = False  # Will be attached after this
+                    self._save_settings(settings, debounce=False)  # Save immediately
             except Exception:
                 pass
             
@@ -15375,9 +15808,6 @@ class BandcampDownloaderGUI:
         
         # Update state
         self.status_detached = False
-        
-        # Save settings
-        self._save_window_linking_settings()
     
     def _position_expand_button(self):
         """Reposition expand/collapse button after reattach."""
@@ -15443,6 +15873,10 @@ class BandcampDownloaderGUI:
                 pass  # Use calculated size if parsing fails
         
         # Position window relative to main window using saved offset
+        # Force update to ensure main window position is accurate
+        self.root.update_idletasks()
+        self.root.update()
+        
         main_x = self.root.winfo_x()
         main_y = self.root.winfo_y()
         offset_x, offset_y = self.window_offset
@@ -15465,6 +15899,21 @@ class BandcampDownloaderGUI:
         
         # Set window geometry with relative position
         self.detached_window.geometry(f"{current_width}x{current_height}+{detached_x}+{detached_y}")
+        
+        # Update window_offset with actual calculated offset (in case main window moved)
+        self.window_offset = (offset_x, offset_y)
+        
+        # Save size and position immediately after creating window (not debounced)
+        # This ensures the size is persisted for next attach/detach cycle
+        try:
+            settings = self._load_settings(use_cache=False)
+            settings["status_window_size"] = f"{current_width}x{current_height}"
+            settings["status_window_offset"] = list(self.window_offset)
+            settings["status_window_linked"] = self.status_window_linked
+            settings["status_window_detached"] = True
+            self._save_settings(settings, debounce=False)  # Save immediately
+        except Exception:
+            pass
         
         # Configure window background
         self.detached_window.configure(bg=log_frame_bg)
@@ -15489,9 +15938,70 @@ class BandcampDownloaderGUI:
         self.detached_window.deiconify()  # Ensure window is visible
         self.detached_window.lift()  # Bring to front
         self.detached_window.update_idletasks()
+        self.detached_window.update()  # Force full update to ensure position is applied
+        
+        # Verify and correct position if needed (handles timing issues in Python version)
+        # Sometimes winfo_x/y aren't accurate immediately after geometry() call
+        self.root.after(10, self._verify_detached_window_position)
         
         # Apply theme to window
         self._apply_theme_to_detached_window()
+    
+    def _verify_detached_window_position(self):
+        """Verify detached window is in correct position relative to main window and correct if needed.
+        
+        This handles timing issues where winfo_x/y might not be accurate immediately after
+        geometry() call, especially in Python version vs .exe version.
+        """
+        if not self.status_detached or not self.detached_window:
+            return
+        
+        try:
+            if not self.detached_window.winfo_exists():
+                return
+            
+            # Get current positions
+            self.root.update_idletasks()
+            main_x = self.root.winfo_x()
+            main_y = self.root.winfo_y()
+            current_detached_x = self.detached_window.winfo_x()
+            current_detached_y = self.detached_window.winfo_y()
+            
+            # Calculate expected position using saved offset
+            offset_x, offset_y = self.window_offset
+            expected_x = main_x + offset_x
+            expected_y = main_y + offset_y
+            
+            # Check if position is significantly different (more than 5 pixels)
+            # This accounts for minor positioning differences but catches major issues
+            x_diff = abs(current_detached_x - expected_x)
+            y_diff = abs(current_detached_y - expected_y)
+            
+            if x_diff > 5 or y_diff > 5:
+                # Position is incorrect - correct it
+                detached_width = self.detached_window.winfo_width()
+                detached_height = self.detached_window.winfo_height()
+                
+                # Ensure window stays on screen
+                screen_width = self.root.winfo_screenwidth()
+                screen_height = self.root.winfo_screenheight()
+                corrected_x = expected_x
+                corrected_y = expected_y
+                
+                if corrected_x < 0:
+                    corrected_x = main_x + self.root.winfo_width() + 20
+                if corrected_y < 0:
+                    corrected_y = main_y
+                if corrected_x + detached_width > screen_width:
+                    corrected_x = screen_width - detached_width - 20
+                if corrected_y + detached_height > screen_height:
+                    corrected_y = screen_height - detached_height - 20
+                
+                # Apply corrected position
+                self.detached_window.geometry(f"{detached_width}x{detached_height}+{corrected_x}+{corrected_y}")
+                self.detached_window.update_idletasks()
+        except Exception:
+            pass  # Silently fail if window is being destroyed or other issues
         
         # Initialize movement tracking and linking AFTER window is positioned and visible
         # This ensures we can properly calculate the offset with accurate window positions
@@ -15650,6 +16160,29 @@ class BandcampDownloaderGUI:
         self.detached_link_toggle = detached_link_toggle
         self.detached_link_var = detached_link_var
         
+        # If linking is already enabled, initialize it immediately after window is ready
+        # This ensures linking works even if the checkbox was already checked when detaching
+        if self.status_window_linked:
+            # Use after() to ensure window is fully positioned and rendered
+            def init_linking_if_enabled():
+                if self.status_detached and self.detached_window and self.detached_window.winfo_exists():
+                    try:
+                        # Verify window has valid position before initializing
+                        # Check that window has been positioned (not at default -1, -1)
+                        x = self.detached_window.winfo_x()
+                        y = self.detached_window.winfo_y()
+                        # Window is positioned if coordinates are non-negative (0,0 is valid)
+                        if x >= 0 and y >= 0:
+                            self._initialize_window_linking()
+                        else:
+                            # Window not positioned yet, try again with shorter delay
+                            self.detached_window.after(50, init_linking_if_enabled)
+                    except:
+                        pass
+            # Delay slightly to ensure window positioning is complete (after checkbox creation)
+            # Use a longer delay than the one in _create_detached_status_window to ensure this runs after
+            self.detached_window.after(200, init_linking_if_enabled)
+        
         # Attach button
         self.attach_btn = ttk.Button(
             detached_log_frame,
@@ -15694,7 +16227,7 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=sync_word_wrap
         )
-        detached_word_wrap_toggle.grid(row=0, column=3, sticky=E, padx=(0, 6), pady=(0, 0))
+        detached_word_wrap_toggle.grid(row=0, column=4, sticky=E, padx=(0, 6), pady=(0, 0))
         self.detached_word_wrap_toggle = detached_word_wrap_toggle
         self.detached_word_wrap_var = detached_word_wrap_var
         
@@ -15718,13 +16251,13 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=sync_debug_mode
         )
-        detached_debug_toggle.grid(row=0, column=4, sticky=E, padx=6, pady=(0, 0))
+        detached_debug_toggle.grid(row=0, column=5, sticky=E, padx=6, pady=(0, 0))
         self.detached_debug_toggle = detached_debug_toggle
         self.detached_debug_var = detached_debug_var
         
         # Configure column weights
         detached_log_frame.columnconfigure(0, weight=1)
-        for col in range(1, 6):  # Updated to 6 columns (Status, Link, Attach, Clear Log, Word Wrap, Debug)
+        for col in range(1, 6):  # Columns: Status (0), Link (1), Attach (2), Clear Log (3), Word Wrap (4), Debug (5)
             detached_log_frame.columnconfigure(col, weight=0)
         
         # Log content frame
@@ -17057,17 +17590,95 @@ class BandcampDownloaderGUI:
             if thumb_file.exists():
                 return str(thumb_file)
             
-            # Try common thumbnail names
-            for name in ['cover', 'album', 'folder', 'artwork']:
-                thumb_file = audio_dir / f"{name}{ext}"
+            # For singles, also try "Artist - Track Title" format (after cover art renaming)
+            if self.is_singles_download:
+                # Try to match by extracting track title from base_name
+                # Base name might be "Aura Shred - Gemini" or just "Gemini"
+                if " - " in base_name:
+                    # Already has artist prefix, try as-is
+                    thumb_file = audio_dir / f"{base_name}{ext}"
+                    if thumb_file.exists():
+                        return str(thumb_file)
+                else:
+                    # Just track title, try with artist prefix
+                    if hasattr(self, 'album_info_stored') and self.album_info_stored:
+                        artist = self.album_info_stored.get("artist", "")
+                        if artist:
+                            thumb_file = audio_dir / f"{artist} - {base_name}{ext}"
+                            if thumb_file.exists():
+                                return str(thumb_file)
+            
+            # Try common thumbnail names (only if not singles, to avoid wrong matches)
+            if not self.is_singles_download:
+                for name in ['cover', 'album', 'folder', 'artwork']:
+                    thumb_file = audio_dir / f"{name}{ext}"
+                    if thumb_file.exists():
+                        return str(thumb_file)
+        
+        # For singles, don't use the "any image file" fallback - it might pick the wrong one
+        # For albums, it's safe to use the first image file found
+        if not self.is_singles_download:
+            # Look for any image file in the directory (fallback for albums only)
+            for ext in self.THUMBNAIL_EXTENSIONS:
+                for img_file in audio_dir.glob(f"*{ext}"):
+                    return str(img_file)
+        
+        return None
+    
+    def find_thumbnail_file_for_single(self, audio_file, metadata):
+        """Find the corresponding thumbnail file for a single track using metadata.
+        
+        This is more reliable than find_thumbnail_file() for singles because it uses
+        the track title from metadata to match the correct artwork file.
+        """
+        audio_path = Path(audio_file)
+        audio_dir = audio_path.parent
+        
+        # Get track title from metadata
+        track_title = metadata.get("title", "")
+        artist = metadata.get("artist", "")
+        
+        if not track_title:
+            # Fallback to filename stem
+            track_title = audio_path.stem
+            # Remove artist prefix if present (e.g., "Aura Shred - Gemini" -> "Gemini")
+            if " - " in track_title:
+                parts = track_title.split(" - ", 1)
+                if len(parts) > 1:
+                    track_title = parts[-1].strip()
+        
+        # Try to find thumbnail matching the track title
+        for ext in self.THUMBNAIL_EXTENSIONS:
+            # Try exact track title match
+            thumb_file = audio_dir / f"{track_title}{ext}"
+            if thumb_file.exists():
+                return str(thumb_file)
+            
+            # Try "Artist - Track Title" format (after renaming)
+            if artist:
+                thumb_file = audio_dir / f"{artist} - {track_title}{ext}"
                 if thumb_file.exists():
                     return str(thumb_file)
-        
-        # Look for any image file in the directory
-        for ext in self.THUMBNAIL_EXTENSIONS:
+            
+            # Try with full filename stem (in case it hasn't been renamed yet)
+            base_name = audio_path.stem
+            thumb_file = audio_dir / f"{base_name}{ext}"
+            if thumb_file.exists():
+                return str(thumb_file)
+            
+            # Pattern 4: Try matching by track title in any filename (for yt-dlp's original naming)
+            # This handles cases where yt-dlp might name files differently
+            track_title_lower = track_title.lower()
             for img_file in audio_dir.glob(f"*{ext}"):
-                return str(img_file)
+                img_stem_lower = img_file.stem.lower()
+                # Check if track title appears in the image filename
+                if track_title_lower in img_stem_lower or img_stem_lower in track_title_lower:
+                    # Additional check: make sure it's not another single's artwork
+                    # If the image filename contains the track title, it's likely the right one
+                    return str(img_file)
         
+        # For singles, don't use generic fallbacks - return None if exact match not found
+        # This prevents picking the wrong artwork from another single
         return None
     
     def _detect_split_album(self, files_to_process):
@@ -17804,8 +18415,38 @@ class BandcampDownloaderGUI:
             artist = self.sanitize_filename(artist) if artist else "Unknown Artist"
             album = self.sanitize_filename(album) if album else "Unknown Album"
             
-            # Create the target filename
-            cover_art_name = f"{artist} - {album}"
+            # For singles, use track title instead of album to prevent overwrites
+            if self.is_singles_download:
+                # Get track title from downloaded files or download_info
+                track_title = None
+                if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                    # Try to get title from first downloaded file's metadata or filename
+                    for downloaded_file in list(self.downloaded_files)[:1]:
+                        try:
+                            file_path = Path(downloaded_file)
+                            if file_path.exists():
+                                # Try to get title from download_info
+                                filename = file_path.stem
+                                if hasattr(self, 'download_info') and self.download_info:
+                                    for title_key, track_info in self.download_info.items():
+                                        if filename.lower() in title_key.lower() or title_key.lower() in filename.lower():
+                                            track_title = track_info.get("title", filename)
+                                            break
+                                if not track_title:
+                                    track_title = filename
+                                break
+                        except Exception:
+                            pass
+                
+                if track_title:
+                    # Use track title for singles: "Artist - Track Title"
+                    cover_art_name = f"{artist} - {self.sanitize_filename(track_title)}"
+                else:
+                    # Fallback to album (which should be "Singles" for singles)
+                    cover_art_name = f"{artist} - {album}"
+            else:
+                # Normal albums: use album name
+                cover_art_name = f"{artist} - {album}"
             
             # Find all cover art files that were just downloaded
             # Only search in directories that contain downloaded audio files from the CURRENT album only
@@ -17903,56 +18544,114 @@ class BandcampDownloaderGUI:
             if not cover_art_files:
                 return
             
-            # Group cover art files by directory (each album folder gets one cover art)
-            cover_art_by_dir = {}
-            for thumb_file in cover_art_files:
-                thumb_dir = thumb_file.parent
-                if thumb_dir not in cover_art_by_dir:
-                    cover_art_by_dir[thumb_dir] = []
-                cover_art_by_dir[thumb_dir].append(thumb_file)
-            
-            # Rename cover art files in each directory
-            for thumb_dir, thumb_files in cover_art_by_dir.items():
-                # Find the best cover art file to keep (prefer common names, then first one)
-                thumb_files.sort(key=lambda f: (
-                    0 if any(name in f.stem.lower() for name in ['cover', 'album', 'folder', 'artwork']) else 1,
-                    f.name
-                ))
+            # For singles, match each cover art to its specific track
+            if self.is_singles_download:
+                # Group cover art files by directory, but we'll match them to tracks individually
+                cover_art_by_dir = {}
+                for thumb_file in cover_art_files:
+                    thumb_dir = thumb_file.parent
+                    if thumb_dir not in cover_art_by_dir:
+                        cover_art_by_dir[thumb_dir] = []
+                    cover_art_by_dir[thumb_dir].append(thumb_file)
                 
-                # Keep the first file, rename others or delete duplicates
-                kept_file = thumb_files[0]
-                target_name = cover_art_name + kept_file.suffix
-                target_path = thumb_dir / target_name
-                
-                # If the target already exists and is the same file, skip
-                if target_path == kept_file:
-                    # Already has the right name, just delete duplicates
-                    for thumb_file in thumb_files[1:]:
-                        try:
-                            thumb_file.unlink()
-                        except Exception:
-                            pass
-                    continue
-                
-                # Rename the kept file to "artist - album"
-                try:
-                    # If target exists, delete it first (might be from previous download)
-                    if target_path.exists():
-                        target_path.unlink()
+                # For each directory with singles, match cover art to tracks
+                for thumb_dir, thumb_files in cover_art_by_dir.items():
+                    # Get all audio files in this directory
+                    audio_files = []
+                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                    for ext in audio_extensions:
+                        audio_files.extend(list(thumb_dir.glob(f"*{ext}")))
                     
-                    kept_file.rename(target_path)
-                    self.root.after(0, lambda old=kept_file.name, new=target_name: 
-                                   self.log(f"Renamed cover art: {old} → {new}"))
+                    # Match cover art to tracks (by timestamp or order)
+                    # Sort both by modification time to match them
+                    thumb_files.sort(key=lambda f: f.stat().st_mtime)
+                    audio_files.sort(key=lambda f: f.stat().st_mtime)
                     
-                    # Delete any remaining duplicate cover art files
-                    for thumb_file in thumb_files[1:]:
-                        try:
-                            thumb_file.unlink()
-                        except Exception:
-                            pass
-                except Exception as e:
-                    self.root.after(0, lambda name=kept_file.name: 
-                                   self.log(f"⚠ Could not rename cover art: {name}"))
+                    # Match each cover art to a track
+                    for i, thumb_file in enumerate(thumb_files):
+                        if i < len(audio_files):
+                            # Get track title from audio file
+                            audio_file = audio_files[i]
+                            track_title = audio_file.stem
+                            
+                            # Try to get better title from download_info
+                            if hasattr(self, 'download_info') and self.download_info:
+                                for title_key, track_info in self.download_info.items():
+                                    if track_title.lower() in title_key.lower() or title_key.lower() in track_title.lower():
+                                        track_title = track_info.get("title", track_title)
+                                        break
+                            
+                            # Create unique cover art name for this track
+                            track_artist = artist  # Use the artist we found earlier
+                            unique_cover_name = f"{track_artist} - {self.sanitize_filename(track_title)}"
+                            target_name = unique_cover_name + thumb_file.suffix
+                            target_path = thumb_dir / target_name
+                        else:
+                            # More cover art files than tracks - use generic name with index
+                            target_name = f"{artist} - Single {i+1}" + thumb_file.suffix
+                            target_path = thumb_dir / target_name
+                        
+                        # Rename the cover art file
+                        if target_path != thumb_file:
+                            try:
+                                if target_path.exists():
+                                    # Target exists - delete this duplicate
+                                    thumb_file.unlink()
+                                else:
+                                    thumb_file.rename(target_path)
+                            except Exception:
+                                pass
+            else:
+                # Normal albums: group by directory (each album folder gets one cover art)
+                cover_art_by_dir = {}
+                for thumb_file in cover_art_files:
+                    thumb_dir = thumb_file.parent
+                    if thumb_dir not in cover_art_by_dir:
+                        cover_art_by_dir[thumb_dir] = []
+                    cover_art_by_dir[thumb_dir].append(thumb_file)
+                
+                # Rename cover art files in each directory
+                for thumb_dir, thumb_files in cover_art_by_dir.items():
+                    # Find the best cover art file to keep (prefer common names, then first one)
+                    thumb_files.sort(key=lambda f: (
+                        0 if any(name in f.stem.lower() for name in ['cover', 'album', 'folder', 'artwork']) else 1,
+                        f.name
+                    ))
+                    
+                    # Keep the first file, rename others or delete duplicates
+                    kept_file = thumb_files[0]
+                    target_name = cover_art_name + kept_file.suffix
+                    target_path = thumb_dir / target_name
+                    
+                    # If the target already exists and is the same file, skip
+                    if target_path == kept_file:
+                        # Already has the right name, just delete duplicates
+                        for thumb_file in thumb_files[1:]:
+                            try:
+                                thumb_file.unlink()
+                            except Exception:
+                                pass
+                        continue
+                    
+                    # Rename the kept file to "artist - album"
+                    try:
+                        # If target exists, delete it first (might be from previous download)
+                        if target_path.exists():
+                            target_path.unlink()
+                        
+                        kept_file.rename(target_path)
+                        self.root.after(0, lambda old=kept_file.name, new=target_name: 
+                                       self.log(f"Renamed cover art: {old} → {new}"))
+                        
+                        # Delete any remaining duplicate cover art files
+                        for thumb_file in thumb_files[1:]:
+                            try:
+                                thumb_file.unlink()
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        self.root.after(0, lambda name=kept_file.name: 
+                                       self.log(f"⚠ Could not rename cover art: {name}"))
         
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Error renaming cover art: {str(e)}"))
@@ -18013,8 +18712,15 @@ class BandcampDownloaderGUI:
             return None, None
     
     def final_cover_art_cleanup(self, download_path):
-        """Final cleanup pass: rename all cover art files to 'folder.{ext}' format."""
+        """Final cleanup pass: rename all cover art files to 'folder.{ext}' format.
+        
+        For singles, skip this step to preserve unique cover art per track.
+        """
         try:
+            # Skip folder.jpg rename for singles - they need unique names per track
+            if self.is_singles_download:
+                return
+            
             base_path = Path(download_path)
             if not base_path.exists():
                 return
@@ -18152,12 +18858,29 @@ class BandcampDownloaderGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Error in final cover art cleanup: {str(e)}"))
     
-    def download_extras_files(self, download_path):
-        """Download extra artwork and bio pic images to album folders where audio files are located.
+    def download_extras_files(self, download_path, download_bio_pic=None, download_extras=None):
+        """Download bio pic and/or extra artwork images to album folders where audio files are located.
         
         Args:
             download_path: Base download path where files should be saved
+            download_bio_pic: Whether to download bio pic (if None, uses self.download_bio_pic_var.get())
+            download_extras: Whether to download extra artwork (if None, uses self.download_extras_var.get())
         """
+        # Use provided parameters or fall back to checkbox values
+        if download_bio_pic is None:
+            download_bio_pic = self.download_bio_pic_var.get()
+        if download_extras is None:
+            download_extras = self.download_extras_var.get()
+        # Log which options are enabled
+        if download_bio_pic or download_extras:
+            self.log(f"download_extras_files() called (bio_pic={download_bio_pic}, extras={download_extras})")
+            if self.debug_mode:
+                self.log(f"DEBUG: download_extras_files() called (bio_pic={download_bio_pic}, extras={download_extras})")
+        else:
+            # Neither option is enabled, skip processing
+            if self.debug_mode:
+                self.log("DEBUG: download_extras_files() called but both options disabled, skipping")
+            return
         try:
             import requests
             from urllib.parse import urlparse
@@ -18190,6 +18913,25 @@ class BandcampDownloaderGUI:
                                     break
                             if has_audio:
                                 directories_to_process.add(audio_path.parent)
+                        else:
+                            # Directory doesn't exist - might have been renamed from "NA" to "Singles"
+                            # Check if the parent directory name is "NA" and try "Singles" instead
+                            parent_dir = audio_path.parent
+                            if parent_dir.name == "NA":
+                                # Try replacing "NA" with "Singles"
+                                new_path = parent_dir.parent / "Singles"
+                                if new_path.exists():
+                                    # Check if there are any audio files in this directory
+                                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                                    has_audio = False
+                                    for ext in audio_extensions:
+                                        if list(new_path.glob(f"*{ext}")):
+                                            has_audio = True
+                                            break
+                                    if has_audio:
+                                        directories_to_process.add(new_path)
+                                        if self.debug_mode:
+                                            self.log(f"DEBUG: Found renamed folder (NA → Singles): {new_path}")
                     except Exception:
                         pass
             
@@ -18232,10 +18974,39 @@ class BandcampDownloaderGUI:
                 except Exception:
                     pass
             
+            # Method 3: For singles, also check for "NA" or "Singles" folders
+            # This handles cases where downloaded_files might be cleared or folder renamed
+            if not directories_to_process and self.is_singles_download:
+                if self.debug_mode:
+                    self.log("DEBUG: No directories found via downloaded_files, checking for NA/Singles folders...")
+                # Look for "NA" or "Singles" folders in the base path
+                for folder_name in ["NA", "Singles"]:
+                    potential_folder = base_path / folder_name
+                    if potential_folder.exists():
+                        # Check if it contains audio files
+                        audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                        has_audio = False
+                        for ext in audio_extensions:
+                            if list(potential_folder.glob(f"*{ext}")):
+                                has_audio = True
+                                break
+                        if has_audio:
+                            directories_to_process.add(potential_folder)
+                            if self.debug_mode:
+                                self.log(f"DEBUG: Found singles folder: {potential_folder}")
+                            break  # Only need one folder for singles
+            
             # If still no directories found, don't process anything
             # This ensures we only download extras to folders from the current album
             if not directories_to_process:
+                # Always log this - it's important to know why extras aren't being downloaded
+                self.log("⚠ No directories found to process extras - skipping download")
+                if self.debug_mode:
+                    self.log("DEBUG: No directories found to process extras - returning early")
                 return
+            
+            if self.debug_mode:
+                self.log(f"DEBUG: Found {len(directories_to_process)} directory(ies) to process for extras")
             
             # Get URLs to download
             extra_artwork_urls = []
@@ -18247,98 +19018,377 @@ class BandcampDownloaderGUI:
             
             if hasattr(self, 'current_bio_pic_url') and self.current_bio_pic_url:
                 bio_pic_url = self.current_bio_pic_url
+                if self.debug_mode:
+                    self.log(f"DEBUG: Found bio pic from current_bio_pic_url: ...{bio_pic_url[-40:]}")
             
             # Also try to get from metadata cache if not available
-            if not extra_artwork_urls or not bio_pic_url:
-                for url in self.url_tag_mapping.values():
-                    normalized_url = self._normalize_url(url)
+            # This is important for batch downloads where current_bio_pic_url might be cleared
+            if not bio_pic_url:
+                # Try to get from metadata cache using the current album/track URL
+                # First, try to find the current URL from album_info, download_info, or url_tag_mapping
+                current_urls_to_try = []
+                
+                # Method 1: Try album_info URL
+                if hasattr(self, 'album_info') and self.album_info:
+                    url_from_info = self.album_info.get('url')
+                    if url_from_info:
+                        current_urls_to_try.append(url_from_info)
+                
+                # Method 2: Try all URLs from url_tag_mapping (for batch downloads, try all recent URLs)
+                if hasattr(self, 'url_tag_mapping') and self.url_tag_mapping:
+                    # For singles, try all track URLs (they might all have the same bio pic)
+                    # For albums, try the most recent URL
+                    if self.is_singles_download:
+                        # For singles, try all URLs - bio pic is usually the same for all tracks from same artist
+                        current_urls_to_try.extend(list(self.url_tag_mapping.values()))
+                    else:
+                        # For albums, try the most recent URL first
+                        if self.url_tag_mapping:
+                            current_urls_to_try.append(list(self.url_tag_mapping.values())[-1])
+                
+                # Try each URL in order
+                for current_url in current_urls_to_try:
+                    if not current_url:
+                        continue
+                    normalized_url = self._normalize_url(current_url)
                     if normalized_url in self.url_tag_metadata_cache:
                         metadata = self.url_tag_metadata_cache[normalized_url]
-                        if not extra_artwork_urls:
-                            extra_artwork_urls = metadata.get('extra_artwork_urls', [])
-                        if not bio_pic_url:
-                            bio_pic_url = metadata.get('bio_pic_url') or metadata.get('bio_pic')
-                        if extra_artwork_urls and bio_pic_url:
+                        candidate_bio_pic = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+                        if candidate_bio_pic:
+                            bio_pic_url = candidate_bio_pic
+                            if self.debug_mode:
+                                self.log(f"DEBUG: Found bio pic from metadata cache for URL: ...{current_url[-40:]}")
                             break
+                
+                # If still not found, try all URLs in metadata cache (comprehensive search)
+                if not bio_pic_url:
+                    if self.debug_mode:
+                        self.log(f"DEBUG: Comprehensive search - checking all {len(self.url_tag_metadata_cache)} entries in metadata cache...")
+                    # First try url_tag_mapping URLs
+                    if hasattr(self, 'url_tag_mapping') and self.url_tag_mapping:
+                        for url in self.url_tag_mapping.values():
+                            normalized_url = self._normalize_url(url)
+                            if normalized_url in self.url_tag_metadata_cache:
+                                metadata = self.url_tag_metadata_cache[normalized_url]
+                                if not extra_artwork_urls:
+                                    extra_artwork_urls = metadata.get('extra_artwork_urls', [])
+                                if not bio_pic_url:
+                                    bio_pic_url = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+                                    if bio_pic_url and self.debug_mode:
+                                        self.log(f"DEBUG: Found bio pic from metadata cache (comprehensive search): ...{bio_pic_url[-40:]}")
+                                if extra_artwork_urls and bio_pic_url:
+                                    break
+                    
+                    # If still not found, search ALL cache entries (not just url_tag_mapping)
+                    if not bio_pic_url:
+                        if self.debug_mode:
+                            self.log("DEBUG: Searching ALL metadata cache entries...")
+                        for cached_url, metadata in self.url_tag_metadata_cache.items():
+                            candidate_bio_pic = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+                            if candidate_bio_pic:
+                                bio_pic_url = candidate_bio_pic
+                                if self.debug_mode:
+                                    self.log(f"DEBUG: Found bio pic from ANY cache entry: ...{cached_url[-40:]} -> ...{bio_pic_url[-40:]}")
+                                break
+                
+                # For singles, if still not found, try to find bio pic from any URL with same artist domain
+                # This handles cases where bio pic is on artist page but we're downloading track pages
+                if not bio_pic_url and self.is_singles_download and hasattr(self, 'url_tag_mapping') and self.url_tag_mapping:
+                    # Extract artist domain from first track URL
+                    first_url = list(self.url_tag_mapping.values())[0]
+                    try:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(first_url)
+                        artist_domain = f"{parsed.scheme}://{parsed.netloc}"
+                        
+                        # Search all cache entries for URLs from the same artist domain
+                        for cached_url, metadata in self.url_tag_metadata_cache.items():
+                            if artist_domain in cached_url:
+                                candidate_bio_pic = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+                                if candidate_bio_pic:
+                                    bio_pic_url = candidate_bio_pic
+                                    if self.debug_mode:
+                                        self.log(f"DEBUG: Found bio pic from same artist domain: ...{cached_url[-40:]}")
+                                    break
+                    except Exception:
+                        pass
+            
+            if not bio_pic_url and self.debug_mode:
+                self.log("DEBUG: Bio pic URL not found - checking metadata cache keys...")
+                if hasattr(self, 'url_tag_metadata_cache'):
+                    for key in list(self.url_tag_metadata_cache.keys())[:3]:  # Show first 3 keys
+                        self.log(f"DEBUG: Cache key: {key[:60]}...")
+                        metadata = self.url_tag_metadata_cache[key]
+                        if 'bio_pic_url' in metadata or 'bio_pic' in metadata:
+                            self.log(f"DEBUG: Found bio_pic in cache for key: {key[:60]}...")
             
             # Process each directory (album folder) separately
             for album_dir in directories_to_process:
                 if not album_dir.exists():
                     continue
                 
-                # Download extra artwork images to this album folder
-                extra_num = 1
-                for extra_url in extra_artwork_urls:
-                    if not extra_url:
-                        continue
+                # For singles, match extras to specific tracks
+                if self.is_singles_download:
+                    # Get all audio files in this directory to match extras to tracks
+                    audio_files = []
+                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                    for ext in audio_extensions:
+                        audio_files.extend(list(album_dir.glob(f"*{ext}")))
+                    audio_files.sort(key=lambda f: f.stat().st_mtime)
                     
-                    try:
-                        # Get file extension from URL
-                        parsed = urlparse(extra_url)
-                        path = parsed.path
-                        ext = Path(path).suffix
-                        if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
-                            ext = '.jpg'  # Default to jpg
-                        
-                        # Generate filename (simple: Extra 1, Extra 2, etc.)
-                        filename = f"Extra {extra_num}{ext}"
-                        file_path = album_dir / filename
-                        
-                        # Skip if already exists
-                        if file_path.exists():
-                            extra_num += 1
-                            continue
-                        
-                        # Download image
-                        response = requests.get(extra_url, timeout=30, stream=True)
-                        response.raise_for_status()
-                        
-                        # Save file to album folder
-                        with open(file_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                        
-                        self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded: {f} (to {d})"))
-                        extra_num += 1
-                        
-                    except Exception as e:
-                        self.root.after(0, lambda u=extra_url[-30:]: 
-                                       self.log(f"⚠ Could not download extra artwork: ...{u}"))
-                
-                # Download bio pic to this album folder if available
-                if bio_pic_url:
-                    try:
-                        # Get file extension from URL
-                        parsed = urlparse(bio_pic_url)
-                        path = parsed.path
-                        ext = Path(path).suffix
-                        if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
-                            ext = '.jpg'  # Default to jpg
-                        
-                        # Generate filename (simple: Bio Pic)
-                        filename = f"Bio Pic{ext}"
-                        file_path = album_dir / filename
-                        
-                        # Skip if already exists
-                        if file_path.exists():
-                            continue
-                        
-                        # Download image
-                        response = requests.get(bio_pic_url, timeout=30, stream=True)
-                        response.raise_for_status()
-                        
-                        # Save file to album folder
-                        with open(file_path, 'wb') as f:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                        
-                        self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded: {f} (to {d})"))
-                        
-                    except Exception as e:
-                        self.root.after(0, lambda: 
-                                       self.log(f"⚠ Could not download bio pic: {str(e)}"))
+                    # Download extra artwork if enabled
+                    if download_extras:
+                        # Match extra artwork to tracks (one extra per track, or distribute evenly)
+                        extra_num = 1
+                        for i, extra_url in enumerate(extra_artwork_urls):
+                            if not extra_url:
+                                continue
+                            
+                            # Determine which track this extra belongs to
+                            track_index = min(i, len(audio_files) - 1) if audio_files else 0
+                            track_title = None
+                            if audio_files and track_index < len(audio_files):
+                                audio_file = audio_files[track_index]
+                                track_title = audio_file.stem
+                                
+                                # Try to get better title from download_info
+                                if hasattr(self, 'download_info') and self.download_info:
+                                    for title_key, track_info in self.download_info.items():
+                                        if track_title.lower() in title_key.lower() or title_key.lower() in track_title.lower():
+                                            track_title = track_info.get("title", track_title)
+                                            break
+                            
+                            try:
+                                # Get file extension from URL
+                                parsed = urlparse(extra_url)
+                                path = parsed.path
+                                ext = Path(path).suffix
+                                if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
+                                    ext = '.jpg'  # Default to jpg
+                                
+                                # Generate filename with track title prefix for singles
+                                if track_title:
+                                    filename = f"{self.sanitize_filename(track_title)} - Extra {extra_num}{ext}"
+                                else:
+                                    filename = f"Single {track_index + 1} - Extra {extra_num}{ext}"
+                                file_path = album_dir / filename
+                            except Exception as e:
+                                self.root.after(0, lambda u=extra_url[-30:]: 
+                                               self.log(f"⚠ Could not download extra artwork: ...{u}"))
+                                continue
+                            
+                            # Skip if already exists
+                            if file_path.exists():
+                                extra_num += 1
+                                continue
+                            
+                            # Download image
+                            try:
+                                response = requests.get(extra_url, timeout=30, stream=True)
+                                response.raise_for_status()
+                                
+                                # Save file to album folder
+                                with open(file_path, 'wb') as f:
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                                
+                                self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded extra artwork: {f} (to {d})"))
+                                extra_num += 1
+                            except Exception as e:
+                                self.root.after(0, lambda u=extra_url[-30:]: 
+                                               self.log(f"⚠ Could not download extra artwork: ...{u}"))
+                    
+                    # Download bio pic for singles (match to first track) - only if enabled
+                    if download_bio_pic:
+                        # Always log this to see what's happening
+                        self.log(f"Singles download - checking bio pic: {'Found' if bio_pic_url else 'None'}")
+                        if self.debug_mode:
+                            self.log(f"DEBUG: Singles download - bio_pic_url: {'Found' if bio_pic_url else 'None'}")
+                        if bio_pic_url:
+                            try:
+                                # Get file extension from URL
+                                parsed = urlparse(bio_pic_url)
+                                path = parsed.path
+                                ext = Path(path).suffix
+                                if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
+                                    ext = '.jpg'  # Default to jpg
+                                
+                                # Get track title for CURRENT single being processed
+                                # For batch downloads, we need to match the current single, not the first file in the folder
+                                track_title = None
+                                
+                                # Method 1: Try to get from downloaded_files (most accurate - current single only)
+                                if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                                    for downloaded_file in self.downloaded_files:
+                                        try:
+                                            audio_path = Path(downloaded_file)
+                                            # Check if this file is in the current directory we're processing
+                                            # Handle both "NA" and "Singles" folder names (folder might have been renamed)
+                                            file_parent = audio_path.parent
+                                            is_in_current_dir = (
+                                                file_parent == album_dir or
+                                                (file_parent.name == "NA" and album_dir.name == "Singles" and 
+                                                 file_parent.parent == album_dir.parent)
+                                            )
+                                            
+                                            if is_in_current_dir:
+                                                # Check if file exists (might be in "NA" folder that was renamed)
+                                                if audio_path.exists():
+                                                    track_title = audio_path.stem
+                                                else:
+                                                    # File might be in "NA" folder that was renamed to "Singles"
+                                                    # Try to find it in the "Singles" folder
+                                                    if file_parent.name == "NA":
+                                                        new_path = album_dir / audio_path.name
+                                                        if new_path.exists():
+                                                            track_title = new_path.stem
+                                                        else:
+                                                            # Use the stem from the original path
+                                                            track_title = audio_path.stem
+                                                    else:
+                                                        track_title = audio_path.stem
+                                                
+                                                # Always log this to help debug
+                                                self.log(f"Using track title from downloaded file: {track_title}")
+                                                
+                                                # Try to get better title from download_info
+                                                if hasattr(self, 'download_info') and self.download_info:
+                                                    for title_key, track_info in self.download_info.items():
+                                                        if track_title.lower() in title_key.lower() or title_key.lower() in track_title.lower():
+                                                            track_title = track_info.get("title", track_title)
+                                                            break
+                                                break  # Found the current single's file
+                                        except Exception as e:
+                                            if self.debug_mode:
+                                                self.log(f"DEBUG: Error processing downloaded_file: {e}")
+                                            pass
+                                
+                                # Method 2: Fallback - use the most recently modified file in the directory
+                                # This should be the current single if downloaded_files didn't work
+                                if not track_title and audio_files:
+                                    # Sort by modification time (newest first) and get the first one
+                                    audio_files_sorted = sorted(audio_files, key=lambda f: f.stat().st_mtime, reverse=True)
+                                    if audio_files_sorted:
+                                        most_recent = audio_files_sorted[0]
+                                        track_title = most_recent.stem
+                                        
+                                        # Try to get better title from download_info
+                                        if hasattr(self, 'download_info') and self.download_info:
+                                            for title_key, track_info in self.download_info.items():
+                                                if track_title.lower() in title_key.lower() or title_key.lower() in track_title.lower():
+                                                    track_title = track_info.get("title", track_title)
+                                                    break
+                                
+                                # Generate filename with track title prefix for singles
+                                if track_title:
+                                    filename = f"{self.sanitize_filename(track_title)} - Bio Pic{ext}"
+                                else:
+                                    filename = f"Single 1 - Bio Pic{ext}"
+                                file_path = album_dir / filename
+                            except Exception as e:
+                                self.root.after(0, lambda: self.log(f"⚠ Could not download bio pic: {str(e)}"))
+                                continue
+                            
+                            # Skip if already exists
+                            if file_path.exists():
+                                if self.debug_mode:
+                                    self.log(f"DEBUG: Bio pic already exists, skipping: {file_path}")
+                                continue
+                            
+                            # Download image
+                            # Always log when attempting download
+                            self.log(f"Downloading bio pic to: {file_path}")
+                            if self.debug_mode:
+                                self.log(f"DEBUG: Bio pic URL: {bio_pic_url[:80]}...")
+                                self.log(f"DEBUG: Target file: {file_path}")
+                            try:
+                                response = requests.get(bio_pic_url, timeout=30, stream=True)
+                                response.raise_for_status()
+                                
+                                # Save file to album folder
+                                with open(file_path, 'wb') as f:
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                                
+                                self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded bio pic: {f} (to {d})"))
+                            except Exception as e:
+                                self.root.after(0, lambda err=str(e): self.log(f"⚠ Could not download bio pic: {err}"))
+                else:
+                    # Normal albums: use simple naming
+                    # Download extra artwork images to this album folder - only if enabled
+                    if download_extras:
+                        extra_num = 1
+                        for extra_url in extra_artwork_urls:
+                            if not extra_url:
+                                continue
+                            
+                            try:
+                                # Get file extension from URL
+                                parsed = urlparse(extra_url)
+                                path = parsed.path
+                                ext = Path(path).suffix
+                                if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
+                                    ext = '.jpg'  # Default to jpg
+                                
+                                # Generate filename (simple: Extra 1, Extra 2, etc.)
+                                filename = f"Extra {extra_num}{ext}"
+                                file_path = album_dir / filename
+                                
+                                # Skip if already exists
+                                if file_path.exists():
+                                    extra_num += 1
+                                    continue
+                                
+                                # Download image
+                                response = requests.get(extra_url, timeout=30, stream=True)
+                                response.raise_for_status()
+                                
+                                # Save file to album folder
+                                with open(file_path, 'wb') as f:
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                                
+                                self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded extra artwork: {f} (to {d})"))
+                                extra_num += 1
+                                
+                            except Exception as e:
+                                self.root.after(0, lambda u=extra_url[-30:]: 
+                                               self.log(f"⚠ Could not download extra artwork: ...{u}"))
+                    
+                    # Download bio pic to this album folder if available - only if enabled
+                    if download_bio_pic and bio_pic_url:
+                        try:
+                            # Get file extension from URL
+                            parsed = urlparse(bio_pic_url)
+                            path = parsed.path
+                            ext = Path(path).suffix
+                            if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
+                                ext = '.jpg'  # Default to jpg
+                            
+                            # Generate filename (simple: Bio Pic)
+                            filename = f"Bio Pic{ext}"
+                            file_path = album_dir / filename
+                            
+                            # Skip if already exists, otherwise download
+                            if not file_path.exists():
+                                # Download image
+                                response = requests.get(bio_pic_url, timeout=30, stream=True)
+                                response.raise_for_status()
+                                
+                                # Save file to album folder
+                                with open(file_path, 'wb') as f:
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                                
+                                self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded: {f} (to {d})"))
+                            
+                        except Exception as e:
+                            self.root.after(0, lambda: 
+                                           self.log(f"⚠ Could not download bio pic: {str(e)}"))
                     
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Error downloading extras: {str(e)}"))
@@ -18346,8 +19396,9 @@ class BandcampDownloaderGUI:
     def process_downloaded_files(self, download_path):
         """Process all downloaded files to embed cover art for FLAC, OGG, and WAV."""
         
-        # Apply track numbering first
-        self.apply_track_numbering(download_path)
+        # Apply track numbering first (skip for singles - they don't need track numbers)
+        if not self.is_singles_download:
+            self.apply_track_numbering(download_path)
         
         # Rename cover art files to "artist - album" format
         self.rename_cover_art_files(download_path)
@@ -18474,6 +19525,9 @@ class BandcampDownloaderGUI:
                                     success = self.embed_cover_art_ffmpeg(audio_file_str, thumbnail_file)
                                 elif audio_ext == ".mp3":
                                     # MP3: use re_embed_mp3_metadata
+                                    # Always embed artwork with Windows Explorer-compatible settings (UTF-16, 'cover' desc)
+                                    # This ensures thumbnails display correctly even if artwork already exists
+                                    
                                     # Get metadata from download_info if available
                                     metadata = {}
                                     file_title = audio_file.stem
@@ -18501,6 +19555,7 @@ class BandcampDownloaderGUI:
                                         except Exception:
                                             pass
                                     
+                                    # Always embed artwork with Windows Explorer-compatible settings
                                     if metadata:
                                         success = self.re_embed_mp3_metadata(audio_file_str, metadata, thumbnail_file)
                                     else:
@@ -18541,8 +19596,18 @@ class BandcampDownloaderGUI:
             try:
                 base_path = Path(download_path)
                 if base_path.exists():
-                    # Find all MP3 files
-                    mp3_files = list(base_path.rglob("*.mp3"))
+                    # For singles, only process files from downloaded_files to avoid processing other singles
+                    if self.is_singles_download:
+                        # Only process files that were just downloaded
+                        mp3_files = []
+                        if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                            for downloaded_file in self.downloaded_files:
+                                file_path = Path(downloaded_file)
+                                if file_path.exists() and file_path.suffix.lower() == '.mp3':
+                                    mp3_files.append(file_path)
+                    else:
+                        # For albums, find all MP3 files
+                        mp3_files = list(base_path.rglob("*.mp3"))
                     
                     if mp3_files:
                         # Group files by directory
@@ -18561,22 +19626,111 @@ class BandcampDownloaderGUI:
                         # Process each directory
                         processed_count = 0
                         for dir_path, dir_files in files_by_dir.items():
-                            # Find thumbnail for this directory
-                            thumbnail_file = None
-                            for mp3_file in dir_files:
-                                thumb = self.find_thumbnail_file(str(mp3_file))
-                                if thumb:
-                                    thumbnail_file = thumb
-                                    break
-                            
-                            if not thumbnail_file:
-                                continue
-                            
-                            # Check each MP3 file and embed artwork if needed
-                            for mp3_file in dir_files:
+                            # For singles, find thumbnail for each file individually (to get correct artwork)
+                            # For albums, find one thumbnail for the directory
+                            if self.is_singles_download:
+                                # Process each file individually with its own thumbnail
+                                for mp3_file in dir_files:
+                                    mp3_file_str = str(mp3_file)
+                                    mp3_file_name = mp3_file.name
+                                    file_title = mp3_file.stem
+                                    
+                                    # Get metadata from download_info if available
+                                    metadata = {}
+                                    for title_key, info in self.download_info.items():
+                                        if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
+                                            metadata = info.copy()
+                                            # Clean title if it contains artist prefix
+                                            if metadata.get("title"):
+                                                metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
+                                            break
+                                    
+                                    # Find thumbnail for this specific file (singles need correct artwork per track)
+                                    thumbnail_file = None
+                                    if metadata:
+                                        thumbnail_file = self.find_thumbnail_file_for_single(mp3_file_str, metadata)
+                                    else:
+                                        thumbnail_file = self.find_thumbnail_file(mp3_file_str)
+                                    
+                                    if not thumbnail_file:
+                                        continue
+                                    
+                                    # Always embed artwork with Windows Explorer-compatible settings
+                                    if metadata:
+                                        success = self.re_embed_mp3_metadata(mp3_file_str, metadata, thumbnail_file)
+                                    else:
+                                        # Try without metadata, just artwork
+                                        cleaned_file_title = self._clean_title(file_title)
+                                        success = self.re_embed_mp3_metadata(mp3_file_str, {"title": cleaned_file_title}, thumbnail_file)
+                                    
+                                    if success:
+                                        processed_count += 1
+                                        self.root.after(0, lambda name=mp3_file_name: self.log(f"✓ Embedded cover art: {name}"))
+                            else:
+                                # For albums, use directory-level thumbnail (original behavior)
+                                # Find thumbnail for this directory
+                                thumbnail_file = None
+                                for mp3_file in dir_files:
+                                    thumb = self.find_thumbnail_file(str(mp3_file))
+                                    if thumb:
+                                        thumbnail_file = thumb
+                                        break
+                                
+                                if not thumbnail_file:
+                                    continue
+                                
+                                # Check each MP3 file and embed artwork if needed
+                                for mp3_file in dir_files:
+                                    mp3_file_str = str(mp3_file)
+                                    mp3_file_name = mp3_file.name
+                                    file_title = mp3_file.stem
+                                    
+                                    # Always embed artwork with Windows Explorer-compatible settings (UTF-16, 'cover' desc)
+                                    # This ensures thumbnails display correctly even if artwork already exists
+                                    
+                                    # Get metadata from download_info if available
+                                    metadata = {}
+                                    for title_key, info in self.download_info.items():
+                                        if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
+                                            metadata = info.copy()
+                                            # Clean title if it contains artist prefix
+                                            if metadata.get("title"):
+                                                metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
+                                            break
+                                    
+                                    # If no metadata found, try to get from file
+                                    if not metadata:
+                                        try:
+                                            artist, album = self._get_metadata_from_directory(dir_path)
+                                            if artist or album:
+                                                metadata = {
+                                                    "artist": artist,
+                                                    "album": album,
+                                                    "title": file_title
+                                                }
+                                                # Clean title if it contains artist prefix
+                                                if metadata.get("title"):
+                                                    metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
+                                        except Exception:
+                                            pass
+                                    
+                                    # Always embed artwork with Windows Explorer-compatible settings
+                                    if metadata:
+                                        success = self.re_embed_mp3_metadata(mp3_file_str, metadata, thumbnail_file)
+                                    else:
+                                        # Try without metadata, just artwork
+                                        cleaned_file_title = self._clean_title(file_title)
+                                        success = self.re_embed_mp3_metadata(mp3_file_str, {"title": cleaned_file_title}, thumbnail_file)
+                                    
+                                    if success:
+                                        processed_count += 1
+                                        self.root.after(0, lambda name=mp3_file_name: self.log(f"✓ Embedded cover art: {name}"))
                                 mp3_file_str = str(mp3_file)
                                 mp3_file_name = mp3_file.name
                                 file_title = mp3_file.stem
+                                
+                                # Always embed artwork with Windows Explorer-compatible settings (UTF-16, 'cover' desc)
+                                # This ensures thumbnails display correctly even if artwork already exists
                                 
                                 # Get metadata from download_info if available
                                 metadata = {}
@@ -18604,7 +19758,7 @@ class BandcampDownloaderGUI:
                                     except Exception:
                                         pass
                                 
-                                # Try to embed artwork (will work for all MP3 types)
+                                # Always embed artwork with Windows Explorer-compatible settings
                                 if metadata:
                                     success = self.re_embed_mp3_metadata(mp3_file_str, metadata, thumbnail_file)
                                 else:
@@ -18867,10 +20021,244 @@ class BandcampDownloaderGUI:
         except Exception:
             return False
     
+    def has_mp3_artwork(self, mp3_file):
+        """Check if MP3 file already has embedded artwork.
+        
+        Returns:
+            True if artwork exists, False otherwise
+        """
+        if not HAS_MUTAGEN:
+            # Fallback: try to check with FFprobe
+            # FFprobe doesn't show artwork info reliably, so return False to allow embedding
+            # This is safe - if artwork exists, re-embedding won't hurt
+            return False
+        
+        try:
+            if not HAS_MUTAGEN:
+                return False
+            audio = MP3(mp3_file, ID3=ID3)
+            if audio.tags:
+                # Check for APIC frames using getall() method (most reliable)
+                try:
+                    apic_list = audio.tags.getall('APIC')
+                    if apic_list:
+                        # Verify at least one is a valid APIC frame
+                        for apic in apic_list:
+                            if isinstance(apic, APIC):
+                                return True
+                except Exception:
+                    pass
+                
+                # Fallback: check keys (less reliable)
+                for key in audio.tags.keys():
+                    if key.startswith('APIC'):
+                        try:
+                            value = audio.tags[key]
+                            if isinstance(value, APIC):
+                                return True
+                        except Exception:
+                            pass
+            return False
+        except (NameError, ImportError):
+            # mutagen classes not available
+            return False
+        except Exception:
+            # If we can't read the file, assume no artwork to be safe
+            return False
+    
+    def embed_mp3_artwork_mutagen(self, mp3_file, artwork_file, metadata=None):
+        """Embed artwork into MP3 using mutagen (Windows Explorer compatible).
+        
+        Args:
+            mp3_file: Path to MP3 file
+            artwork_file: Path to artwork image file
+            metadata: Optional metadata dict (artist, album, title, etc.)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if not HAS_MUTAGEN:
+            return False
+        
+        try:
+            if not HAS_MUTAGEN:
+                return False
+            
+            # Load with ID3v2.3 from the start for maximum Windows Explorer compatibility
+            # Windows Explorer prefers ID3v2.3 and specific APIC frame format
+            # Use ID3 directly to have more control over the tag structure
+            try:
+                # Try loading existing ID3 tags
+                id3_tags = ID3(mp3_file)
+            except:
+                # No tags exist, create new
+                id3_tags = ID3()
+            
+            # Read artwork file
+            artwork_path = Path(artwork_file)
+            if not artwork_path.exists():
+                return False
+            
+            with open(artwork_file, 'rb') as f:
+                artwork_data = f.read()
+            
+            # Determine MIME type from file extension
+            ext = artwork_path.suffix.lower()
+            mime_type = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.png': 'image/png',
+                '.gif': 'image/gif',
+                '.webp': 'image/webp'
+            }.get(ext, 'image/jpeg')
+            
+            # Remove existing APIC frames (to avoid duplicates)
+            id3_tags.delall('APIC')
+            
+            # Add new APIC frame optimized for Windows Explorer thumbnail display
+            # Based on analysis of working Bandcamp files, Windows Explorer requires:
+            # - encoding=Encoding.UTF16 (UTF-16) - this is what Bandcamp uses
+            # - type=PictureType.COVER_FRONT (Type 3) - Cover (front)
+            # - desc='cover' (lowercase) - not empty, exactly 'cover'
+            # - Valid MIME type
+            # - APIC frame should be added early in the tag structure
+            from mutagen.id3 import Encoding
+            id3_tags.add(APIC(
+                encoding=Encoding.UTF16,  # UTF-16 - matches Bandcamp's format (Windows Explorer compatible)
+                mime=mime_type,
+                type=PictureType.COVER_FRONT,  # Type 3 - Cover (front) - required for Windows Explorer
+                desc='cover',  # Lowercase 'cover' - matches Bandcamp's format exactly
+                data=artwork_data
+            ))
+            
+            # Update metadata if provided (add after APIC to ensure APIC is first)
+            if metadata:
+                # Import text frame classes
+                try:
+                    from mutagen.id3 import TIT2, TPE1, TALB, TRCK, TDRC
+                except ImportError:
+                    # Fallback: use string keys (less reliable but works)
+                    if metadata.get("title"):
+                        clean_title = metadata.get("title", "")
+                        if clean_title:
+                            clean_title = self._clean_title(clean_title, metadata.get("artist"))
+                            if clean_title:
+                                id3_tags['TIT2'] = clean_title  # Title
+                    
+                    if metadata.get("artist"):
+                        id3_tags['TPE1'] = metadata['artist']  # Artist
+                    
+                    if metadata.get("album"):
+                        id3_tags['TALB'] = metadata['album']  # Album
+                    
+                    if metadata.get("track_number"):
+                        track_num = str(metadata['track_number'])
+                        id3_tags['TRCK'] = track_num  # Track number
+                    
+                    if metadata.get("date"):
+                        id3_tags['TDRC'] = metadata['date']  # Date
+                else:
+                    # Use frame classes (preferred method)
+                    # Clean title before embedding (remove artist prefix if present)
+                    clean_title = metadata.get("title", "")
+                    if clean_title:
+                        clean_title = self._clean_title(clean_title, metadata.get("artist"))
+                        if clean_title:
+                            id3_tags.add(TIT2(encoding=3, text=clean_title))  # Title
+                    
+                    if metadata.get("artist"):
+                        id3_tags.add(TPE1(encoding=3, text=metadata['artist']))  # Artist
+                    
+                    if metadata.get("album"):
+                        id3_tags.add(TALB(encoding=3, text=metadata['album']))  # Album
+                    
+                    if metadata.get("track_number"):
+                        track_num = str(metadata['track_number'])
+                        id3_tags.add(TRCK(encoding=3, text=track_num))  # Track number
+                    
+                    if metadata.get("date"):
+                        id3_tags.add(TDRC(encoding=3, text=metadata['date']))  # Date
+            
+            # Save as ID3v2.3 for maximum Windows Explorer compatibility
+            # ID3v2.3 has better compatibility than ID3v2.4 with Windows Explorer and older players
+            # Don't use update_to_v23() as it can remove artwork - save directly as v2.3 instead
+            # This preserves all frames including the APIC frame we just added
+            id3_tags.save(mp3_file, v2_version=3)  # Save as ID3v2.3
+            
+            # Verify the APIC frame was saved correctly (debug only)
+            if self.debug_mode:
+                try:
+                    # Reload to verify
+                    verify_tags = ID3(mp3_file)
+                    apic_list = verify_tags.getall('APIC')
+                    if apic_list:
+                        apic = apic_list[0]
+                        self._log_debug(f"APIC frame verified: encoding={apic.encoding}, type={apic.type}, mime={apic.mime}, desc='{apic.desc}', size={len(apic.data)} bytes")
+                    else:
+                        self._log_debug("WARNING: APIC frame not found after save!")
+                except Exception as e:
+                    self._log_debug(f"Could not verify APIC frame: {str(e)}")
+            
+            # Touch the file to trigger Windows Explorer cache refresh
+            # This helps Windows Explorer recognize the updated artwork
+            try:
+                import os
+                import time
+                current_time = time.time()
+                os.utime(mp3_file, (current_time, current_time))
+            except Exception:
+                pass  # Non-critical - file timestamp update
+            
+            return True
+        except (NameError, ImportError) as e:
+            # mutagen classes not available
+            if self.debug_mode:
+                self._log_debug(f"mutagen not available: {str(e)}")
+            return False
+        except Exception as e:
+            # Log the actual error for debugging
+            if self.debug_mode:
+                self._log_debug(f"mutagen embedding failed for {mp3_file}: {str(e)}")
+            elif hasattr(self, 'log'):
+                # Try to log even if debug mode is off (for critical errors)
+                try:
+                    self.log(f"⚠ Artwork embedding error: {str(e)[:100]}")
+                except:
+                    pass
+            return False
+    
     def re_embed_mp3_metadata(self, mp3_file, metadata, thumbnail_file=None):
-        """Re-embed metadata into MP3 file using FFmpeg."""
-        # Use the generic function for MP3 as well
+        """Re-embed metadata into MP3 file.
+        
+        Uses mutagen for artwork (Windows Explorer compatible) if available,
+        falls back to FFmpeg for metadata-only updates or if mutagen unavailable.
+        """
+        # For singles, set album to "Singles" if missing or "NA"
+        if self.is_singles_download and self._is_single_track(metadata):
+            if not metadata.get("album") or metadata.get("album") == "NA":
+                metadata = metadata.copy()  # Don't modify original
+                metadata["album"] = "Singles"
+        
+        # If we have mutagen and artwork file, use mutagen for Windows Explorer compatibility
+        # Always embed artwork with Windows Explorer-compatible settings (UTF-16, 'cover' desc)
+        # This ensures thumbnails display correctly even if artwork already exists
+        if HAS_MUTAGEN and thumbnail_file and Path(thumbnail_file).exists():
+            # Always use mutagen to embed artwork with Windows Explorer-compatible settings
+            result = self.embed_mp3_artwork_mutagen(mp3_file, thumbnail_file, metadata)
+            if not result:
+                # If mutagen fails, fall back to FFmpeg
+                if self.debug_mode:
+                    self._log_debug(f"mutagen embedding failed for {mp3_file}, falling back to FFmpeg")
+                return self.re_embed_audio_metadata(mp3_file, metadata, thumbnail_file)
+            return result
+        
+        # Fall back to FFmpeg method (for metadata-only or if mutagen unavailable)
         return self.re_embed_audio_metadata(mp3_file, metadata, thumbnail_file)
+    
+    def _is_single_track(self, metadata):
+        """Check if a metadata dict represents a single track (no album or album is NA)."""
+        album = metadata.get("album")
+        return not album or album == "NA" or album.strip() == ""
     
     def verify_and_fix_mp3_metadata(self, download_path):
         """Verify MP3 files have metadata and fix missing ones."""
@@ -18893,8 +20281,14 @@ class BandcampDownloaderGUI:
                     if file_path.exists() and file_path.suffix.lower() == '.mp3':
                         mp3_files.append(file_path)
             
-            # If no files tracked, use timestamp-based filtering (files modified after download started)
-            if not mp3_files and hasattr(self, 'download_start_time'):
+            # For singles, ONLY use downloaded_files - don't fall back to timestamp-based filtering
+            # This prevents processing files from previous singles in batch mode
+            if self.is_singles_download:
+                # Only process files that are in downloaded_files
+                if not mp3_files:
+                    return  # No files to process
+            # For albums, use timestamp-based filtering as fallback
+            elif not mp3_files and hasattr(self, 'download_start_time'):
                 # Cache file stats to avoid multiple stat() calls
                 time_threshold = self.download_start_time - 30
                 album_info = getattr(self, 'album_info_stored', None)
@@ -18951,7 +20345,11 @@ class BandcampDownloaderGUI:
                             "track_number": tags.get("track") or tags.get("TRACK"),
                             "date": tags.get("date") or tags.get("DATE")
                         }
-                        thumbnail_file = self.find_thumbnail_file(str(mp3_file))
+                        # For singles, use metadata-based thumbnail finding
+                        if self.is_singles_download:
+                            thumbnail_file = self.find_thumbnail_file_for_single(str(mp3_file), metadata)
+                        else:
+                            thumbnail_file = self.find_thumbnail_file(str(mp3_file))
                         if self.re_embed_mp3_metadata(mp3_file, metadata, thumbnail_file):
                             fixed_count += 1
                             self.root.after(0, lambda f=mp3_file.name: self.log(f"✓ Fixed metadata: {f}"))
@@ -18988,12 +20386,25 @@ class BandcampDownloaderGUI:
                     if metadata.get("title"):
                         metadata["title"] = self._clean_title(metadata["title"], metadata.get("artist"))
                     
-                    # Find thumbnail
-                    thumbnail_file = self.find_thumbnail_file(str(mp3_file))
+                    # For singles, set album to "Singles" if missing or "NA"
+                    if self.is_singles_download and self._is_single_track(metadata):
+                        if not metadata.get("album") or metadata.get("album") == "NA":
+                            metadata["album"] = "Singles"
                     
-                    # Re-embed metadata
+                    # Find thumbnail - for singles, pass metadata to help find the correct artwork
+                    if self.is_singles_download and metadata:
+                        # For singles, use metadata to find the correct artwork file
+                        thumbnail_file = self.find_thumbnail_file_for_single(str(mp3_file), metadata)
+                    else:
+                        thumbnail_file = self.find_thumbnail_file(str(mp3_file))
+                    
+                    # Always embed artwork with Windows Explorer-compatible settings (UTF-16, 'cover' desc)
+                    # This ensures thumbnails display correctly even if artwork already exists
+                    
+                    # Re-embed metadata and artwork
                     if metadata.get("artist") or metadata.get("album") or metadata.get("title"):
                         self.root.after(0, lambda f=mp3_file.name: self.log(f"Fixing metadata: {f}"))
+                        # Always pass thumbnail to ensure Windows Explorer-compatible embedding
                         if self.re_embed_mp3_metadata(mp3_file, metadata, thumbnail_file):
                             fixed_count += 1
                             self.root.after(0, lambda f=mp3_file.name: self.log(f"✓ Fixed metadata: {f}"))
@@ -19005,6 +20416,95 @@ class BandcampDownloaderGUI:
         
         except Exception as e:
             self.root.after(0, lambda: self.log(f"Error verifying MP3 metadata: {str(e)}"))
+    
+    def _rename_na_folders_to_singles(self, download_path):
+        """Rename 'NA' folders to 'Singles' for singles downloads.
+        
+        Only renames folders that were created during the current download session.
+        """
+        if not self.is_singles_download:
+            if self.debug_mode:
+                self._log_debug("Skipping NA folder rename: not a singles download")
+            return
+        
+        try:
+            base_path = Path(download_path)
+            if not base_path.exists():
+                return
+            
+            # Find all "NA" folders - search recursively from download path
+            na_folders = []
+            
+            # Method 1: Check folders that contain downloaded files (most accurate)
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                for downloaded_file in self.downloaded_files:
+                    try:
+                        file_path = Path(downloaded_file)
+                        if file_path.exists():
+                            # Check parent directory
+                            parent = file_path.parent
+                            if parent.name == "NA":
+                                if parent not in na_folders:
+                                    na_folders.append(parent)
+                            # Check grandparent (for nested structures like Artist/NA/Track)
+                            grandparent = parent.parent
+                            if grandparent.name == "NA":
+                                if grandparent not in na_folders:
+                                    na_folders.append(grandparent)
+                    except Exception:
+                        pass
+            
+            # Method 2: Also search the download path directly for "NA" folders (fallback)
+            # This catches cases where downloaded_files might not be fully populated
+            try:
+                for item in base_path.rglob("NA"):
+                    if item.is_dir() and item.name == "NA":
+                        # Only include if it contains audio files (to avoid false positives)
+                        audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                        has_audio = False
+                        for ext in audio_extensions:
+                            if list(item.glob(f"*{ext}")):
+                                has_audio = True
+                                break
+                        if has_audio and item not in na_folders:
+                            na_folders.append(item)
+            except Exception:
+                pass
+            
+            # Rename each "NA" folder to "Singles"
+            for na_folder in na_folders:
+                try:
+                    if na_folder.exists() and na_folder.name == "NA":
+                        singles_folder = na_folder.parent / "Singles"
+                        
+                        # If "Singles" folder already exists, merge contents
+                        if singles_folder.exists():
+                            # Move files from NA to Singles
+                            for item in na_folder.iterdir():
+                                try:
+                                    target = singles_folder / item.name
+                                    if target.exists():
+                                        # File exists - skip or handle conflict
+                                        continue
+                                    item.rename(target)
+                                except Exception:
+                                    pass
+                            # Remove empty NA folder
+                            try:
+                                if not any(na_folder.iterdir()):
+                                    na_folder.rmdir()
+                            except Exception:
+                                pass
+                        else:
+                            # Rename NA to Singles
+                            na_folder.rename(singles_folder)
+                            self.root.after(0, lambda: self.log(f"Renamed folder: NA → Singles"))
+                except Exception as e:
+                    if self.debug_mode:
+                        self._log_debug(f"Could not rename NA folder to Singles: {str(e)}")
+        except Exception as e:
+            if self.debug_mode:
+                self._log_debug(f"Error renaming NA folders: {str(e)}")
     
     def verify_and_fix_original_format_metadata(self, download_path):
         """Verify and fix metadata/artwork for all formats in Original format (MP3, M4A, FLAC, etc.)."""
@@ -19026,8 +20526,15 @@ class BandcampDownloaderGUI:
                     if file_path.exists() and file_path.suffix.lower() in audio_extensions:
                         audio_files.append(file_path)
             
-            # If no files tracked, use timestamp-based filtering
-            if not audio_files and hasattr(self, 'download_start_time'):
+            # For singles, ONLY use downloaded_files - don't fall back to timestamp-based filtering
+            # This prevents processing files from previous singles in batch mode
+            if self.is_singles_download:
+                # Only process files that are in downloaded_files
+                if not audio_files:
+                    return  # No files to process
+            
+            # For albums, use timestamp-based filtering as fallback
+            elif not audio_files and hasattr(self, 'download_start_time'):
                 time_threshold = self.download_start_time - 30
                 album_info = getattr(self, 'album_info_stored', None)
                 artist_lower = (album_info.get("artist") or "").lower() if album_info else None
@@ -19189,6 +20696,133 @@ class BandcampDownloaderGUI:
                 # Files are different - keep them all
                 self.root.after(0, lambda count=len(cover_art_files): 
                                self.log(f"Keeping {count} unique cover art file(s) (they differ)"))
+    
+    def _deduplicate_bio_pics(self, download_path):
+        """Remove duplicate bio pic files for singles - keep only one if all are identical.
+        
+        When downloading multiple singles from the same artist, they all have the same bio pic.
+        This function finds all bio pic files, compares them, and keeps only one (renamed to "Bio Pic.jpg").
+        
+        Args:
+            download_path: Base download path where files should be saved
+        """
+        try:
+            base_path = Path(download_path)
+            if not base_path.exists():
+                return
+            
+            # Find all "Singles" folders (or "NA" if not renamed yet)
+            singles_folders = []
+            for folder_name in ["Singles", "NA"]:
+                potential_folder = base_path / folder_name
+                if potential_folder.exists():
+                    # Check if it contains audio files (to confirm it's a singles folder)
+                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                    has_audio = False
+                    for ext in audio_extensions:
+                        if list(potential_folder.glob(f"*{ext}")):
+                            has_audio = True
+                            break
+                    if has_audio:
+                        singles_folders.append(potential_folder)
+            
+            # Also check artist folders for Singles subfolders
+            if base_path.exists():
+                for item in base_path.iterdir():
+                    if item.is_dir():
+                        for folder_name in ["Singles", "NA"]:
+                            potential_folder = item / folder_name
+                            if potential_folder.exists():
+                                audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                                has_audio = False
+                                for ext in audio_extensions:
+                                    if list(potential_folder.glob(f"*{ext}")):
+                                        has_audio = True
+                                        break
+                                if has_audio and potential_folder not in singles_folders:
+                                    singles_folders.append(potential_folder)
+            
+            if not singles_folders:
+                return
+            
+            # Process each singles folder
+            hash_cache = {}
+            for singles_folder in singles_folders:
+                # Find all bio pic files (match patterns like "* - Bio Pic.*" or "*Bio Pic.*")
+                bio_pic_files = []
+                for ext in self.THUMBNAIL_EXTENSIONS:
+                    # Pattern 1: "Track Title - Bio Pic.jpg"
+                    bio_pic_files.extend(singles_folder.glob(f"* - Bio Pic{ext}"))
+                    # Pattern 2: "Bio Pic.jpg" (already deduplicated)
+                    bio_pic_files.extend(singles_folder.glob(f"Bio Pic{ext}"))
+                    # Pattern 3: "*Bio Pic*" (catch any variation)
+                    bio_pic_files.extend(singles_folder.glob(f"*Bio Pic*{ext}"))
+                
+                # Remove duplicates from the list (same file found by multiple patterns)
+                bio_pic_files = list(set(bio_pic_files))
+                
+                if len(bio_pic_files) <= 1:
+                    continue  # No duplicates possible
+                
+                # Calculate hashes for all bio pic files
+                file_hashes = {}
+                for bio_pic_file in bio_pic_files:
+                    file_hash = self.get_file_hash(bio_pic_file, cache=hash_cache)
+                    if file_hash:
+                        if file_hash not in file_hashes:
+                            file_hashes[file_hash] = []
+                        file_hashes[file_hash].append(bio_pic_file)
+                
+                # If all files have the same hash, keep only one
+                if len(file_hashes) == 1:
+                    # All files are identical - keep one, delete the rest
+                    files_to_keep = list(file_hashes.values())[0]
+                    if len(files_to_keep) > 1:
+                        # Prefer "Bio Pic.jpg" if it exists, otherwise keep the first one
+                        preferred_file = None
+                        for bio_file in files_to_keep:
+                            if bio_file.stem.lower() == "bio pic":
+                                preferred_file = bio_file
+                                break
+                        
+                        if not preferred_file:
+                            # Keep the first file (sorted by name for consistency)
+                            files_to_keep.sort(key=lambda f: f.name)
+                            preferred_file = files_to_keep[0]
+                        
+                        # Rename preferred file to "Bio Pic.jpg" if it's not already
+                        target_file = singles_folder / f"Bio Pic{preferred_file.suffix}"
+                        if preferred_file != target_file:
+                            try:
+                                if target_file.exists():
+                                    target_file.unlink()  # Remove existing "Bio Pic.jpg" if it exists
+                                preferred_file.rename(target_file)
+                                preferred_file = target_file
+                            except Exception as e:
+                                if self.debug_mode:
+                                    self.log(f"DEBUG: Could not rename bio pic to 'Bio Pic.jpg': {e}")
+                        
+                        # Delete all other duplicate files
+                        deleted_count = 0
+                        for file_to_delete in files_to_keep:
+                            if file_to_delete != preferred_file:
+                                try:
+                                    file_to_delete.unlink()
+                                    deleted_count += 1
+                                except Exception:
+                                    pass
+                        
+                        if deleted_count > 0:
+                            self.root.after(0, lambda count=deleted_count, folder=str(singles_folder.name): 
+                                           self.log(f"Removed {count} duplicate bio pic file(s) in {folder} (kept one as 'Bio Pic.jpg')"))
+                else:
+                    # Files are different - keep them all (different artists or different bio pics)
+                    if self.debug_mode:
+                        self.log(f"DEBUG: Keeping {len(bio_pic_files)} unique bio pic file(s) in {singles_folder.name} (they differ)")
+        except Exception as e:
+            if self.debug_mode:
+                self.log(f"DEBUG: Error deduplicating bio pics: {e}")
+            self.root.after(0, lambda: self.log(f"⚠ Error deduplicating bio pics: {str(e)}"))
     
     def create_playlist_file(self, download_path, format_val):
         """Create an .m3u playlist file with all downloaded tracks."""
@@ -19708,6 +21342,24 @@ class BandcampDownloaderGUI:
             if isinstance(urls, str):
                 urls = [urls]
             
+            # Detect if this is a singles-only download by analyzing the URLs
+            track_count = 0
+            album_count = 0
+            for url in urls:
+                parsed = self._parse_bandcamp_url(url)
+                if parsed:
+                    url_type = parsed[2]  # url_type is the third element
+                    if url_type == 'track':
+                        track_count += 1
+                    elif url_type == 'album':
+                        album_count += 1
+                    # For 'artist' type, we'll treat it as album (discography mode)
+                    else:
+                        album_count += 1
+            
+            # Set singles detection flag (only singles, no albums)
+            self.is_singles_download = (track_count > 0 and album_count == 0)
+            
             # Get format settings
             format_val = self.format_var.get()
             base_format = self._extract_format(format_val)
@@ -19983,13 +21635,25 @@ class BandcampDownloaderGUI:
                 
                 # Final summary
                 if successful_albums > 0:
-                    msg = f"Downloaded {successful_albums} album(s)"
+                    # Check if this was a singles download
+                    if self.is_singles_download:
+                        if successful_albums == 1:
+                            msg = f"Downloaded {successful_albums} single"
+                        else:
+                            msg = f"Downloaded {successful_albums} singles"
+                    else:
+                        msg = f"Downloaded {successful_albums} album(s)"
                     if failed_albums > 0:
                         msg += f" ({failed_albums} failed)"
                     self.root.after(0, self.download_complete, True, msg + "!")
                 else:
-                    self.root.after(0, self.download_complete, False, 
-                                  f"Failed to download any albums. {failed_albums} album(s) failed.")
+                    # Check if this was a singles download for error message
+                    if self.is_singles_download:
+                        self.root.after(0, self.download_complete, False, 
+                                      f"Failed to download any singles. {failed_albums} single(s) failed.")
+                    else:
+                        self.root.after(0, self.download_complete, False, 
+                                      f"Failed to download any albums. {failed_albums} album(s) failed.")
                 return
             
             # Batch mode (multiple URLs) or single album mode
@@ -20020,6 +21684,96 @@ class BandcampDownloaderGUI:
                         yt_dlp = self._ensure_ytdlp_loaded()
                         with yt_dlp.YoutubeDL(extract_opts_quick) as extract_ydl:
                             info = extract_ydl.extract_info(url, download=False)
+                            
+                            # For track pages (singles), also extract bio pic from HTML synchronously
+                            # This ensures bio pic is available for download_extras_files()
+                            if '/track/' in url:
+                                if self.debug_mode:
+                                    self.log(f"DEBUG: Attempting to extract bio pic from track page: {url[:60]}...")
+                                try:
+                                    # Extract bio pic synchronously (not in background thread)
+                                    import urllib.request
+                                    import re
+                                    from urllib.parse import urlparse
+                                    
+                                    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                                    headers = {
+                                        'User-Agent': user_agent,
+                                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                                        'Accept-Language': 'en-US,en;q=0.9',
+                                        'Connection': 'keep-alive',
+                                        'Referer': 'https://bandcamp.com/',
+                                    }
+                                    req = urllib.request.Request(url, headers=headers)
+                                    with urllib.request.urlopen(req, timeout=15) as response:
+                                        html_content = response.read().decode('utf-8', errors='ignore')
+                                    
+                                    # Extract bio pic using same patterns as fetch_thumbnail_from_html
+                                    # Also add pattern specifically for bio-container structure
+                                    bio_pic_url = None
+                                    bio_pic_patterns = [
+                                        # Pattern 1: Look inside bio-container first (most specific)
+                                        r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                                        # Pattern 2: artists-bio-pic with nested divs
+                                        r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>(?:[^<]|<(?!a[^>]*popupImage))*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                                        # Pattern 3: popupImage with band-photo img inside
+                                        r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
+                                        # Pattern 4: artists-bio-pic with any nesting
+                                        r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                                        # Pattern 5: band-photo img src
+                                        r'<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                                        # Pattern 6: bio-pic class
+                                        r'<div[^>]*class=["\'][^"]*bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                                        # Pattern 7: Look in bio-container for any popupImage
+                                        r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                                    ]
+                                    
+                                    for pattern_idx, pattern in enumerate(bio_pic_patterns):
+                                        match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
+                                        if match:
+                                            bio_pic_url = match.group(1)
+                                            if bio_pic_url.startswith('//'):
+                                                bio_pic_url = 'https:' + bio_pic_url
+                                            elif bio_pic_url.startswith('/'):
+                                                parsed_url = urlparse(url)
+                                                bio_pic_url = f"{parsed_url.scheme}://{parsed_url.netloc}{bio_pic_url}"
+                                            # Verify it's not the album art (check if it contains common album art indicators)
+                                            if bio_pic_url and 'tralbum-art' not in bio_pic_url.lower() and 'album-art' not in bio_pic_url.lower():
+                                                # Upgrade to higher quality
+                                                if bio_pic_url and ('_' in bio_pic_url or 'bcbits.com' in bio_pic_url):
+                                                    for size in ['_500', '_300', '_200', '_100', '_64']:
+                                                        if size in bio_pic_url:
+                                                            break
+                                                        test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                                                        if test_url != bio_pic_url:
+                                                            bio_pic_url = test_url
+                                                            break
+                                                if self.debug_mode:
+                                                    self.log(f"DEBUG: Found bio pic via pattern {pattern_idx + 1}: ...{bio_pic_url[-40:]}")
+                                                break
+                                            else:
+                                                bio_pic_url = None  # Reset if it's actually album art
+                                                if self.debug_mode:
+                                                    self.log(f"DEBUG: Pattern {pattern_idx + 1} matched but was album art, continuing...")
+                                    
+                                    # Store in metadata cache
+                                    if bio_pic_url:
+                                        normalized_url = self._normalize_url(url)
+                                        if normalized_url not in self.url_tag_metadata_cache:
+                                            self.url_tag_metadata_cache[normalized_url] = {}
+                                        self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = bio_pic_url
+                                        if self.debug_mode:
+                                            self.log(f"DEBUG: Extracted and cached bio pic from track page: ...{bio_pic_url[-40:]}")
+                                    else:
+                                        if self.debug_mode:
+                                            self.log(f"DEBUG: Bio pic not found in HTML for track page: {url[:60]}...")
+                                except Exception as e:
+                                    if self.debug_mode:
+                                        self.log(f"DEBUG: Could not extract bio pic from track page: {str(e)}")
+                                    import traceback
+                                    if self.debug_mode:
+                                        self.log(f"DEBUG: Traceback: {traceback.format_exc()}")
+                            
                             if info:
                                 album_name = info.get("album") or info.get("title") or url
                                 
@@ -20139,12 +21893,27 @@ class BandcampDownloaderGUI:
                     # Update album_info with metadata we already have
                     # Extract album_artist from metadata (for prefer_album_artist_for_folders setting)
                     album_artist_name = meta.get("album_artist") or artist_name or "Artist"
+                    
+                    # Try to extract first track title from batch metadata if available
+                    first_track_title = None
+                    first_track_number = None
+                    if meta.get("info"):
+                        info = meta["info"]
+                        entries = info.get("entries", [])
+                        if entries and len(entries) > 0:
+                            first_entry = entries[0]
+                            # In flat mode, title might be available
+                            first_track_title = first_entry.get("title")
+                            first_track_number = first_entry.get("track_number") or first_entry.get("track")
+                    
                     self.album_info = {
                         "artist": artist_name or "Artist",
                         "album": album_name or "Album",
                         "title": "Track",
                         "thumbnail_url": None,
-                        "album_artist": album_artist_name  # Set album_artist so get_outtmpl() can use it
+                        "album_artist": album_artist_name,  # Set album_artist so get_outtmpl() can use it
+                        "first_track_title": first_track_title,  # Add first track title if available
+                        "first_track_number": first_track_number  # Add first track number if available
                     }
                     self.root.after(0, self.update_preview)
                     
@@ -20172,6 +21941,10 @@ class BandcampDownloaderGUI:
                         self.album_info["thumbnail_url"] = thumbnail_url
                         self.current_thumbnail_url = thumbnail_url
                         self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
+                        # Even if we have thumbnail, fetch metadata to get first track title if not already extracted
+                        # (flat mode might not have full track info)
+                        if not first_track_title:
+                            self.fetch_album_metadata(album_url)
                     else:
                         # Fetch metadata and artwork (will update preview and artwork)
                         self.fetch_album_metadata(album_url)
@@ -20204,13 +21977,25 @@ class BandcampDownloaderGUI:
                 
                 # Final summary
                 if successful_albums > 0:
-                    msg = f"Downloaded {successful_albums} album(s)"
+                    # Check if this was a singles download
+                    if self.is_singles_download:
+                        if successful_albums == 1:
+                            msg = f"Downloaded {successful_albums} single"
+                        else:
+                            msg = f"Downloaded {successful_albums} singles"
+                    else:
+                        msg = f"Downloaded {successful_albums} album(s)"
                     if failed_albums > 0:
                         msg += f" ({failed_albums} failed)"
                     self.root.after(0, self.download_complete, True, msg + "!")
                 else:
-                    self.root.after(0, self.download_complete, False,
-                                  f"Failed to download any albums. {failed_albums} album(s) failed.")
+                    # Check if this was a singles download for error message
+                    if self.is_singles_download:
+                        self.root.after(0, self.download_complete, False,
+                                      f"Failed to download any singles. {failed_albums} single(s) failed.")
+                    else:
+                        self.root.after(0, self.download_complete, False,
+                                      f"Failed to download any albums. {failed_albums} album(s) failed.")
                 return
             
             # Single album mode - download normally
@@ -20245,6 +22030,106 @@ class BandcampDownloaderGUI:
     
     def _do_album_download_and_processing(self, album_url, ydl_opts, format_val, base_format, skip_postprocessing, download_path):
         """Helper method to perform the actual download and processing of a single album."""
+        # For track pages (singles), extract bio pic synchronously before download
+        # This ensures bio pic is available for download_extras_files()
+        if '/track/' in album_url:
+            # Always log this (not just debug) to confirm code is running
+            self.log(f"Extracting bio pic from track page...")
+            try:
+                if self.debug_mode:
+                    self.log(f"DEBUG: Single URL download - extracting bio pic from: {album_url[:60]}...")
+                # Extract bio pic synchronously (same code as batch mode)
+                import urllib.request
+                import re
+                from urllib.parse import urlparse
+                
+                user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                headers = {
+                    'User-Agent': user_agent,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Connection': 'keep-alive',
+                    'Referer': 'https://bandcamp.com/',
+                }
+                req = urllib.request.Request(album_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    html_content = response.read().decode('utf-8', errors='ignore')
+                
+                # Extract bio pic using same patterns as batch mode
+                bio_pic_url = None
+                bio_pic_patterns = [
+                    r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>(?:[^<]|<(?!a[^>]*popupImage))*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<div[^>]*class=["\'][^"]*bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                ]
+                
+                for pattern_idx, pattern in enumerate(bio_pic_patterns):
+                    match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        bio_pic_url = match.group(1)
+                        if bio_pic_url.startswith('//'):
+                            bio_pic_url = 'https:' + bio_pic_url
+                        elif bio_pic_url.startswith('/'):
+                            parsed_url = urlparse(album_url)
+                            bio_pic_url = f"{parsed_url.scheme}://{parsed_url.netloc}{bio_pic_url}"
+                        # Verify it's not the album art
+                        if bio_pic_url and 'tralbum-art' not in bio_pic_url.lower() and 'album-art' not in bio_pic_url.lower():
+                            # Upgrade to higher quality
+                            if bio_pic_url and ('_' in bio_pic_url or 'bcbits.com' in bio_pic_url):
+                                for size in ['_500', '_300', '_200', '_100', '_64']:
+                                    if size in bio_pic_url:
+                                        break
+                                    test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                                    if test_url != bio_pic_url:
+                                        bio_pic_url = test_url
+                                        break
+                            # Always log when bio pic is found (not just debug)
+                            self.log(f"Bio pic found via pattern {pattern_idx + 1}: ...{bio_pic_url[-40:]}")
+                            if self.debug_mode:
+                                self.log(f"DEBUG: Found bio pic via pattern {pattern_idx + 1}: ...{bio_pic_url[-40:]}")
+                            break
+                        else:
+                            bio_pic_url = None
+                
+                # Store in metadata cache AND set current_bio_pic_url
+                if bio_pic_url:
+                    normalized_url = self._normalize_url(album_url)
+                    if normalized_url not in self.url_tag_metadata_cache:
+                        self.url_tag_metadata_cache[normalized_url] = {}
+                    self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = bio_pic_url
+                    # Also set current_bio_pic_url so download_extras_files() can find it immediately
+                    self.current_bio_pic_url = bio_pic_url
+                    # Always log when bio pic is cached (not just debug)
+                    self.log(f"Extracted and cached bio pic: ...{bio_pic_url[-40:]}")
+                    if self.debug_mode:
+                        self.log(f"DEBUG: Extracted and cached bio pic for single URL download: ...{bio_pic_url[-40:]}")
+                        self.log(f"DEBUG: Also set current_bio_pic_url and stored in cache with key: {normalized_url[:60]}...")
+                else:
+                    if self.debug_mode:
+                        self.log(f"DEBUG: Bio pic not found in HTML for single URL: {album_url[:60]}...")
+                        # Debug: check if bio-container exists
+                        if 'bio-container' in html_content:
+                            self.log("DEBUG: bio-container found in HTML but bio pic URL not extracted")
+                            # Try to find any popupImage in bio-container as fallback
+                            bio_container_match = re.search(r'<div[^>]*id=["\']bio-container["\'][^>]*>(.*?)</div>', html_content, re.IGNORECASE | re.DOTALL)
+                            if bio_container_match:
+                                bio_content = bio_container_match.group(1)
+                                popup_match = re.search(r'href=["\']([^"\']+\.(jpg|jpeg|png|webp))', bio_content, re.IGNORECASE)
+                                if popup_match:
+                                    self.log(f"DEBUG: Found image URL in bio-container (but not extracted): ...{popup_match.group(1)[-40:]}")
+                        else:
+                            self.log("DEBUG: bio-container not found in HTML")
+            except Exception as e:
+                # Always log errors (not just debug) so we can see what's wrong
+                self.log(f"⚠ Error extracting bio pic from track page: {str(e)}")
+                if self.debug_mode:
+                    import traceback
+                    self.log(f"DEBUG: Traceback: {traceback.format_exc()}")
+        
         # Initialize downloaded_files set for this album (important for batch/discography mode)
         if not hasattr(self, 'downloaded_files'):
             self.downloaded_files = set()
@@ -20325,6 +22210,58 @@ class BandcampDownloaderGUI:
                 self.ydl_instance = ydl
             
             try:
+                # For singles (track pages), extract track title before download
+                # This allows the preview to show the actual track name instead of "track.mp3"
+                if '/track/' in album_url:
+                    track_title = None
+                    
+                    # Method 1: Try to get from album_info (fastest - already set from URL paste)
+                    if hasattr(self, 'album_info') and self.album_info:
+                        track_title = self.album_info.get("first_track_title")
+                    
+                    # Method 2: Try to get from cached metadata (already fetched when URL was pasted)
+                    if not track_title:
+                        normalized_url = self._normalize_url(album_url)
+                        # Check both caches (url_metadata_cache and url_tag_metadata_cache)
+                        for cache in [self.url_metadata_cache, self.url_tag_metadata_cache]:
+                            if normalized_url in cache:
+                                cached_metadata = cache[normalized_url]
+                                track_title = cached_metadata.get("first_track_title")
+                                if track_title:
+                                    break
+                    
+                    # Method 3: Extract from yt-dlp info (slower but reliable - only if cache failed)
+                    if not track_title:
+                        try:
+                            # Extract info without downloading (fast)
+                            info = ydl.extract_info(album_url, download=False)
+                            if info:
+                                # Get track title from info
+                                track_title = info.get("title")
+                                if track_title:
+                                    # Clean the title (remove artist prefix if present)
+                                    artist_name = info.get("artist") or info.get("uploader") or info.get("creator")
+                                    if artist_name and track_title.startswith(artist_name):
+                                        # Remove artist prefix
+                                        track_title = track_title.replace(artist_name, "", 1).strip()
+                                        # Remove " - " prefix if present
+                                        if track_title.startswith(" - "):
+                                            track_title = track_title[3:].strip()
+                                    # Remove trailing comma if present (some titles have "Track, by Artist" format)
+                                    track_title = track_title.rstrip(',').strip()
+                        except Exception as e:
+                            # If extraction fails, continue with download anyway
+                            if self.debug_mode:
+                                self.log(f"DEBUG: Could not extract track title for preview: {e}")
+                    
+                    # Update album_info with track title if we found it
+                    if track_title:
+                        if not hasattr(self, 'album_info'):
+                            self.album_info = {}
+                        self.album_info["first_track_title"] = track_title
+                        # Update preview immediately to show actual track name (synchronous update)
+                        self.update_preview()
+                
                 ydl.download([album_url])
                 # Log after download completes
                 self.root.after(0, lambda attempt=download_attempt: self.log(f"DEBUG: yt-dlp download() returned successfully (attempt {attempt + 1})"))
@@ -20537,10 +22474,23 @@ class BandcampDownloaderGUI:
                 # Final cleanup: rename all cover art files to "artist - album" format
                 self.final_cover_art_cleanup(download_path)
                 
-                # Download extras (extra artwork and bio pic) if enabled - after final cleanup
+                # Rename "NA" folders to "Singles" for singles downloads
+                self._rename_na_folders_to_singles(download_path)
+                
+                # Download bio pic and/or extras if enabled - after final cleanup
+                download_bio_pic = self.download_bio_pic_var.get()
                 download_extras = self.download_extras_var.get()
-                if download_extras:
-                    self.download_extras_files(download_path)
+                
+                # Check if either option is enabled
+                if download_bio_pic or download_extras:
+                    if self.debug_mode:
+                        self.log(f"DEBUG: download_bio_pic={download_bio_pic}, download_extras={download_extras}, calling download_extras_files()")
+                    self.download_extras_files(download_path, download_bio_pic=download_bio_pic, download_extras=download_extras)
+                    # For singles, deduplicate bio pics (all singles from same artist have same bio pic)
+                    if self.is_singles_download and download_bio_pic:
+                        self._deduplicate_bio_pics(download_path)
+                elif self.debug_mode:
+                    self.log(f"DEBUG: download_extras is disabled, skipping download_extras_files()")
             except Exception as e:
                 self.root.after(0, lambda msg=str(e): self.log(f"⚠ Error during post-processing: {msg}"))
                 # Continue anyway - files were downloaded

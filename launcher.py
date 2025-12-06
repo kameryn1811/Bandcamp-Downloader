@@ -4,7 +4,7 @@ Self-contained launcher that bundles Python, ffmpeg, and auto-updates the main s
 """
 
 # Launcher version (update this when releasing a new launcher.exe)
-__version__ = "1.3.5"
+__version__ = "1.3.7"
 
 import sys
 import os
