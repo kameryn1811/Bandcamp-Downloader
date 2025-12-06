@@ -16,7 +16,7 @@ This was created as an interim solution for users experiencing issues with [Otie
 
 Bandcamp Downloader (Python Edition) provides a simple way to download the freely available 128 kbps MP3 streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
 
-<img width="650" alt="screenshot-main-v1 1 8" src="images/screenshot-main-v1.2.5b.png" />
+<img width="600" alt="screenshot-main-v1 1 8" src="images/screenshot-main-v1.3.5.png" />
 
 *The main download interface with album art preview and settings panel*
 
