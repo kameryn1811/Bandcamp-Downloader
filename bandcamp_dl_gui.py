@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.5"
+__version__ = "1.3.6"
 
 import sys
 import subprocess
@@ -4790,6 +4790,9 @@ class BandcampDownloaderGUI:
             overlay_frame.lower()
             overlay_frame.takefocus = False  # Don't interfere with keyboard navigation
             
+            # Store reference so we can hide/show it during download
+            self.dnd_overlay_frame = overlay_frame
+            
             # Bind to window focus loss to hide feedback if window loses focus
             self.root.bind('<FocusOut>', lambda e: self._hide_drag_feedback())
             
@@ -4828,6 +4831,15 @@ class BandcampDownloaderGUI:
     
     def _on_drag_enter(self, event):
         """Show visual feedback when drag enters the app (fires once)."""
+        # If downloading, show not-allowed cursor
+        if self._is_downloading():
+            # Set cursor to 'no' (not-allowed) on the root window
+            try:
+                self.root.config(cursor='no')
+            except:
+                pass
+            return  # Don't show normal drag feedback during download
+        
         # Change download button text when drag enters
         self._show_drag_feedback()
     
@@ -4856,6 +4868,14 @@ class BandcampDownloaderGUI:
         This is called continuously while dragging over the app.
         We just ensure the button text is changed (it should already be from drag enter).
         """
+        # If downloading, ensure not-allowed cursor is shown
+        if self._is_downloading():
+            try:
+                self.root.config(cursor='no')
+            except:
+                pass
+            return  # Don't show normal drag feedback during download
+        
         # If button text hasn't been changed yet, change it (fallback in case drag enter didn't fire)
         if not hasattr(self, '_original_download_button_text') or self._original_download_button_text is None:
             self._show_drag_feedback()
@@ -4908,6 +4928,13 @@ class BandcampDownloaderGUI:
         
         The button text should only change when actively dragging over the app.
         """
+        # Restore cursor if it was changed during download
+        if self._is_downloading():
+            try:
+                self.root.config(cursor='')
+            except:
+                pass
+        
         # Always hide feedback when drag leaves - this ensures button resets
         # immediately when user drags away from the interface
         self._hide_drag_feedback()
@@ -5186,6 +5213,10 @@ class BandcampDownloaderGUI:
     
     def _paste_dropped_urls(self, url_text):
         """Paste dropped URLs by simulating the paste button click."""
+        # Block drag-and-drop paste during download
+        if self._is_downloading():
+            return
+        
         # Set clipboard to the dropped URLs
         self.root.clipboard_clear()
         self.root.clipboard_append(url_text)
@@ -6451,6 +6482,9 @@ class BandcampDownloaderGUI:
             self.log("Cancelling download...")
             self.cancel_btn.config(state='disabled', cursor='arrow')  # Regular cursor when disabled
             
+            # Unlock URL field when cancelling (download_complete will also unlock, but this ensures it happens immediately)
+            self._unlock_url_field()
+            
             # Stop progress bar animation immediately
             try:
                 self.progress_bar.stop()
@@ -6753,6 +6787,10 @@ class BandcampDownloaderGUI:
     
     def _handle_paste_button_Click(self):
         """Handle paste button Click - replace selection if present, otherwise paste at end."""
+        # Block paste during download
+        if self._is_downloading():
+            return
+        
         # Determine which mode we're in and paste accordingly
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
             # ScrolledText mode - paste at next blank line (handles selection internally)
@@ -6768,6 +6806,10 @@ class BandcampDownloaderGUI:
     
     def _clear_url_field(self):
         """Clear the URL field and unfocus it."""
+        # Block clear during download
+        if self._is_downloading():
+            return
+        
         # Cancel any pending URL check timer to prevent race conditions
         if self.url_check_timer:
             self.root.after_cancel(self.url_check_timer)
@@ -6842,6 +6884,10 @@ class BandcampDownloaderGUI:
     
     def _handle_right_Click_paste_text(self, event=None):
         """Handle right-Click paste in ScrolledText widget - always paste at next blank line."""
+        # Block paste during download
+        if self._is_downloading():
+            return
+        
         # Save current content state before pasting (so we can undo back to it)
         self._save_content_state()
         # Paste at next blank line instead of at cursor
@@ -7085,6 +7131,10 @@ class BandcampDownloaderGUI:
     
     def _handle_entry_paste(self, event):
         """Handle paste in Entry widget - replace selection if present, otherwise append at end."""
+        # Block paste during download
+        if self._is_downloading():
+            return "break"
+        
         widget = event.widget if hasattr(event, 'widget') else self.url_entry_widget
         if not widget:
             widget = self.url_entry_widget
@@ -8794,14 +8844,27 @@ class BandcampDownloaderGUI:
         # View Metadata button - inherit tag colors
         # Using ℹ️ (information) icon for view metadata
         def view_metadata_handler(e):
+            # Block metadata viewer during download to prevent interference
+            if self._is_downloading():
+                return "break"
             self._view_tag_metadata(tag_id)
             return "break"  # Stop event propagation
+        # Set initial cursor based on download state
+        initial_cursor = 'no' if self._is_downloading() else 'hand2'
         view_metadata_btn = Button(button_frame, text="ℹ️", font=("Segoe UI", 10),
                                   bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
-                                  width=2, height=1, cursor='hand2',
+                                  width=2, height=1, cursor=initial_cursor,
                                   activebackground=hover_bg, activeforeground=tag_fg)
         view_metadata_btn.pack(side=LEFT, padx=btn_pad)
-        view_metadata_btn.bind("<Enter>", lambda e: (view_metadata_btn.config(bg=hover_bg), show_tooltip(view_metadata_btn, "View Metadata")))
+        # Update tooltip and cursor based on download state
+        def update_view_metadata_tooltip():
+            if self._is_downloading():
+                show_tooltip(view_metadata_btn, "Download in progress - Metadata viewer disabled")
+                view_metadata_btn.config(cursor='no')
+            else:
+                show_tooltip(view_metadata_btn, "View Metadata")
+                view_metadata_btn.config(cursor='hand2')
+        view_metadata_btn.bind("<Enter>", lambda e: (view_metadata_btn.config(bg=hover_bg), update_view_metadata_tooltip()))
         view_metadata_btn.bind("<Leave>", lambda e: (view_metadata_btn.config(bg=tag_bg),
                                                       self.root.after_cancel(view_metadata_btn._tooltip_timer) if hasattr(view_metadata_btn, '_tooltip_timer') and view_metadata_btn._tooltip_timer else None))
         view_metadata_btn.bind("<Button-1>", view_metadata_handler)
@@ -8824,14 +8887,27 @@ class BandcampDownloaderGUI:
         # Paste button - inherit tag colors
         # Using ➕ (plus) icon for consistency with main paste button
         def paste_handler(e):
+            # Block paste during download
+            if self._is_downloading():
+                return "break"
             self._paste_from_overlay(tag_id)
             return "break"  # Stop event propagation to prevent double paste
+        # Set initial cursor based on download state
+        paste_initial_cursor = 'no' if self._is_downloading() else 'hand2'
         paste_btn = Button(button_frame, text="➕", font=("Segoe UI", 10),
                           bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
-                          width=2, height=1, cursor='hand2',
+                          width=2, height=1, cursor=paste_initial_cursor,
                           activebackground=hover_bg, activeforeground=tag_fg)
         paste_btn.pack(side=LEFT, padx=btn_pad)
-        paste_btn.bind("<Enter>", lambda e: (paste_btn.config(bg=hover_bg), show_tooltip(paste_btn, "Paste")))
+        # Update tooltip and cursor based on download state
+        def update_paste_tooltip():
+            if self._is_downloading():
+                show_tooltip(paste_btn, "Download in progress - URL field locked")
+                paste_btn.config(cursor='no')
+            else:
+                show_tooltip(paste_btn, "Paste")
+                paste_btn.config(cursor='hand2')
+        paste_btn.bind("<Enter>", lambda e: (paste_btn.config(bg=hover_bg), update_paste_tooltip()))
         paste_btn.bind("<Leave>", lambda e: (paste_btn.config(bg=tag_bg),
                                              self.root.after_cancel(paste_btn._tooltip_timer) if hasattr(paste_btn, '_tooltip_timer') and paste_btn._tooltip_timer else None))
         paste_btn.bind("<Button-1>", paste_handler)
@@ -8839,6 +8915,9 @@ class BandcampDownloaderGUI:
         # Delete button - inherit tag colors
         # Using ✕ (multiplication x) for delete
         def delete_handler(e):
+            # Block delete during download
+            if self._is_downloading():
+                return "break"
             # Check if this will be the last URL before deleting
             will_be_last = len(self.url_tag_mapping) == 1
             self._delete_tag(tag_id)
@@ -8848,13 +8927,23 @@ class BandcampDownloaderGUI:
                 # Immediately try to unfocus to prevent button click from refocusing text widget
                 self.root.after(0, lambda: self.root.focus_force())
             return "break"  # Stop event propagation
+        # Set initial cursor based on download state
+        delete_initial_cursor = 'no' if self._is_downloading() else 'hand2'
         delete_btn = Button(button_frame, text="✕", font=("Segoe UI", 11),
                            bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
-                           width=2, height=1, cursor='hand2',
+                           width=2, height=1, cursor=delete_initial_cursor,
                            activebackground=hover_bg, activeforeground=tag_fg,
                            padx=2, pady=2)  # Extra padding for better icon centering
         delete_btn.pack(side=LEFT, padx=btn_pad)
-        delete_btn.bind("<Enter>", lambda e: (delete_btn.config(bg=hover_bg), show_tooltip(delete_btn, "Delete")))
+        # Update tooltip and cursor based on download state
+        def update_delete_tooltip():
+            if self._is_downloading():
+                show_tooltip(delete_btn, "Download in progress - URL field locked")
+                delete_btn.config(cursor='no')
+            else:
+                show_tooltip(delete_btn, "Delete")
+                delete_btn.config(cursor='hand2')
+        delete_btn.bind("<Enter>", lambda e: (delete_btn.config(bg=hover_bg), update_delete_tooltip()))
         delete_btn.bind("<Leave>", lambda e: (delete_btn.config(bg=tag_bg),
                                               self.root.after_cancel(delete_btn._tooltip_timer) if hasattr(delete_btn, '_tooltip_timer') and delete_btn._tooltip_timer else None))
         delete_btn.bind("<Button-1>", delete_handler)
@@ -9292,6 +9381,10 @@ class BandcampDownloaderGUI:
     
     def _view_tag_metadata(self, tag_id):
         """Show metadata dialog for tag URL."""
+        # Block metadata viewer during download to prevent interference
+        if self._is_downloading():
+            return
+        
         if tag_id not in self.url_tag_mapping:
             return
         
@@ -10669,6 +10762,10 @@ class BandcampDownloaderGUI:
     
     def _delete_tag(self, tag_id):
         """Delete tag from URL field while protecting surrounding tags."""
+        # Block delete during download
+        if self._is_downloading():
+            return
+        
         if tag_id not in self.url_tag_mapping or tag_id not in self.url_tag_positions:
             return
         
@@ -10846,6 +10943,10 @@ class BandcampDownloaderGUI:
     
     def _paste_from_overlay(self, tag_id):
         """Paste from overlay menu - same as ➕ paste button for convenience/accessibility."""
+        # Block paste during download
+        if self._is_downloading():
+            return
+        
         # Hide overlay first to prevent flicker
         if self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id:
             # Cancel any pending show/hide timers
@@ -11490,8 +11591,187 @@ class BandcampDownloaderGUI:
         entry.bind('<FocusOut>', on_focus_out)
     
     
+    def _is_downloading(self):
+        """Check if a download is currently in progress.
+        
+        Returns:
+            True if download is active, False otherwise
+        """
+        try:
+            if hasattr(self, 'cancel_btn'):
+                return self.cancel_btn.winfo_viewable()
+        except:
+            pass
+        return False
+    
+    def _lock_url_field(self):
+        """Lock the URL field during download - disable all interactions."""
+        if not hasattr(self, 'url_field_locked'):
+            self.url_field_locked = False
+        
+        if self.url_field_locked:
+            return  # Already locked
+        
+        self.url_field_locked = True
+        
+        # Disable URL text widget
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            self.url_text_widget.config(state='disabled', cursor='no')
+        
+        # Disable URL entry widget
+        if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            self.url_entry_widget.config(state='disabled', cursor='no')
+        
+        # Disable paste button (Label widgets don't have state, so we unbind events)
+        if hasattr(self, 'url_paste_btn') and self.url_paste_btn:
+            self.url_paste_btn.config(cursor='no')  # Show not-allowed cursor
+            # Unbind click event to disable it
+            self.url_paste_btn.unbind("<Button-1>")
+            # Unbind hover events and rebind to show not-allowed cursor
+            self.url_paste_btn.unbind("<Enter>")
+            self.url_paste_btn.unbind("<Leave>")
+            self.url_paste_btn.bind("<Enter>", lambda e: self.url_paste_btn.config(cursor='no'))
+            self.url_paste_btn.bind("<Leave>", lambda e: self.url_paste_btn.config(cursor='no'))
+            # Update tooltip to explain why disabled
+            self._create_tooltip(self.url_paste_btn, "Download in progress - URL field locked")
+        
+        # Disable clear button (Label widgets don't have state, so we unbind events)
+        if hasattr(self, 'url_clear_btn') and self.url_clear_btn:
+            self.url_clear_btn.config(cursor='no')  # Show not-allowed cursor
+            # Unbind click event to disable it
+            self.url_clear_btn.unbind("<Button-1>")
+            # Unbind hover events and rebind to show not-allowed cursor
+            self.url_clear_btn.unbind("<Enter>")
+            self.url_clear_btn.unbind("<Leave>")
+            self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(cursor='no'))
+            self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(cursor='no'))
+            # Update tooltip to explain why disabled
+            self._create_tooltip(self.url_clear_btn, "Download in progress - URL field locked")
+        
+        # Store original bindings and unbind paste shortcuts
+        # We'll restore these in _unlock_url_field
+        if not hasattr(self, '_original_url_bindings'):
+            self._original_url_bindings = {}
+        
+        # Unbind paste shortcuts from URL entry widget
+        if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Store original bindings
+            self._original_url_bindings['entry_paste'] = self.url_entry_widget.bindtags()
+            # Unbind paste events
+            self.url_entry_widget.unbind('<<Paste>>')
+            self.url_entry_widget.unbind('<Control-v>')
+            self.url_entry_widget.unbind('<Shift-Insert>')
+            self.url_entry_widget.unbind('<Button-2>')
+            self.url_entry_widget.unbind('<Button-3>')
+        
+        # Unbind paste shortcuts from URL text widget
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # Store original bindings
+            self._original_url_bindings['text_paste'] = self.url_text_widget.bindtags()
+            # Unbind paste events
+            self.url_text_widget.unbind('<Button-3>')
+            self.url_text_widget.unbind('<Control-v>')
+            # Unbind delete/backspace (tag deletion)
+            self.url_text_widget.unbind('<Delete>')
+            self.url_text_widget.unbind('<BackSpace>')
+        
+        # Disable drag and drop by hiding the overlay frame
+        if hasattr(self, 'dnd_overlay_frame') and self.dnd_overlay_frame:
+            try:
+                self.dnd_overlay_frame.place_forget()
+            except:
+                pass
+        
+        # Disable URL tag overlay menu buttons (delete, paste)
+        # We'll check in the overlay creation/handlers to prevent actions
+        
+        # Log message to status log
+        self.log("Download in progress - URL field locked")
+    
+    def _unlock_url_field(self):
+        """Unlock the URL field after download completes - restore all interactions."""
+        if not hasattr(self, 'url_field_locked') or not self.url_field_locked:
+            return  # Not locked
+        
+        self.url_field_locked = False
+        
+        # Re-enable URL text widget
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            self.url_text_widget.config(state='normal', cursor='xterm')  # Restore default text cursor
+        
+        # Re-enable URL entry widget
+        if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            self.url_entry_widget.config(state='normal', cursor='xterm')  # Restore default text cursor
+        
+        # Re-enable paste button (Label widgets don't have state, so we rebind events)
+        if hasattr(self, 'url_paste_btn') and self.url_paste_btn:
+            # Restore original hover behavior
+            colors = self.theme_colors
+            self.url_paste_btn.config(cursor='hand2')
+            # Rebind click event to enable it
+            self.url_paste_btn.bind("<Button-1>", lambda e: self._handle_paste_button_Click())
+            # Restore original hover events
+            self.url_paste_btn.unbind("<Enter>")
+            self.url_paste_btn.unbind("<Leave>")
+            self.url_paste_btn.bind("<Enter>", lambda e: self.url_paste_btn.config(fg=colors.hover_fg))
+            self.url_paste_btn.bind("<Leave>", lambda e: self.url_paste_btn.config(fg=colors.disabled_fg))
+            # Restore original tooltip
+            self._create_tooltip(self.url_paste_btn, "Paste URLs from clipboard")
+        
+        # Re-enable clear button (Label widgets don't have state, so we rebind events)
+        if hasattr(self, 'url_clear_btn') and self.url_clear_btn:
+            # Restore original hover behavior
+            colors = self.theme_colors
+            self.url_clear_btn.config(cursor='hand2')
+            # Rebind click event to enable it
+            self.url_clear_btn.bind("<Button-1>", lambda e: self._clear_url_field())
+            # Restore original hover events
+            self.url_clear_btn.unbind("<Enter>")
+            self.url_clear_btn.unbind("<Leave>")
+            self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(fg=colors.hover_fg))
+            self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(fg=colors.disabled_fg))
+            # Restore original tooltip (or remove if it was dynamic)
+            # The clear button tooltip is dynamic based on state, so we'll let it update naturally
+        
+        # Restore paste shortcuts to URL entry widget
+        if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            # Rebind paste events
+            self.url_entry_widget.bind('<<Paste>>', self._handle_entry_paste)
+            self.url_entry_widget.bind('<Control-v>', self._handle_entry_paste)
+            self.url_entry_widget.bind('<Shift-Insert>', self._handle_entry_paste)
+            self.url_entry_widget.bind('<Button-2>', self._handle_entry_paste)
+            self.url_entry_widget.bind('<Button-3>', self._handle_right_Click_paste_entry)
+        
+        # Restore paste shortcuts to URL text widget
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            # Rebind paste events
+            self.url_text_widget.bind('<Button-3>', self._show_text_context_menu)
+            self.url_text_widget.bind('<Control-v>', self._handle_entry_paste)
+            # Rebind delete/backspace (tag deletion)
+            self.url_text_widget.bind('<Delete>', self._handle_url_tag_delete, add='+')
+            self.url_text_widget.bind('<BackSpace>', self._handle_url_tag_backspace, add='+')
+        
+        # Re-enable drag and drop by restoring the overlay frame
+        if hasattr(self, 'dnd_overlay_frame') and self.dnd_overlay_frame:
+            try:
+                self.dnd_overlay_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+                self.dnd_overlay_frame.lower()
+            except:
+                pass
+        
+        # Restore root window cursor (in case it was changed during drag)
+        try:
+            self.root.config(cursor='')
+        except:
+            pass
+        
+        # Log message to status log
+        self.log("Download complete - URL field unlocked")
+    
     def _check_url(self):
         """Actually check the URL and fetch metadata."""
+        # Skip artwork updates during download (but still allow metadata fetching for tags)
+        is_downloading = self._is_downloading()
         # Get content from either Entry or ScrolledText
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
             content = self.url_text_widget.get(1.0, END)
@@ -11638,7 +11918,8 @@ class BandcampDownloaderGUI:
                         self.update_preview()
                         
                         # Also trigger artwork fetch if we have a thumbnail URL
-                        if cached_metadata.get("thumbnail_url"):
+                        # Skip artwork updates during download (keep current download artwork visible)
+                        if cached_metadata.get("thumbnail_url") and not is_downloading:
                             self.current_thumbnail_url = cached_metadata.get("thumbnail_url")
                             # Reset artwork list to force rebuild
                             self.artwork_list = []
@@ -12984,7 +13265,19 @@ class BandcampDownloaderGUI:
                 
                 # If found, display the artwork (only if this URL is still the current one being processed)
                 # Check current_url_being_processed to ensure we only display artwork for the latest URL
-                if self.current_thumbnail_url and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                # EXCEPT during download - allow artwork updates during download to show current album
+                is_downloading = self._is_downloading()
+                should_display = False
+                if is_downloading:
+                    # During download, always display artwork for the URL being fetched
+                    should_display = bool(self.current_thumbnail_url)
+                else:
+                    # When not downloading, only display if URL matches current_url_being_processed
+                    should_display = (self.current_thumbnail_url and 
+                                    hasattr(self, 'current_url_being_processed') and 
+                                    self.current_url_being_processed == url)
+                
+                if should_display:
                     # Build unified artwork list now that we have all URLs
                     # This should include: album_art, extra_artwork, and bio_pic
                     self._build_artwork_list()
@@ -12999,8 +13292,8 @@ class BandcampDownloaderGUI:
                             self.log(f"Initial display: index=0, list={len(self.artwork_list)} items, bio_pic={bio_in_list}")
                         # Use a lambda that captures the current state
                         def display_initial():
-                            # Double-check URL is still current before displaying (race condition protection)
-                            if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                            # During download, always display; otherwise check URL match
+                            if is_downloading or (hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url):
                                 self.artwork_index = 0  # Ensure it's still 0
                                 self._display_artwork_at_index(0)
                         self.root.after(0, display_initial)
@@ -13069,7 +13362,8 @@ class BandcampDownloaderGUI:
                                                entry.get("cover"))
                         
                         # If found, store it and use artwork list system (only if not already fetching)
-                        if thumbnail_url and not self.album_art_fetching:
+                        # Skip artwork updates during download (keep current download artwork visible)
+                        if thumbnail_url and not self.album_art_fetching and not self._is_downloading():
                             self.current_thumbnail_url = thumbnail_url
                             # Build artwork list and display if not already built
                             if not self.artwork_list:
@@ -13391,7 +13685,9 @@ class BandcampDownloaderGUI:
             return
         
         # Check if URL field is empty - if so, don't fetch/display artwork
-        if self._is_url_field_empty():
+        # EXCEPT during download - allow artwork updates during download to show current album
+        is_downloading = self._is_downloading()
+        if not is_downloading and self._is_url_field_empty():
             self.clear_album_art()
             return
         
@@ -13432,7 +13728,8 @@ class BandcampDownloaderGUI:
                     return
                 
                 # Check again before downloading (field might have been cleared)
-                if self._is_url_field_empty():
+                # Skip this check during download - allow artwork updates during download
+                if not self._is_downloading() and self._is_url_field_empty():
                     if fetch_id == self.artwork_fetch_id:  # Only clear if still current
                         self.root.after(0, self.clear_album_art)
                     # Reset flag in a thread-safe way
@@ -13462,7 +13759,8 @@ class BandcampDownloaderGUI:
                     return
                 
                 # Check again after download (field might have been cleared during download)
-                if self._is_url_field_empty():
+                # Skip this check during download - allow artwork updates during download
+                if not self._is_downloading() and self._is_url_field_empty():
                     if fetch_id == self.artwork_fetch_id:  # Only clear if still current
                         self.root.after(0, self.clear_album_art)
                     # Reset flag in a thread-safe way
@@ -13490,7 +13788,8 @@ class BandcampDownloaderGUI:
                         return
                     
                     # Final check before displaying - field might have been cleared
-                    if self._is_url_field_empty():
+                    # Skip this check during download - allow artwork updates during download
+                    if not self._is_downloading() and self._is_url_field_empty():
                         self.clear_album_art()
                         return
                     
@@ -16619,6 +16918,9 @@ class BandcampDownloaderGUI:
         self.cancel_btn.grid()
         self.is_cancelling = False
         
+        # Lock URL field during download
+        self._lock_url_field()
+        
         # Disable clear log button during download operations
         # Update button state (will be disabled because is_downloading will be True)
         self._update_clear_button_state()
@@ -17506,49 +17808,80 @@ class BandcampDownloaderGUI:
             cover_art_name = f"{artist} - {album}"
             
             # Find all cover art files that were just downloaded
-            # Only search in directories that contain downloaded audio files
+            # Only search in directories that contain downloaded audio files from the CURRENT album only
+            # First try downloaded_files (most accurate), then fall back to album metadata-based path
             cover_art_files = []
             
-            # Get directories that contain downloaded audio files
+            # Get directories that contain downloaded audio files from the CURRENT album only
             directories_to_search = set()
+            
+            # Method 1: Use downloaded_files if available (most accurate)
             if hasattr(self, 'downloaded_files') and self.downloaded_files:
                 for downloaded_file in self.downloaded_files:
                     try:
                         audio_path = Path(downloaded_file)
+                        # Check if file exists (might have been renamed, so check parent directory)
                         if audio_path.exists():
                             directories_to_search.add(audio_path.parent)
+                        elif audio_path.parent.exists():
+                            # File might have been renamed, but parent directory exists
+                            # Check if there are any audio files in this directory
+                            audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                            has_audio = False
+                            for ext in audio_extensions:
+                                if list(audio_path.parent.glob(f"*{ext}")):
+                                    has_audio = True
+                                    break
+                            if has_audio:
+                                directories_to_search.add(audio_path.parent)
                     except Exception:
                         pass
             
-            # If no downloaded files found, use timestamp-based fallback to find recently downloaded files
-            # This ensures we only process files from this download session, not existing files
-            if not directories_to_search:
-                if hasattr(self, 'download_start_time') and self.download_start_time:
-                    # Use timestamp-based filtering to find directories with recently downloaded files
-                    time_threshold = self.download_start_time - 30
-                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
-                    try:
-                        for ext in audio_extensions:
-                            for audio_file in base_path.rglob(f"*{ext}"):
-                                # Skip temporary files
-                                if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
-                                    continue
-                                # Only include files modified after download started (with buffer)
-                                try:
-                                    file_mtime = audio_file.stat().st_mtime
-                                    if file_mtime >= time_threshold:
-                                        directories_to_search.add(audio_file.parent)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+            # Method 2: Fallback - construct expected album folder path from current album metadata
+            # This is safer than timestamp search and only uses current album info
+            if not directories_to_search and hasattr(self, 'album_info') and self.album_info:
+                try:
+                    # Get album and artist from current album_info
+                    album_name = self.album_info.get("album")
+                    artist_name = self.album_info.get("album_artist") or self.album_info.get("artist")
+                    
+                    if album_name and artist_name:
+                        # Construct expected folder path based on folder structure
+                        choice = self._extract_structure_choice(self.folder_structure_var.get())
+                        expected_folder = None
+                        
+                        if choice == "2":
+                            # Structure: Root/Album/
+                            expected_folder = base_path / self.sanitize_filename(album_name)
+                        elif choice == "4":
+                            # Structure: Root/Artist/Album/
+                            expected_folder = base_path / self.sanitize_filename(artist_name) / self.sanitize_filename(album_name)
+                        elif choice == "5":
+                            # Structure: Root/Album/Artist/
+                            expected_folder = base_path / self.sanitize_filename(album_name) / self.sanitize_filename(artist_name)
+                        elif choice == "3":
+                            # Structure: Root/Artist/ (no album folder, but we can still use it)
+                            expected_folder = base_path / self.sanitize_filename(artist_name)
+                        
+                        # Only add if folder exists and contains audio files
+                        if expected_folder and expected_folder.exists():
+                            audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                            has_audio = False
+                            for ext in audio_extensions:
+                                if list(expected_folder.glob(f"*{ext}")):
+                                    has_audio = True
+                                    break
+                            if has_audio:
+                                directories_to_search.add(expected_folder)
+                except Exception:
+                    pass
                 
                 # If still no directories found, don't process anything (safety: don't modify existing files)
             
-            # Only search in directories that contain downloaded files
-            if hasattr(self, 'download_start_time') and self.download_start_time:
-                # Use timestamp-based filtering to find recently downloaded cover art files
-                time_threshold = self.download_start_time - 30
+            # Only search in directories that contain downloaded files from the CURRENT album
+            # Don't use timestamp filtering - it finds files from previous albums
+            # Only process if we have downloaded_files tracking (current album)
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
                 for search_dir in directories_to_search:
                     if not search_dir.exists():
                         continue
@@ -17556,11 +17889,14 @@ class BandcampDownloaderGUI:
                         # Only search in this specific directory, not recursively
                         for thumb_file in search_dir.glob(f"*{ext}"):
                             try:
-                                file_mtime = thumb_file.stat().st_mtime
-                                if file_mtime >= time_threshold:
-                                    # Skip files that already have the "artist - album" format
-                                    if not re.match(r'^[^-]+ - [^-]+$', thumb_file.stem):
-                                        cover_art_files.append(thumb_file)
+                                # Exclude extra artwork and bio pic files
+                                file_name_lower = thumb_file.name.lower()
+                                if file_name_lower.startswith('extra ') or file_name_lower.startswith('bio pic'):
+                                    continue
+                                
+                                # Skip files that already have the "artist - album" format
+                                if not re.match(r'^[^-]+ - [^-]+$', thumb_file.stem):
+                                    cover_art_files.append(thumb_file)
                             except Exception:
                                 pass
             
@@ -17683,68 +18019,91 @@ class BandcampDownloaderGUI:
             if not base_path.exists():
                 return
             
-            # Only check directories that contain downloaded audio files
+            # Only check directories that contain downloaded audio files from the CURRENT album only
+            # First try downloaded_files (most accurate), then fall back to album metadata-based path
             directories_to_check = set()
             
-            # Get directories from downloaded files
+            # Method 1: Use downloaded_files if available (most accurate)
             if hasattr(self, 'downloaded_files') and self.downloaded_files:
                 for downloaded_file in self.downloaded_files:
                     try:
                         audio_path = Path(downloaded_file)
+                        # Check if file exists (might have been renamed, so check parent directory)
                         if audio_path.exists():
                             directories_to_check.add(audio_path.parent)
+                        elif audio_path.parent.exists():
+                            # File might have been renamed, but parent directory exists
+                            # Check if there are any audio files in this directory
+                            audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                            has_audio = False
+                            for ext in audio_extensions:
+                                if list(audio_path.parent.glob(f"*{ext}")):
+                                    has_audio = True
+                                    break
+                            if has_audio:
+                                directories_to_check.add(audio_path.parent)
                     except Exception:
                         pass
             
-            # If no downloaded files found, use timestamp-based fallback to find recently downloaded files
-            # This ensures we only process files from this download session, not existing files
-            if not directories_to_check:
-                if hasattr(self, 'download_start_time') and self.download_start_time:
-                    # Use timestamp-based filtering to find directories with recently downloaded files
-                    time_threshold = self.download_start_time - 30
-                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
-                    try:
-                        for ext in audio_extensions:
-                            for audio_file in base_path.rglob(f"*{ext}"):
-                                # Skip temporary files
-                                if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
-                                    continue
-                                # Only include files modified after download started (with buffer)
-                                try:
-                                    file_mtime = audio_file.stat().st_mtime
-                                    if file_mtime >= time_threshold:
-                                        directories_to_check.add(audio_file.parent)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-                
-                # If still no directories found, don't process anything (safety: don't modify existing files)
-                # This ensures we only process files that were definitely downloaded in this session
+            # Method 2: Fallback - construct expected album folder path from current album metadata
+            # This is safer than timestamp search and only uses current album info
+            if not directories_to_check and hasattr(self, 'album_info') and self.album_info:
+                try:
+                    # Get album and artist from current album_info
+                    album_name = self.album_info.get("album")
+                    artist_name = self.album_info.get("album_artist") or self.album_info.get("artist")
+                    
+                    if album_name and artist_name:
+                        # Construct expected folder path based on folder structure
+                        choice = self._extract_structure_choice(self.folder_structure_var.get())
+                        expected_folder = None
+                        
+                        if choice == "2":
+                            # Structure: Root/Album/
+                            expected_folder = base_path / self.sanitize_filename(album_name)
+                        elif choice == "4":
+                            # Structure: Root/Artist/Album/
+                            expected_folder = base_path / self.sanitize_filename(artist_name) / self.sanitize_filename(album_name)
+                        elif choice == "5":
+                            # Structure: Root/Album/Artist/
+                            expected_folder = base_path / self.sanitize_filename(album_name) / self.sanitize_filename(artist_name)
+                        elif choice == "3":
+                            # Structure: Root/Artist/ (no album folder, but we can still use it)
+                            expected_folder = base_path / self.sanitize_filename(artist_name)
+                        
+                        # Only add if folder exists and contains audio files
+                        if expected_folder and expected_folder.exists():
+                            audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                            has_audio = False
+                            for ext in audio_extensions:
+                                if list(expected_folder.glob(f"*{ext}")):
+                                    has_audio = True
+                                    break
+                            if has_audio:
+                                directories_to_check.add(expected_folder)
+                except Exception:
+                    pass
+            
+            # If still no directories found, don't process anything
+            # This ensures we only process cover art from the current album, not previous albums
             
             # Process each directory
             for directory in directories_to_check:
                 # Find all cover art files in this directory
+                # Exclude "Extra X.jpg" and "Bio Pic.jpg" files - these should not be touched
                 cover_art_files = []
                 
-                # Only process cover art files that were downloaded in this session
-                if hasattr(self, 'download_start_time') and self.download_start_time:
-                    time_threshold = self.download_start_time - 30
+                # Only process cover art files from the current album
+                # Don't use timestamp filtering - it finds files from previous albums
+                # Only process if we have downloaded_files tracking (current album)
+                if hasattr(self, 'downloaded_files') and self.downloaded_files:
                     for ext in self.THUMBNAIL_EXTENSIONS:
                         for thumb_file in directory.glob(f"*{ext}"):
-                            try:
-                                # Only include files modified after download started (with buffer)
-                                file_mtime = thumb_file.stat().st_mtime
-                                if file_mtime >= time_threshold:
-                                    cover_art_files.append(thumb_file)
-                            except Exception:
-                                pass
-                else:
-                    # If no timestamp available, only process if we have downloaded_files tracking
-                    # Otherwise skip to avoid modifying existing files
-                    if hasattr(self, 'downloaded_files') and self.downloaded_files:
-                        for ext in self.THUMBNAIL_EXTENSIONS:
-                            cover_art_files.extend(directory.glob(f"*{ext}"))
+                            # Exclude extra artwork and bio pic files
+                            file_name_lower = thumb_file.name.lower()
+                            if file_name_lower.startswith('extra ') or file_name_lower.startswith('bio pic'):
+                                continue
+                            cover_art_files.append(thumb_file)
                 
                 if not cover_art_files:
                     continue
@@ -17762,7 +18121,7 @@ class BandcampDownloaderGUI:
                 
                 # Skip if already correctly named
                 if kept_file.name.lower() == target_name.lower():
-                    # Delete duplicates
+                    # Delete duplicates (but not Extra X.jpg or Bio Pic.jpg - already excluded above)
                     for thumb_file in cover_art_files[1:]:
                         try:
                             thumb_file.unlink()
@@ -17780,7 +18139,7 @@ class BandcampDownloaderGUI:
                     self.root.after(0, lambda old=kept_file.name, new=target_name: 
                                    self.log(f"Final cleanup: Renamed cover art {old} → {new}"))
                     
-                    # Delete all other cover art files in this directory
+                    # Delete all other cover art files in this directory (but not Extra X.jpg or Bio Pic.jpg)
                     for thumb_file in cover_art_files[1:]:
                         try:
                             thumb_file.unlink()
@@ -17808,37 +18167,73 @@ class BandcampDownloaderGUI:
             if not base_path.exists():
                 return
             
-            # Find directories that contain downloaded audio files (same pattern as rename_cover_art_files)
+            # Find directories that contain downloaded audio files from the CURRENT album only
+            # First try downloaded_files (most accurate), then fall back to album metadata-based path
             directories_to_process = set()
+            
+            # Method 1: Use downloaded_files if available (most accurate)
             if hasattr(self, 'downloaded_files') and self.downloaded_files:
                 for downloaded_file in self.downloaded_files:
                     try:
                         audio_path = Path(downloaded_file)
+                        # Check if file exists (might have been renamed, so check parent directory)
                         if audio_path.exists():
                             directories_to_process.add(audio_path.parent)
+                        elif audio_path.parent.exists():
+                            # File might have been renamed, but parent directory exists
+                            # Check if there are any audio files in this directory
+                            audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                            has_audio = False
+                            for ext in audio_extensions:
+                                if list(audio_path.parent.glob(f"*{ext}")):
+                                    has_audio = True
+                                    break
+                            if has_audio:
+                                directories_to_process.add(audio_path.parent)
                     except Exception:
                         pass
             
-            # If no downloaded files found, use timestamp-based fallback to find recently downloaded files
-            if not directories_to_process:
-                if hasattr(self, 'download_start_time') and self.download_start_time:
-                    time_threshold = self.download_start_time - 30
-                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
-                    try:
-                        for ext in audio_extensions:
-                            for audio_file in base_path.rglob(f"*{ext}"):
-                                if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
-                                    continue
-                                try:
-                                    file_mtime = audio_file.stat().st_mtime
-                                    if file_mtime >= time_threshold:
-                                        directories_to_process.add(audio_file.parent)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+            # Method 2: Fallback - construct expected album folder path from current album metadata
+            # This is safer than timestamp search and only uses current album info
+            if not directories_to_process and hasattr(self, 'album_info') and self.album_info:
+                try:
+                    # Get album and artist from current album_info
+                    album_name = self.album_info.get("album")
+                    artist_name = self.album_info.get("album_artist") or self.album_info.get("artist")
+                    
+                    if album_name and artist_name:
+                        # Construct expected folder path based on folder structure
+                        choice = self._extract_structure_choice(self.folder_structure_var.get())
+                        expected_folder = None
+                        
+                        if choice == "2":
+                            # Structure: Root/Album/
+                            expected_folder = base_path / self.sanitize_filename(album_name)
+                        elif choice == "4":
+                            # Structure: Root/Artist/Album/
+                            expected_folder = base_path / self.sanitize_filename(artist_name) / self.sanitize_filename(album_name)
+                        elif choice == "5":
+                            # Structure: Root/Album/Artist/
+                            expected_folder = base_path / self.sanitize_filename(album_name) / self.sanitize_filename(artist_name)
+                        elif choice == "3":
+                            # Structure: Root/Artist/ (no album folder, but we can still use it)
+                            expected_folder = base_path / self.sanitize_filename(artist_name)
+                        
+                        # Only add if folder exists and contains audio files
+                        if expected_folder and expected_folder.exists():
+                            audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                            has_audio = False
+                            for ext in audio_extensions:
+                                if list(expected_folder.glob(f"*{ext}")):
+                                    has_audio = True
+                                    break
+                            if has_audio:
+                                directories_to_process.add(expected_folder)
+                except Exception:
+                    pass
             
             # If still no directories found, don't process anything
+            # This ensures we only download extras to folders from the current album
             if not directories_to_process:
                 return
             
@@ -19122,15 +19517,21 @@ class BandcampDownloaderGUI:
                     info = extract_ydl.extract_info(album_url, download=False)
                     if info:
                         # Store album-level info (including all metadata fields for preview)
+                        album_artist_from_info = info.get("album_artist") or info.get("albumartist") or info.get("artist") or info.get("uploader") or info.get("creator")
                         self.album_info_stored = {
                             "artist": info.get("artist") or info.get("uploader") or info.get("creator"),
                             "album": info.get("album") or info.get("title"),
                             "date": info.get("release_date") or info.get("upload_date"),
                             "genre": info.get("genre"),
                             "label": info.get("label") or info.get("publisher"),
-                            "album_artist": info.get("album_artist") or info.get("albumartist"),
+                            "album_artist": album_artist_from_info,
                             "catalog_number": info.get("catalog_number") or info.get("catalognumber"),
                         }
+                        
+                        # Also update self.album_info with album_artist so get_outtmpl() can use it
+                        if not hasattr(self, 'album_info') or not self.album_info:
+                            self.album_info = {}
+                        self.album_info["album_artist"] = album_artist_from_info
                         
                         # Handle track URLs: if no entries, treat info itself as the track
                         entries = []
@@ -19665,11 +20066,19 @@ class BandcampDownloaderGUI:
                                 if not artist_name:
                                     artist_name = "Unknown"
                                 
+                                # Extract album_artist (main album artist, typically same as artist for single-artist albums)
+                                # For split albums, this should be the main page artist, not individual track artists
+                                album_artist_name = (info.get("artist") or 
+                                                   info.get("uploader") or 
+                                                   info.get("creator") or 
+                                                   artist_name)
+                                
                                 track_count = len(info.get("entries", [])) if "entries" in info else 0
                                 album_metadata.append({
                                     "url": url,
                                     "name": album_name,
                                     "artist": artist_name,
+                                    "album_artist": album_artist_name,
                                     "track_count": track_count,
                                     "info": info
                                 })
@@ -19728,11 +20137,14 @@ class BandcampDownloaderGUI:
                     
                     # Update preview and artwork for current album
                     # Update album_info with metadata we already have
+                    # Extract album_artist from metadata (for prefer_album_artist_for_folders setting)
+                    album_artist_name = meta.get("album_artist") or artist_name or "Artist"
                     self.album_info = {
                         "artist": artist_name or "Artist",
                         "album": album_name or "Album",
                         "title": "Track",
-                        "thumbnail_url": None
+                        "thumbnail_url": None,
+                        "album_artist": album_artist_name  # Set album_artist so get_outtmpl() can use it
                     }
                     self.root.after(0, self.update_preview)
                     
@@ -26139,6 +26551,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             pass
         self.download_btn.config(state='normal')
         self.download_btn.grid()
+        
+        # Unlock URL field after download completes
+        self._unlock_url_field()
         
         # Update clear log button state after download/cancel operations complete
         self._update_clear_button_state()
