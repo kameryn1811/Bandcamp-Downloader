@@ -4,7 +4,7 @@ Self-contained launcher that bundles Python, ffmpeg, and auto-updates the main s
 """
 
 # Launcher version (update this when releasing a new launcher.exe)
-__version__ = "1.3.3"
+__version__ = "1.3.5"
 
 import sys
 import os
@@ -39,6 +39,7 @@ else:
 
 SCRIPT_PATH = LAUNCHER_DIR / SCRIPT_NAME
 SETTINGS_FILE = LAUNCHER_DIR / "launcher_settings.json"
+GUI_SETTINGS_FILE = LAUNCHER_DIR / "settings.json"  # GUI's settings file
 UPDATE_STATUS_FILE = LAUNCHER_DIR / "update_status.json"
 LAUNCHER_EXE_PATH = Path(sys.executable) if hasattr(sys, 'frozen') else None
 LAUNCHER_UPDATE_TEMP = Path(tempfile.gettempdir()) / "BandcampDownloader_new.exe"
@@ -71,6 +72,22 @@ def get_launcher_version():
     # Fallback: return embedded version (this is the version compiled into the exe)
     # For old launchers that don't have launcher.py in the directory, this will return the old version
     return __version__
+
+
+def get_auto_check_updates_setting():
+    """Read the auto-check updates setting from GUI's settings.json file.
+    
+    Returns:
+        True if auto-check is enabled, False if disabled, True by default if setting not found
+    """
+    try:
+        if GUI_SETTINGS_FILE.exists():
+            with open(GUI_SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+                return settings.get("auto_check_updates", True)  # Default to True if not found
+    except Exception:
+        pass  # If can't read settings, default to True
+    return True  # Default to enabled if settings file doesn't exist
 
 
 def get_local_version():
@@ -344,6 +361,10 @@ def run_script_directly():
     try:
         # Set environment variable to indicate launcher mode
         os.environ['BANDCAMP_LAUNCHER'] = '1'
+        # Set launcher version in environment variable for GUI to read
+        launcher_version = get_launcher_version()
+        if launcher_version:
+            os.environ['BANDCAMP_LAUNCHER_VERSION'] = launcher_version
         
         # Add ffmpeg to PATH if bundled
         ffmpeg_path = get_ffmpeg_path()
@@ -869,10 +890,24 @@ Set WshShell = Nothing
 """)
             
             # Launch the VBScript (which will run the batch file hidden)
-            subprocess.Popen(
-                ['wscript.exe', str(vbscript)],
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            )
+            # Use Windows 7 compatible flags (DETACHED_PROCESS may not work on Win7)
+            try:
+                # Try with DETACHED_PROCESS first (Windows 8+)
+                subprocess.Popen(
+                    ['wscript.exe', str(vbscript)],
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                )
+            except (AttributeError, ValueError):
+                # Fallback for Windows 7 (DETACHED_PROCESS not available)
+                # CREATE_NEW_PROCESS_GROUP should work on Win7
+                try:
+                    subprocess.Popen(
+                        ['wscript.exe', str(vbscript)],
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                    )
+                except (AttributeError, ValueError):
+                    # Final fallback: no flags (should work on all Windows versions)
+                    subprocess.Popen(['wscript.exe', str(vbscript)])
             
             # Clean up VBScript after a delay
             def cleanup_vbs():
@@ -1001,9 +1036,17 @@ def main():
     
     # Launch the script immediately (using bundled version if available)
     # Check for updates in background AFTER launching (non-blocking, delayed to not affect startup)
+    # Only check if auto-check updates is enabled in settings
     def check_updates_background():
         # Delay to let app start first (non-blocking, doesn't affect startup performance)
         time.sleep(3)  # Increased delay to ensure app is fully loaded before checking
+        
+        # Check if auto-update is enabled in GUI settings
+        auto_check_enabled = get_auto_check_updates_setting()
+        if not auto_check_enabled:
+            # Auto-check is disabled, skip update checks
+            return
+        
         # Check for script updates silently
         check_and_update_script(silent=True)
         # Check for launcher updates (show dialog if update available)
@@ -1012,8 +1055,11 @@ def main():
         # If updates were downloaded, they will be used on next launch
     
     # Start update check in background (non-blocking, doesn't affect startup)
-    update_thread = threading.Thread(target=check_updates_background, daemon=True)
-    update_thread.start()
+    # Only start thread if auto-check is enabled
+    auto_check_enabled = get_auto_check_updates_setting()
+    if auto_check_enabled:
+        update_thread = threading.Thread(target=check_updates_background, daemon=True)
+        update_thread.start()
     
     # Also copy icon.ico from parent if it doesn't exist (for development)
     icon_path = LAUNCHER_DIR / "icon.ico"

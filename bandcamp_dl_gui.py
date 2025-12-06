@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 
 import sys
 import subprocess
@@ -102,11 +102,10 @@ except ImportError:
             except ImportError:
                 pass
 
-# yt-dlp will be imported after checking if it's installed
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
+# yt-dlp will be lazy-loaded (imported on first use or pre-imported after startup)
+yt_dlp = None
+_ytdlp_preloaded = False
+_ytdlp_preload_failed = False
 
 
 class ThinProgressBar:
@@ -634,6 +633,100 @@ class BandcampDownloaderGUI:
         # Return title as-is if no pattern matches
         return title.strip()
     
+    # ============================================================================
+    # LAZY IMPORT HELPERS - For yt-dlp and PIL
+    # ============================================================================
+    def _ensure_ytdlp_loaded(self):
+        """Ensure yt-dlp is loaded (lazy import).
+        
+        Returns:
+            yt_dlp module if successful
+            
+        Raises:
+            ImportError: If yt-dlp cannot be imported
+        """
+        global yt_dlp
+        if yt_dlp is not None:
+            return yt_dlp
+        
+        # Try to import
+        import yt_dlp
+        # Update global variable
+        globals()['yt_dlp'] = yt_dlp
+        if self.debug_mode:
+            self._log_debug("yt-dlp imported successfully (lazy load)")
+        return yt_dlp
+    
+    def _ensure_pil_loaded(self):
+        """Ensure PIL/Pillow is loaded (lazy import).
+        
+        Returns:
+            PIL module if successful, None otherwise
+        """
+        try:
+            from PIL import Image, ImageTk
+            if self.debug_mode:
+                self._log_debug("PIL imported successfully (lazy load)")
+            return Image, ImageTk
+        except ImportError:
+            if self.debug_mode:
+                self._log_debug("PIL import failed (lazy load)")
+            return None, None
+    
+    def _preload_ytdlp(self):
+        """Pre-load yt-dlp in background thread after startup."""
+        global yt_dlp, _ytdlp_preloaded, _ytdlp_preload_failed
+        
+        if _ytdlp_preloaded or yt_dlp is not None:
+            return  # Already loaded
+        
+        try:
+            import yt_dlp
+            # Update global variable so it's available for lazy loading
+            globals()['yt_dlp'] = yt_dlp
+            _ytdlp_preloaded = True
+            if self.debug_mode:
+                self._log_debug("yt-dlp pre-imported successfully")
+        except ImportError:
+            _ytdlp_preload_failed = True
+            if self.debug_mode:
+                self._log_debug("yt-dlp pre-import failed (will lazy-load on first use)")
+    
+    def _preload_pil(self):
+        """Pre-load PIL/Pillow in main thread after startup."""
+        try:
+            from PIL import Image, ImageTk
+            if self.debug_mode:
+                self._log_debug("PIL pre-imported successfully")
+        except ImportError:
+            if self.debug_mode:
+                self._log_debug("PIL pre-import failed (will lazy-load on first use)")
+    
+    def _start_preimports(self):
+        """Start pre-importing libraries after fade-in completes.
+        
+        yt-dlp is imported in a background thread (non-GUI library).
+        PIL is imported in main thread (GUI-related library).
+        """
+        # Pre-import PIL in main thread (GUI-related, safer in main thread)
+        self._preload_pil()
+        
+        # Pre-import yt-dlp in background thread (non-GUI, safe in background)
+        import threading
+        threading.Thread(target=self._preload_ytdlp, daemon=True).start()
+    
+    def _log_debug(self, message):
+        """Log a debug message (only if debug mode is enabled)."""
+        if hasattr(self, 'debug_mode') and self.debug_mode:
+            if hasattr(self, 'log_messages'):
+                self.log_messages.append((message, True))
+            if hasattr(self, 'log_text'):
+                try:
+                    self.log_text.insert(END, f"[DEBUG] {message}\n", "debug_message")
+                    self.log_text.see(END)
+                except:
+                    pass
+    
     def __init__(self, root):
         self.root = root
         self.root.title(" Bandcamp Downloader")
@@ -735,6 +828,7 @@ class BandcampDownloaderGUI:
         self.skip_postprocessing_var = BooleanVar(value=self.load_saved_skip_postprocessing())
         self.create_playlist_var = BooleanVar(value=self.load_saved_create_playlist())
         self.download_cover_art_var = BooleanVar(value=self.load_saved_download_cover_art())
+        self.download_extras_var = BooleanVar(value=self.load_saved_download_extras())
         self.download_discography_var = BooleanVar(value=False)  # Always default to off, not persistent
         self.auto_check_updates_var = BooleanVar(value=self.load_saved_auto_check_updates())
         
@@ -801,6 +895,10 @@ class BandcampDownloaderGUI:
         self.artwork_fetch_id = 0  # Track fetch requests to cancel stale ones
         self.current_url_being_processed = None  # Track URL currently being processed to avoid cancelling valid fetches
         self.album_art_mode = "album_art"  # Track album art panel mode: "album_art", "bio_pic", or "hidden"
+        # Unified artwork system: single list containing [album_art, *extra_artwork, bio_pic]
+        self.artwork_list = []  # Unified list of all artwork URLs in order
+        self.artwork_index = 0  # Current position in artwork_list (0 = album art)
+        self.extra_artwork_urls = []  # Just the extra popup images (for reference)
         
         # URL text widget resize state
         self.url_text_height = 1  # Default height in lines (collapsed)
@@ -824,6 +922,37 @@ class BandcampDownloaderGUI:
         self.current_match_tag_name = "current_search_match"  # Tag name for current match (green)
         self.debug_tag_name = "debug_message"  # Tag name for debug messages (for show/hide)
         
+        # Detachable status window state
+        self.status_detached = False
+        self.detached_window = None
+        self.detached_frame = None
+        # Load linked state from settings (default to True if not set)
+        settings = self._load_settings()
+        self.status_window_linked = settings.get("status_window_linked", True)
+        # Load saved relative offset from settings (default if not set)
+        saved_offset = settings.get("status_window_offset", None)
+        if saved_offset and isinstance(saved_offset, (list, tuple)) and len(saved_offset) == 2:
+            self.window_offset = tuple(saved_offset)
+        else:
+            self.window_offset = (100, 100)  # Default offset from main window
+        # Store window size (not position - position is calculated from offset)
+        self.status_window_size = None  # Store window size (width x height)
+        self.log_content = None  # Store reference to log_content frame for moving widgets
+        # Movement tracking for linked windows
+        self._moving_detached_programmatically = False
+        self._last_main_window_pos = None
+        self._last_detached_window_pos = None
+        self._window_link_offset = None  # Current offset when linked
+        self._detached_window_size_save_timer = None  # Timer for debounced size saving
+        self._bringing_windows_to_front = False  # Flag to prevent recursive focus events
+        # Store original window size and minimum size for restoration when reattaching
+        self.original_window_geometry = None  # Store original window geometry (size + position)
+        self.original_min_width = None  # Store original minimum width
+        self.original_min_height = None  # Store original minimum height
+        self.url_field_min_height_px = None  # Store minimum URL field height in pixels (when detached)
+        self.preview_frame_min_height_px = None  # Store minimum preview frame height in pixels (when detached)
+        self.detached_base_min_height = None  # Store base minimum height (without URL field and preview frame expansion)
+        
         # Check dependencies first
         if not self.check_dependencies():
             self.root.destroy()
@@ -834,6 +963,9 @@ class BandcampDownloaderGUI:
         # Load album art state before setting up UI so eye icon can be positioned correctly
         self.load_saved_album_art_state()
         self.setup_ui()
+        
+        # Always start with log attached (as requested)
+        # Linking state is already loaded in __init__ from settings
         self.load_saved_path()
         # Defer update_preview until after UI is shown (optimization - no URL/metadata yet anyway)
         self.root.after_idle(self.update_preview)
@@ -865,6 +997,13 @@ class BandcampDownloaderGUI:
         
         # Bind to window resize events to update expand/collapse button state
         self.root.bind('<Configure>', self._on_window_configure)
+        
+        # Bind to click and focus events to bring both windows to front when either is clicked
+        self.root.bind('<Button-1>', self._on_main_window_click, add=True)
+        self.root.bind('<FocusIn>', self._on_main_window_focus, add=True)
+        
+        # Bind ESC key for global close functionality
+        self.root.bind_all('<Escape>', self._handle_escape_key)
         
         # Check for launcher update status (deferred for faster startup)
         # Do this after UI is ready so it doesn't block startup
@@ -1152,6 +1291,10 @@ class BandcampDownloaderGUI:
         
         # Update settings menu to reflect new theme
         self._rebuild_settings_menu()
+        
+        # Update detached window theme if it exists
+        if self.status_detached:
+            self._apply_theme_to_detached_window()
         
         # Save preference
         self._save_theme_preference()
@@ -1545,7 +1688,7 @@ class BandcampDownloaderGUI:
         
         # Update checkboxes in settings section - dark mode uses bg, light mode uses select_bg
         checkbox_attrs = [
-            'skip_postprocessing_check', 'download_cover_art_check',
+            'skip_postprocessing_check', 'download_cover_art_check', 'download_extras_check',
             'create_playlist_check', 'download_discography_check'
         ]
         checkbox_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
@@ -1683,7 +1826,10 @@ class BandcampDownloaderGUI:
                 
                 # Method 2: iconphoto - sets taskbar icon (more reliable)
                 try:
-                    from PIL import Image, ImageTk
+                    # Ensure PIL is loaded (lazy import)
+                    Image, ImageTk = self._ensure_pil_loaded()
+                    if Image is None or ImageTk is None:
+                        return  # PIL not available
                     img = Image.open(icon_path)
                     photo = ImageTk.PhotoImage(img)
                     # Use True to set as default icon (affects taskbar)
@@ -1935,6 +2081,7 @@ class BandcampDownloaderGUI:
                 "skip_postprocessing": self.skip_postprocessing_var.get(),
                 "create_playlist": self.create_playlist_var.get(),
                 "download_cover_art": self.download_cover_art_var.get(),
+                "download_extras": self.download_extras_var.get(),
                 # download_discography is intentionally not saved - always defaults to off
                 "album_art_mode": self.album_art_mode,
                 "word_wrap": self.word_wrap_var.get() if hasattr(self, 'word_wrap_var') else False,
@@ -2555,25 +2702,506 @@ class BandcampDownloaderGUI:
     # ============================================================================
     # SHARED UTILITIES (Used by both folder structure and filename format systems)
     # ============================================================================
-    def _create_dialog_base(self, title, width, height):
+    def _close_dialog_with_fade(self, dialog):
+        """Close a dialog with smooth fade-out effect.
+        
+        Args:
+            dialog: Toplevel dialog to close with fade-out
+        """
+        try:
+            # Check if dialog still exists and alpha/opacity is supported
+            if not dialog.winfo_exists():
+                return
+            
+            try:
+                current_alpha = dialog.attributes('-alpha')
+                alpha_supported = True
+            except (TclError, AttributeError):
+                # Alpha not supported, just destroy immediately
+                alpha_supported = False
+            
+            if alpha_supported:
+                # Fade out over 200ms with ease-out curve (fast start, slow end)
+                fade_steps = 20
+                fade_duration_ms = 200
+                step_delay = max(1, fade_duration_ms // fade_steps)
+                step = 0
+                start_alpha = current_alpha if current_alpha is not None else 1.0
+                
+                def fade_step():
+                    nonlocal step
+                    try:
+                        if not dialog.winfo_exists():
+                            return
+                        
+                        step += 1
+                        # Ease-out quadratic: 1 - (1 - progress)^2
+                        progress = step / fade_steps
+                        eased_progress = 1 - (1 - progress) * (1 - progress)
+                        current_opacity = max(0.0, start_alpha * (1 - eased_progress))
+                        
+                        if step >= fade_steps:
+                            # Final step - ensure fully transparent, then destroy
+                            try:
+                                dialog.attributes('-alpha', 0.0)
+                                dialog.update_idletasks()
+                            except:
+                                pass
+                            # Destroy after fade completes
+                            try:
+                                dialog.destroy()
+                            except:
+                                pass
+                        else:
+                            dialog.attributes('-alpha', current_opacity)
+                            # Continue fade
+                            dialog.after(step_delay, fade_step)
+                    except (TclError, RuntimeError):
+                        # Dialog may have been closed, just destroy
+                        try:
+                            dialog.destroy()
+                        except:
+                            pass
+                
+                # Start fade-out
+                dialog.after(10, fade_step)
+            else:
+                # Alpha not supported - just destroy immediately
+                try:
+                    dialog.destroy()
+                except:
+                    pass
+        except Exception:
+            # Fallback: just destroy the dialog normally
+            try:
+                dialog.destroy()
+            except:
+                pass
+    
+    def _create_tooltip(self, widget, text, delay_ms=800):
+        """Create a tooltip that appears after a delay when hovering over a widget.
+        
+        Args:
+            widget: The widget to attach the tooltip to
+            text: The tooltip text to display
+            delay_ms: Delay in milliseconds before showing tooltip (default 800ms)
+        """
+        def on_enter(event):
+            # Cancel any existing tooltip timer
+            if hasattr(widget, '_tooltip_timer'):
+                try:
+                    self.root.after_cancel(widget._tooltip_timer)
+                except:
+                    pass
+            
+            # Store tooltip text and event for delayed show
+            widget._tooltip_text = text
+            widget._tooltip_event = event
+            
+            def show_tooltip():
+                # Check if widget still exists
+                try:
+                    if not widget.winfo_exists():
+                        return
+                except:
+                    return
+                
+                try:
+                    # Get theme colors
+                    colors = self.theme_colors
+                    
+                    # Create tooltip window
+                    tooltip = Toplevel(self.root)
+                    tooltip.overrideredirect(True)
+                    tooltip.attributes('-topmost', True)
+                    tooltip.configure(bg=colors.bg, highlightthickness=0, bd=0)
+                    
+                    # Create label with tooltip text
+                    tooltip_label = Label(
+                        tooltip,
+                        text=text,
+                        bg=colors.bg,
+                        fg=colors.fg,
+                        font=("Segoe UI", 8),
+                        relief='flat',
+                        bd=0,
+                        padx=8,
+                        pady=4,
+                        justify=LEFT,
+                        wraplength=300  # Allow text wrapping for long tooltips
+                    )
+                    tooltip_label.pack()
+                    tooltip.update_idletasks()
+                    
+                    # Position tooltip above widget (or below if not enough space)
+                    try:
+                        widget_x = widget.winfo_rootx()
+                        widget_y = widget.winfo_rooty()
+                        widget_width = widget.winfo_width()
+                        widget_height = widget.winfo_height()
+                        tooltip_width = tooltip.winfo_reqwidth()
+                        tooltip_height = tooltip.winfo_reqheight()
+                        
+                        # Try to position above widget
+                        tooltip_x = widget_x + (widget_width // 2) - (tooltip_width // 2)
+                        tooltip_y = widget_y - tooltip_height - 5
+                        
+                        # If not enough space above, position below
+                        screen_height = self.root.winfo_screenheight()
+                        if tooltip_y < 0:
+                            tooltip_y = widget_y + widget_height + 5
+                        
+                        # Keep tooltip within screen bounds
+                        screen_width = self.root.winfo_screenwidth()
+                        if tooltip_x < 0:
+                            tooltip_x = 5
+                        elif tooltip_x + tooltip_width > screen_width:
+                            tooltip_x = screen_width - tooltip_width - 5
+                        
+                        tooltip.geometry(f"{tooltip_width}x{tooltip_height}+{tooltip_x}+{tooltip_y}")
+                        
+                        # Store tooltip reference
+                        widget._tooltip_window = tooltip
+                    except Exception:
+                        # Widget may have been moved/destroyed, destroy tooltip
+                        try:
+                            tooltip.destroy()
+                        except:
+                            pass
+                except Exception:
+                    # Widget may have been destroyed, just ignore
+                    pass
+            
+            # Schedule tooltip to show after delay (use add='+' to allow multiple handlers)
+            widget._tooltip_timer = self.root.after(delay_ms, show_tooltip)
+        
+        def on_leave(event):
+            # Cancel pending tooltip
+            if hasattr(widget, '_tooltip_timer'):
+                try:
+                    self.root.after_cancel(widget._tooltip_timer)
+                except:
+                    pass
+                widget._tooltip_timer = None
+            
+            # Hide tooltip if showing
+            if hasattr(widget, '_tooltip_window'):
+                try:
+                    widget._tooltip_window.destroy()
+                except:
+                    pass
+                widget._tooltip_window = None
+        
+        # Bind events with add='+' to allow multiple handlers (don't interfere with existing Enter/Leave bindings)
+        widget.bind('<Enter>', on_enter, add='+')
+        widget.bind('<Leave>', on_leave, add='+')
+    
+    def _destroy_all_tooltips(self):
+        """Destroy all active tooltip windows to prevent them from getting stuck."""
+        # Iterate through all Toplevel windows and destroy tooltips
+        for widget in self.root.winfo_children():
+            if isinstance(widget, Toplevel):
+                # Check if this is a tooltip window (has overrideredirect and is topmost)
+                try:
+                    if widget.attributes('-topmost') and widget.overrideredirect():
+                        # This is likely a tooltip, destroy it
+                        widget.destroy()
+                except:
+                    pass
+        
+        # Also check all widgets for tooltip_window references
+        def destroy_widget_tooltips(parent):
+            """Recursively find and destroy tooltip references in widgets."""
+            try:
+                for child in parent.winfo_children():
+                    if hasattr(child, '_tooltip_window'):
+                        try:
+                            tooltip = child._tooltip_window
+                            if tooltip and tooltip.winfo_exists():
+                                tooltip.destroy()
+                            child._tooltip_window = None
+                        except:
+                            pass
+                    # Cancel any pending tooltip timers
+                    if hasattr(child, '_tooltip_timer') and child._tooltip_timer:
+                        try:
+                            self.root.after_cancel(child._tooltip_timer)
+                            child._tooltip_timer = None
+                        except:
+                            pass
+                    # Recurse into child widgets
+                    destroy_widget_tooltips(child)
+            except:
+                pass
+        
+        # Check main window widgets
+        destroy_widget_tooltips(self.root)
+        # Check detached window widgets if it exists
+        if hasattr(self, 'detached_window') and self.detached_window:
+            try:
+                destroy_widget_tooltips(self.detached_window)
+            except:
+                pass
+    
+    def _on_detached_window_move(self, event):
+        """Handle detached window Configure events - destroy tooltips, handle linking, and save size."""
+        if event.widget == self.detached_window:
+            # Destroy all tooltips when window moves/resizes
+            self._destroy_all_tooltips()
+            
+            # Handle window linking if enabled
+            if self.status_detached and self.status_window_linked:
+                self._handle_detached_window_movement(event)
+            
+            # Save window size when resized (debounced to avoid excessive saves)
+            if self.status_detached:
+                self._schedule_detached_window_size_save()
+    
+    def _on_main_window_configure(self, event):
+        """Handle main window Configure events for window linking."""
+        if event.widget == self.root and self.status_detached and self.status_window_linked:
+            self._handle_main_window_movement(event)
+    
+    def _on_main_window_click(self, event):
+        """Handle main window click - bring detached window to front if it exists."""
+        # Process clicks anywhere in the main window (including child widgets)
+        # Check if the click is within the root window hierarchy
+        widget = event.widget
+        while widget:
+            if widget == self.root:
+                # Click is within main window, bring detached window to front
+                self._bring_detached_window_to_front()
+                break
+            widget = widget.master if hasattr(widget, 'master') else None
+    
+    def _on_main_window_focus(self, event):
+        """Handle main window focus - bring detached window to front if it exists."""
+        # Only process if event is for root window
+        if event.widget != self.root:
+            return
+        
+        self._bring_detached_window_to_front()
+    
+    def _bring_detached_window_to_front(self):
+        """Helper to bring detached window to front, keeping main window on top."""
+        if self._bringing_windows_to_front:
+            return  # Prevent recursive calls
+        
+        if self.status_detached and self.detached_window:
+            try:
+                if self.detached_window.winfo_exists():
+                    self._bringing_windows_to_front = True
+                    # First, bring detached window above all other windows (but not main window)
+                    self.detached_window.lift()
+                    # Then, bring main window to top (above detached window) to keep focus
+                    self.root.lift()
+                    # Use a slightly longer delay to ensure the operation completes
+                    self.root.after(50, lambda: setattr(self, '_bringing_windows_to_front', False))
+            except Exception:
+                self._bringing_windows_to_front = False
+    
+    def _on_detached_window_click(self, event):
+        """Handle detached window click - bring main window to front."""
+        # Process clicks anywhere in the detached window (including child widgets)
+        # Check if the click is within the detached window hierarchy
+        if not self.detached_window:
+            return
+        
+        widget = event.widget
+        while widget:
+            if widget == self.detached_window:
+                # Click is within detached window, bring main window to front
+                self._bring_main_window_to_front()
+                break
+            widget = widget.master if hasattr(widget, 'master') else None
+    
+    def _on_detached_window_focus(self, event):
+        """Handle detached window focus - bring main window to front."""
+        # Only process if event is for detached window
+        if not self.detached_window or event.widget != self.detached_window:
+            return
+        
+        self._bring_main_window_to_front()
+    
+    def _bring_main_window_to_front(self):
+        """Helper to bring main window to front, keeping detached window on top."""
+        if self._bringing_windows_to_front:
+            return  # Prevent recursive calls
+        
+        try:
+            if self.root.winfo_exists():
+                self._bringing_windows_to_front = True
+                # First, bring main window above all other windows (but not detached window)
+                self.root.lift()
+                # Then, bring detached window to top (above main window) to keep focus
+                if self.detached_window and self.detached_window.winfo_exists():
+                    self.detached_window.lift()
+                # Use a slightly longer delay to ensure the operation completes
+                if self.detached_window:
+                    self.detached_window.after(50, lambda: setattr(self, '_bringing_windows_to_front', False))
+                else:
+                    self.root.after(50, lambda: setattr(self, '_bringing_windows_to_front', False))
+        except Exception:
+            self._bringing_windows_to_front = False
+    
+    def _handle_escape_key(self, event):
+        """Handle ESC key globally - close search, detached window, modals, or prompt to quit."""
+        # Check if search is open - if so, let the search handler deal with it
+        # (search handlers return "break" to prevent propagation)
+        if hasattr(self, 'search_frame') and self.search_frame and self.search_frame.winfo_viewable():
+            return  # Search is open, let its handler deal with it
+        if hasattr(self, 'detached_search_frame') and self.detached_search_frame and self.detached_search_frame.winfo_viewable():
+            return  # Detached search is open, let its handler deal with it
+        
+        # Check if detached window is open - close it (reattach)
+        if self.status_detached and hasattr(self, 'detached_window') and self.detached_window:
+            try:
+                if self.detached_window.winfo_exists():
+                    self._reattach_status_window()
+                    return "break"  # Stop event propagation
+            except:
+                pass
+        
+        # Check for open modals/dialogs - close them
+        # Get all Toplevel windows (excluding detached window and root)
+        try:
+            for widget in self.root.winfo_children():
+                if isinstance(widget, Toplevel):
+                    # Skip detached window (already handled above)
+                    if widget == self.detached_window:
+                        continue
+                    # Check if it's a visible dialog/modal
+                    try:
+                        if widget.winfo_viewable() and widget.winfo_exists():
+                            # Try to close with fade if it has the method, otherwise just destroy
+                            if hasattr(widget, '_close_dialog_with_fade'):
+                                self._close_dialog_with_fade(widget)
+                            else:
+                                widget.destroy()
+                            return "break"  # Stop event propagation
+                    except:
+                        pass
+        except:
+            pass
+        
+        # If we get here, no search, detached window, or modals are open
+        # Check if ESC was pressed in the main window - prompt to quit
+        try:
+            focused = self.root.focus_get()
+            # Check if focus is in the main window (not in a child that might have its own ESC handler)
+            if focused:
+                # Check if the focused widget is part of the main window
+                widget = focused
+                while widget:
+                    if widget == self.root:
+                        # Focus is in main window - prompt to quit
+                        if messagebox.askyesno("Quit", "Are you sure you want to quit?"):
+                            self.on_closing()
+                        return "break"
+                    try:
+                        widget = widget.master
+                    except:
+                        break
+            else:
+                # No focus, assume main window - prompt to quit
+                if messagebox.askyesno("Quit", "Are you sure you want to quit?"):
+                    self.on_closing()
+                return "break"
+        except:
+            pass
+        
+        # Default: do nothing if we can't determine context
+        return "break"
+    
+    def _show_dialog_with_fade(self, dialog):
+        """Show a dialog with smooth fade-in effect to prevent flicker.
+        
+        Args:
+            dialog: Toplevel dialog to show with fade-in
+        """
+        try:
+            # Check if alpha/opacity is supported
+            try:
+                # Set alpha to 0 BEFORE showing to eliminate initial flicker
+                dialog.attributes('-alpha', 0.0)
+                alpha_supported = True
+            except (TclError, AttributeError):
+                # Alpha not supported, just show normally
+                alpha_supported = False
+            
+            if alpha_supported:
+                # Show the dialog while still transparent (no flicker)
+                dialog.deiconify()
+                # Small delay to ensure dialog is fully ready before starting fade
+                dialog.update_idletasks()
+                
+                # Fade in over 300ms with ease-in curve (faster than main window for responsiveness)
+                fade_steps = 30
+                fade_duration_ms = 300
+                step_delay = max(1, fade_duration_ms // fade_steps)
+                step = 0
+                
+                def fade_step():
+                    nonlocal step
+                    try:
+                        step += 1
+                        # Ease-in quadratic: progress^2
+                        progress = step / fade_steps
+                        eased_progress = progress * progress
+                        current_opacity = min(1.0, eased_progress)
+                        
+                        if step >= fade_steps:
+                            # Final step - ensure fully opaque
+                            dialog.attributes('-alpha', 1.0)
+                            dialog.update_idletasks()
+                        else:
+                            dialog.attributes('-alpha', current_opacity)
+                            # Continue fade
+                            dialog.after(step_delay, fade_step)
+                    except (TclError, RuntimeError):
+                        # Dialog may have been closed, just ensure it's visible
+                        try:
+                            dialog.attributes('-alpha', 1.0)
+                        except Exception:
+                            pass
+                
+                # Start fade-in after ensuring dialog is ready
+                dialog.after(10, fade_step)
+            else:
+                # Alpha not supported - just show normally
+                dialog.deiconify()
+                dialog.update_idletasks()
+        except Exception:
+            # Fallback: just show the dialog normally
+            try:
+                dialog.deiconify()
+                dialog.update_idletasks()
+            except Exception:
+                pass
+    
+    def _create_dialog_base(self, title, width, height, show_immediately=True):
         """Create base dialog with common styling and centering.
         
         Args:
             title: Dialog title
             width: Dialog width in pixels
             height: Dialog height in pixels
+            show_immediately: If True, show dialog with fade-in immediately. If False, dialog stays hidden.
             
         Returns:
             Configured Toplevel dialog
         """
         dialog = Toplevel(self.root)
+        # Hide dialog initially to prevent flicker (will be shown with fade-in)
+        dialog.withdraw()
+        
         # Add leading space for nice spacing between icon and title text
         dialog.title(f" {title}")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
         
-        # Center dialog
+        # Center dialog (calculate position before showing)
         dialog.update_idletasks()
         x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (width // 2)
         y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (height // 2)
@@ -2583,6 +3211,15 @@ class BandcampDownloaderGUI:
         # Configure dialog background with theme colors
         colors = self.theme_colors
         dialog.configure(bg=colors.bg)
+        
+        # Intercept close events to use fade-out
+        def on_dialog_close():
+            self._close_dialog_with_fade(dialog)
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+        
+        # Show dialog with fade-in effect (unless caller wants to show it later)
+        if show_immediately:
+            self._show_dialog_with_fade(dialog)
         
         return dialog
     
@@ -3035,7 +3672,7 @@ class BandcampDownloaderGUI:
         close_btn = Button(
             button_frame,
             text="Close",
-            command=dialog.destroy,
+            command=lambda: self._close_dialog_with_fade(dialog),
             bg=colors.accent,
             fg='#FFFFFF',
             font=("Segoe UI", 9),
@@ -3047,8 +3684,8 @@ class BandcampDownloaderGUI:
         close_btn.pack(side=RIGHT)
         
         # Bind Enter key to close
-        dialog.bind('<Return>', lambda e: dialog.destroy())
-        dialog.bind('<Escape>', lambda e: dialog.destroy())
+        dialog.bind('<Return>', lambda e: self._close_dialog_with_fade(dialog))
+        dialog.bind('<Escape>', lambda e: self._close_dialog_with_fade(dialog))
     
     def _create_menubutton_with_menu(self, parent, textvariable, values, width, callback=None):
         """Create a menubutton with menu, matching the structure menubutton style.
@@ -3319,19 +3956,18 @@ class BandcampDownloaderGUI:
             disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'
             if has_custom:
                 self.manage_btn.config(fg=colors.disabled_fg, cursor='hand2')
-                # Rebind events if they don't exist
-                if not hasattr(self.manage_btn, '_bound'):
-                    self.manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog())
-                    self.manage_btn.bind("<Enter>", lambda e: self.manage_btn.config(fg=colors.hover_fg))
-                    self.manage_btn.bind("<Leave>", lambda e: self.manage_btn.config(fg=colors.disabled_fg))
-                    self.manage_btn._bound = True
-            else:
-                self.manage_btn.config(fg=disabled_color, cursor='arrow')
-                # Unbind events when disabled
+                # Rebind Button-1 - unbind first to avoid duplicate handlers, then rebind with add='+' to preserve tooltip
+                # Don't rebind Enter/Leave - they're already bound (tooltip + color change)
                 try:
                     self.manage_btn.unbind("<Button-1>")
-                    self.manage_btn.unbind("<Enter>")
-                    self.manage_btn.unbind("<Leave>")
+                except:
+                    pass
+                self.manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog(), add='+')
+            else:
+                self.manage_btn.config(fg=disabled_color, cursor='arrow')
+                # Only unbind Button-1 (don't unbind Enter/Leave to preserve tooltip)
+                try:
+                    self.manage_btn.unbind("<Button-1>")
                     if hasattr(self.manage_btn, '_bound'):
                         delattr(self.manage_btn, '_bound')
                 except:
@@ -3402,20 +4038,46 @@ class BandcampDownloaderGUI:
             if hasattr(self, 'settings_frame'):
                 self.settings_frame.grid_configure(columnspan=3)
             if hasattr(self, 'show_album_art_btn'):
-                # Show the button by adding it back to grid
+                # Ensure button is visible (should already be in grid, but make sure)
                 self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
                 self.show_album_art_btn.config(fg='#808080', cursor='hand2')
         else:
-            # Album art or bio pic is visible, ensure eye icon is removed from grid
+            # Album art or bio pic is visible, keep eye icon visible so it can toggle
             if hasattr(self, 'album_art_frame'):
                 self.album_art_frame.grid()
             if hasattr(self, 'settings_frame'):
                 self.settings_frame.grid_configure(columnspan=2)
             if hasattr(self, 'show_album_art_btn'):
-                self.show_album_art_btn.grid_remove()
-            # Fetch appropriate image based on mode
-            if self.album_art_mode == "bio_pic" and hasattr(self, 'current_bio_pic_url') and self.current_bio_pic_url:
-                self.root.after(200, lambda: self.fetch_and_display_bio_pic(self.current_bio_pic_url))
+                # Keep button visible so it can toggle panel visibility
+                self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
+                self.show_album_art_btn.config(fg='#808080', cursor='hand2')
+            # Fetch appropriate image based on mode using artwork list system
+            if self.artwork_list:
+                # Use artwork list to display - find bio pic index if in bio_pic mode
+                if self.album_art_mode == "bio_pic" and self.current_bio_pic_url:
+                    # Find bio pic index in list
+                    try:
+                        bio_pic_index = self.artwork_list.index(self.current_bio_pic_url)
+                        self.artwork_index = bio_pic_index
+                        self.root.after(200, lambda: self._display_artwork_at_index(bio_pic_index))
+                    except ValueError:
+                        # Bio pic not in list yet, build list first
+                        self._build_artwork_list()
+                        if self.artwork_list and self.current_bio_pic_url in self.artwork_list:
+                            bio_pic_index = self.artwork_list.index(self.current_bio_pic_url)
+                            self.artwork_index = bio_pic_index
+                            self.root.after(200, lambda: self._display_artwork_at_index(bio_pic_index))
+                elif self.album_art_mode == "album_art":
+                    # Display album art (index 0)
+                    self.artwork_index = 0
+                    self.root.after(200, lambda: self._display_artwork_at_index(0))
+            elif self.album_art_mode == "bio_pic" and hasattr(self, 'current_bio_pic_url') and self.current_bio_pic_url:
+                # Fallback: build list and display bio pic
+                self._build_artwork_list()
+                if self.artwork_list and self.current_bio_pic_url in self.artwork_list:
+                    bio_pic_index = self.artwork_list.index(self.current_bio_pic_url)
+                    self.artwork_index = bio_pic_index
+                    self.root.after(200, lambda: self._display_artwork_at_index(bio_pic_index))
     
     def save_album_art_state(self):
         """Save album art visibility state."""
@@ -3487,6 +4149,19 @@ class BandcampDownloaderGUI:
     def on_download_cover_art_change(self):
         """Handle download cover art checkbox change."""
         self.save_download_cover_art()
+    
+    def load_saved_download_extras(self):
+        """Load saved download extras preference, default to False if not found."""
+        settings = self._load_settings()
+        return settings.get("download_extras", False)
+    
+    def save_download_extras(self):
+        """Save download extras preference."""
+        self._save_settings()
+    
+    def on_download_extras_change(self):
+        """Handle download extras checkbox change."""
+        self.save_download_extras()
     
     def load_saved_download_discography(self):
         """Load saved download discography preference, default to False if not found."""
@@ -3629,11 +4304,12 @@ class BandcampDownloaderGUI:
             webbrowser.open("https://www.python.org/downloads/")
             return False
         
-        # Check yt-dlp
-        global yt_dlp
+        # Check yt-dlp (lazy import - just verify it can be imported, don't import yet)
         try:
-            if yt_dlp is None:
-                import yt_dlp
+            import importlib.util
+            spec = importlib.util.find_spec("yt_dlp")
+            if spec is None:
+                raise ImportError("yt-dlp module not found")
         except ImportError:
             response = messagebox.askyesno(
                 "yt-dlp Not Found",
@@ -3675,8 +4351,12 @@ class BandcampDownloaderGUI:
         self.ffmpeg_path = ffmpeg_path
         
         # Check PIL (optional - only needed for album art display)
+        # Just verify it can be imported, don't import yet (lazy import)
         try:
-            import PIL
+            import importlib.util
+            spec = importlib.util.find_spec("PIL")
+            if spec is None:
+                raise ImportError("PIL module not found")
         except ImportError:
             # PIL is optional, so we don't block startup, but offer to install
             response = messagebox.askyesno(
@@ -3771,6 +4451,7 @@ class BandcampDownloaderGUI:
         # Main container with compact padding
         main_frame = ttk.Frame(self.root, padding="8")
         main_frame.grid(row=0, column=0, sticky=(W, E, N, S))
+        self.main_frame = main_frame  # Store reference for detachable status window
         
         # Configure grid weights early so URL field starts at full width
         # This prevents the URL field from resizing multiple times during startup
@@ -3832,6 +4513,7 @@ class BandcampDownloaderGUI:
         self.url_paste_btn.bind("<Button-1>", lambda e: self._handle_paste_button_Click())
         self.url_paste_btn.bind("<Enter>", lambda e: self.url_paste_btn.config(fg=colors.hover_fg))
         self.url_paste_btn.bind("<Leave>", lambda e: self.url_paste_btn.config(fg=colors.disabled_fg))
+        self._create_tooltip(self.url_paste_btn, "Paste URLs from clipboard")
         
         # Container frame for URL widgets (Entry and ScrolledText)
         # Span rows 0-1 to align with URL label (row 0) and paste button (row 1)
@@ -3867,9 +4549,6 @@ class BandcampDownloaderGUI:
         url_entry.grid(row=0, column=0, sticky=(W, E), pady=0, padx=0)
         self.url_entry_widget = url_entry
         
-        # Add placeholder text to Entry
-        self._set_entry_placeholder(url_entry, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
-        
         # Clear button (X) - appears when URL field has content
         # Use smaller font and minimal padding to match entry field height
         self.url_clear_btn = Label(
@@ -3890,6 +4569,7 @@ class BandcampDownloaderGUI:
         self.url_clear_btn.bind("<Button-1>", lambda e: self._clear_url_field())
         self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(fg=colors.hover_fg))
         self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(fg=colors.disabled_fg))
+        self._create_tooltip(self.url_clear_btn, "Clear all URLs from the input field.")
         # Always visible - no grid_remove()
         
         # Expand/Collapse button - toggles between Entry and ScrolledText modes
@@ -3912,6 +4592,7 @@ class BandcampDownloaderGUI:
         self.url_expand_btn.bind("<Button-1>", self._toggle_url_text_height)
         self.url_expand_btn.bind("<Enter>", lambda e: self.url_expand_btn.config(fg=colors.hover_fg))
         self.url_expand_btn.bind("<Leave>", lambda e: self.url_expand_btn.config(fg=colors.disabled_fg))
+        self._create_tooltip(self.url_expand_btn, "Expand/Collapse URL field (or use resize handle for manual adjustment)")
         # Always visible - no grid_remove()
         # Set initial icon based on mode (should be ⤢ for entry mode)
         self._update_url_expand_button()
@@ -4022,7 +4703,7 @@ class BandcampDownloaderGUI:
         # This will be positioned over the ScrolledText but won't interfere with editing
         placeholder_label = Label(
             url_text_frame,
-            text="Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.",
+            text="Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs",
             font=("Segoe UI", 9),
             bg=colors.entry_bg,
             fg=colors.disabled_fg,
@@ -4647,6 +5328,7 @@ class BandcampDownloaderGUI:
         browse_btn = ttk.Button(browse_container, text="Browse", command=self.browse_folder, cursor='hand2', style='Browse.TButton')
         browse_btn.grid(row=0, column=0, sticky=(W, E))  # Expand to fill available space
         self.browse_btn = browse_btn  # Store reference for unfocus handling
+        self._create_tooltip(browse_btn, "Choose output directory")
         
         # Settings cog icon button
         self.settings_cog_btn = Label(
@@ -4663,6 +5345,7 @@ class BandcampDownloaderGUI:
         self.settings_cog_btn.bind("<Button-1>", self._show_settings_menu)
         self.settings_cog_btn.bind("<Enter>", lambda e: self.settings_cog_btn.config(fg=colors.hover_fg))
         self.settings_cog_btn.bind("<Leave>", lambda e: self.settings_cog_btn.config(fg=colors.disabled_fg))
+        self._create_tooltip(self.settings_cog_btn, "Settings menu for additional options and preferences")
         
         # Create settings menu (will be shown on cog Click)
         self.settings_menu = None
@@ -4727,8 +5410,8 @@ class BandcampDownloaderGUI:
         # Canvas centered in frame (1px padding on all sides to account for border)
         self.album_art_canvas.grid(row=0, column=0, padx=1, pady=1, sticky=(N, S, E, W))
         
-        # Make canvas Clickable to toggle album art
-        self.album_art_canvas.bind("<Button-1>", lambda e: self.toggle_album_art())
+        # Make canvas Clickable to cycle through artwork types (album_art ↔ bio_pic)
+        self.album_art_canvas.bind("<Button-1>", lambda e: self.cycle_artwork_type())
         
         # Placeholder text on canvas (centered at 84, 84 for 168x168 canvas)
         self.album_art_canvas.create_text(
@@ -4759,34 +5442,34 @@ class BandcampDownloaderGUI:
         format_menubutton.grid(row=0, column=1, padx=4, sticky=W, pady=1)
         self.format_menubutton = format_menubutton  # Store for dynamic updates
         self.format_menu = format_menu  # Store for dynamic updates
+        #self._create_tooltip(format_menubutton, "Select audio format for downloads. Options include Original, MP3, FLAC, OGG, and WAV.")
         
         # Update format menu to match current skip re-encode setting and saved format
         self.root.after_idle(self._update_format_menu)
         
-        # Show album art button (hidden by default, shown when album art is hidden)
+        # Show album art button (always visible to allow toggling)
         # Placed in the same row as Audio Format, right-aligned
-        # Always keep it in grid to prevent layout shifts - just make it invisible when not needed
-        # Eye icon for showing album art (Win7 compatible)
+        # Always keep it in grid to allow toggling panel visibility
+        # Eye icon for showing/hiding album art (Win7 compatible)
         eye_icon = self._get_icon('eye')
         eye_font = ("Webdings", 12) if self._is_windows_7() else ("Segoe UI", 10)
         self.show_album_art_btn = Label(
             self.settings_content,
             text=eye_icon,
             font=eye_font,
-            bg=colors.bg,
+            bg=settings_frame_bg,
             fg=colors.disabled_fg,
             cursor='hand2',
             width=2
         )
-        # Only add to grid if album art is hidden (will be shown/hidden by toggle_album_art)
-        # If album art is visible by default, don't add to grid initially to save space
-        if self.album_art_mode == "hidden":
-            self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
-            self.show_album_art_btn.config(fg=colors.disabled_fg, cursor='hand2')
-        # Always bind events (they'll work when the button is in grid)
+        # Always add to grid so it's always visible and can toggle panel visibility
+        self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
+        self.show_album_art_btn.config(fg=colors.disabled_fg, cursor='hand2')
+        # Always bind events
         self.show_album_art_btn.bind("<Button-1>", lambda e: self.toggle_album_art())
         self.show_album_art_btn.bind("<Enter>", lambda e: self.show_album_art_btn.config(fg=colors.hover_fg))
         self.show_album_art_btn.bind("<Leave>", lambda e: self.show_album_art_btn.config(fg=colors.disabled_fg))
+        self._create_tooltip(self.show_album_art_btn, "Toggle artwork visibility")
         
         # Numbering (second, below Audio Format)
         # Use Settings.TLabel style to match settings frame background
@@ -4814,13 +5497,14 @@ class BandcampDownloaderGUI:
         
         self.filename_menubutton = numbering_menubutton  # Store reference
         self.filename_menu = numbering_menu  # Store reference
+        #self._create_tooltip(numbering_menubutton, "Select filename format for downloaded tracks. Choose from preset formats or create custom formats.")
         
         # Build the menu with standard formats, separator, and custom formats
         self._build_filename_menu(numbering_menu)
         
         # Update edit button state based on initial selection (after button is created)
         # Will be called after button creation below
-        
+                
         # Customize button (✏️) - matching folder structure style
         filename_customize_btn = Label(
             filename_frame,
@@ -4834,9 +5518,12 @@ class BandcampDownloaderGUI:
         )
         filename_customize_btn.pack(side=LEFT, padx=(0, 0))
         filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog())
-        filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg=colors.hover_fg))
-        filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg=colors.disabled_fg))
-        self.filename_customize_btn = filename_customize_btn  # Store reference
+        # Store reference before adding tooltip (tooltip needs the widget reference)
+        self.filename_customize_btn = filename_customize_btn
+        # Add tooltip first, then add color change handlers with add='+' so they don't interfere
+        self._create_tooltip(filename_customize_btn, "Create/edit custom filename formats")
+        filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg=colors.hover_fg), add='+')
+        filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg=colors.disabled_fg), add='+')
         
         # Update edit button state based on initial selection
         self.root.after(100, self._update_filename_edit_button)
@@ -4860,6 +5547,8 @@ class BandcampDownloaderGUI:
             filename_manage_btn.bind("<Enter>", lambda e: filename_manage_btn.config(fg=colors.hover_fg) if has_custom_filename else None)
             filename_manage_btn.bind("<Leave>", lambda e: filename_manage_btn.config(fg=colors.disabled_fg) if has_custom_filename else None)
         self.filename_manage_btn = filename_manage_btn  # Store reference
+        # Always add tooltip (even if disabled, it's still helpful to know what it does)
+        self._create_tooltip(filename_manage_btn, "Delete custom filename formats")
         
         # Folder Structure (third, below Numbering)
         # Use Settings.TLabel style to match settings frame background
@@ -5062,8 +5751,12 @@ class BandcampDownloaderGUI:
         )
         customize_btn.pack(side=LEFT, padx=(0, 0))  # spacing between buttons
         customize_btn.bind("<Button-1>", lambda e: self._show_customize_dialog())
-        customize_btn.bind("<Enter>", lambda e: customize_btn.config(fg=colors.hover_fg))
-        customize_btn.bind("<Leave>", lambda e: customize_btn.config(fg=colors.disabled_fg))
+        # Store reference and add tooltip first
+        self.customize_btn = customize_btn
+        self._create_tooltip(customize_btn, "Create/edit custom folder structures")
+        # Add color change handlers with add='+' so they don't interfere with tooltip
+        customize_btn.bind("<Enter>", lambda e: customize_btn.config(fg=colors.hover_fg), add='+')
+        customize_btn.bind("<Leave>", lambda e: customize_btn.config(fg=colors.disabled_fg), add='+')
         
         # Manage button (🗑️) - trash can icon for managing/deleting structures
         has_custom = hasattr(self, 'custom_structures') and self.custom_structures
@@ -5079,14 +5772,14 @@ class BandcampDownloaderGUI:
             padx=4
         )
         manage_btn.pack(side=LEFT, padx=(2, 0))  # Left padding to prevent icon cutoff
-        if has_custom:
-            manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog())
-            manage_btn.bind("<Enter>", lambda e: manage_btn.config(fg=colors.hover_fg) if has_custom else None)
-            manage_btn.bind("<Leave>", lambda e: manage_btn.config(fg=colors.disabled_fg) if has_custom else None)
-        
-        # Store references (structure_menubutton and structure_menu already stored above)
-        self.customize_btn = customize_btn
+        # Store reference and add tooltip first (always add, even if disabled)
         self.manage_btn = manage_btn
+        self._create_tooltip(manage_btn, "Delete custom folder structures")
+        # Add button and color handlers with add='+' so they don't interfere with tooltip
+        if has_custom:
+            manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog(), add='+')
+        manage_btn.bind("<Enter>", lambda e: manage_btn.config(fg=colors.hover_fg) if has_custom else None, add='+')
+        manage_btn.bind("<Leave>", lambda e: manage_btn.config(fg=colors.disabled_fg) if has_custom else None, add='+')
         
         # Update dropdown with custom structures and set initial display value
         self._update_structure_dropdown()
@@ -5109,11 +5802,18 @@ class BandcampDownloaderGUI:
         # Hide by default unless developer flag is enabled
         if not SHOW_SKIP_POSTPROCESSING_OPTION:
             skip_postprocessing_check.grid_remove()
+        if SHOW_SKIP_POSTPROCESSING_OPTION:
+            self._create_tooltip(skip_postprocessing_check, "Skip audio post-processing and output original files as downloaded. Only available in developer mode.")
         
-        # Download cover art separately checkbox (below Skip post-processing)
+        # Cover art and extras checkboxes on same row (below Skip post-processing)
+        # Create a frame to hold both checkboxes side by side
+        cover_art_extras_frame = Frame(self.settings_content, bg=settings_frame_bg, highlightthickness=0, borderwidth=0)
+        cover_art_extras_frame.grid(row=4, column=0, columnspan=2, padx=4, sticky=W, pady=1)
+        
+        # Save cover art checkbox (renamed, on left)
         download_cover_art_check = Checkbutton(
-            self.settings_content,
-            text="Save copy of cover art in download folder",
+            cover_art_extras_frame,
+            text="Save copy of cover art",
             variable=self.download_cover_art_var,
             font=("Segoe UI", 8),
             bg=settings_frame_bg,
@@ -5123,8 +5823,26 @@ class BandcampDownloaderGUI:
             activeforeground=colors.fg,
             command=self.on_download_cover_art_change
         )
-        download_cover_art_check.grid(row=4, column=0, columnspan=2, padx=4, sticky=W, pady=1)
+        download_cover_art_check.pack(side=LEFT, padx=(0, 12))
         self.download_cover_art_check = download_cover_art_check  # Store reference for theme updates
+        self._create_tooltip(download_cover_art_check, "Save album art to the download folder.")
+        
+        # Save extras checkbox (new, on right)
+        download_extras_check = Checkbutton(
+            cover_art_extras_frame,
+            text="Save extras",
+            variable=self.download_extras_var,
+            font=("Segoe UI", 8),
+            bg=settings_frame_bg,
+            fg=colors.fg,
+            selectcolor=settings_frame_bg,
+            activebackground=settings_frame_bg,
+            activeforeground=colors.fg,
+            command=self.on_download_extras_change
+        )
+        download_extras_check.pack(side=LEFT)
+        self.download_extras_check = download_extras_check  # Store reference for theme updates
+        self._create_tooltip(download_extras_check, "Save additional artwork and bio pic images to the download folder.")
         
         # Create playlist checkbox (below Save copy of cover art)
         create_playlist_check = Checkbutton(
@@ -5141,6 +5859,7 @@ class BandcampDownloaderGUI:
         )
         create_playlist_check.grid(row=5, column=0, columnspan=2, padx=4, sticky=W, pady=1)
         self.create_playlist_check = create_playlist_check  # Store reference for theme updates
+        #self._create_tooltip(create_playlist_check, "Create an M3U playlist file containing all downloaded tracks for easy playback in music players.")
         
         # Download artist discography checkbox (below Create playlist)
         download_discography_check = Checkbutton(
@@ -5157,6 +5876,7 @@ class BandcampDownloaderGUI:
         )
         download_discography_check.grid(row=6, column=0, columnspan=2, padx=4, sticky=W, pady=1)
         self.download_discography_check = download_discography_check  # Store reference for enabling/disabling
+        #self._create_tooltip(download_discography_check, "Download the artist's entire discography instead of just the selected album. Only works with single album URLs.")
         
         # Configure column weights: label (0), combo (1), button (2)
         self.settings_content.columnconfigure(0, weight=0)  # Label column - fixed width
@@ -5317,6 +6037,7 @@ class BandcampDownloaderGUI:
             cursor='hand2'
         )
         self.download_btn.grid(row=6, column=0, columnspan=3, pady=0)
+        self._create_tooltip(self.download_btn, "Start Download")
         
         # Track if download button is being Clicked to prevent URL field collapse interference
         self.download_button_Clicked = False
@@ -5384,9 +6105,8 @@ class BandcampDownloaderGUI:
         log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 2))
         self.log_label = log_label  # Store reference for theme updates
         
-        # Clear log button (between Status label and Debug toggle) - styled like Browse button
-        # Use same font size as Debug toggle (8) for consistency in header
         # Create a custom style for the small button (based on TButton but with smaller padding and font)
+        # This style is used by Detach, Clear Log, and Attach buttons
         style = ttk.Style()
         style.configure('Small.TButton', 
                        background=colors.entry_bg,  # Light gray like URL field
@@ -5400,6 +6120,20 @@ class BandcampDownloaderGUI:
                  background=[('active', colors.hover_bg), ('pressed', colors.entry_bg)],
                  bordercolor=[('active', colors.entry_bg), ('pressed', colors.entry_bg)])
         
+        # Detach button (before Clear Log)
+        self.detach_btn = ttk.Button(
+            self.log_frame,
+            text="Detach",
+            command=self._toggle_detach_status,
+            cursor='hand2',
+            style='Small.TButton',
+            state='normal'
+        )
+        self.detach_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
+        self._create_tooltip(self.detach_btn, "Detach status log into a separate window")
+        
+        # Clear log button (between Status label and Debug toggle) - styled like Browse button
+        # Use same font size as Debug toggle (8) for consistency in header
         self.clear_log_btn = ttk.Button(
             self.log_frame,
             text="Clear Log",
@@ -5408,7 +6142,7 @@ class BandcampDownloaderGUI:
             style='Small.TButton',
             state='disabled'  # Disabled initially when log is empty
         )
-        self.clear_log_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
+        self.clear_log_btn.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(0, 0))
         
         # Word wrap toggle checkbox (between Clear Log and Debug)
         settings = self._load_settings()
@@ -5426,8 +6160,9 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=self._toggle_word_wrap
         )
-        word_wrap_toggle.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(0, 0))
+        word_wrap_toggle.grid(row=0, column=3, sticky=E, padx=(0, 6), pady=(0, 0))
         self.word_wrap_toggle = word_wrap_toggle  # Store reference for theme updates
+        #self._create_tooltip(word_wrap_toggle, "Enable word wrapping in the status log. Long lines will wrap to multiple lines instead of requiring horizontal scrolling.")
         
         # Debug toggle checkbox (right-aligned on same row as Status label)
         self.debug_mode_var = BooleanVar(value=False)
@@ -5443,19 +6178,22 @@ class BandcampDownloaderGUI:
             font=("Segoe UI", 8),
             command=self._toggle_debug_mode
         )
-        debug_toggle.grid(row=0, column=3, sticky=E, padx=6, pady=(0, 0))
+        debug_toggle.grid(row=0, column=4, sticky=E, padx=6, pady=(0, 0))
         self.debug_toggle = debug_toggle  # Store reference for theme updates
+        #self._create_tooltip(debug_toggle, "Enable debug mode to show detailed technical information in the status log. Useful for troubleshooting issues.")
         
         # Configure column weights so controls stay on the right
         self.log_frame.columnconfigure(0, weight=1)
-        self.log_frame.columnconfigure(1, weight=0)
-        self.log_frame.columnconfigure(2, weight=0)
-        self.log_frame.columnconfigure(3, weight=0)
+        self.log_frame.columnconfigure(1, weight=0)  # Detach button
+        self.log_frame.columnconfigure(2, weight=0)  # Clear Log
+        self.log_frame.columnconfigure(3, weight=0)  # Word Wrap
+        self.log_frame.columnconfigure(4, weight=0)  # Debug
         
         # Inner frame for content (spans all columns to stay full width)
         # Search bar will be at the bottom (row=2), log_content at row=1
         log_content = Frame(self.log_frame, bg=log_frame_bg)
-        log_content.grid(row=1, column=0, columnspan=4, sticky=(W, E, N, S), padx=6, pady=(0, 6))
+        log_content.grid(row=1, column=0, columnspan=5, sticky=(W, E, N, S), padx=6, pady=(0, 6))
+        self.log_content = log_content  # Store reference for moving widgets
         self.log_frame.rowconfigure(1, weight=1)  # Log content row expands
         # Column 0: Text widget, Column 1: vertical scrollbar
         log_content.columnconfigure(0, weight=1)
@@ -5550,6 +6288,7 @@ class BandcampDownloaderGUI:
         self.expand_collapse_btn.bind("<Button-1>", lambda e: self._toggle_window_height())
         self.expand_collapse_btn.bind("<Enter>", lambda e: self.expand_collapse_btn.config(fg=colors.hover_fg))
         self.expand_collapse_btn.bind("<Leave>", lambda e: self.expand_collapse_btn.config(fg=colors.disabled_fg))
+        self._create_tooltip(self.expand_collapse_btn, "Expand/Collapse Status Log (or resize the window for manual adjustment)")
         
         # Track if window is expanded
         self.is_expanded = False
@@ -5652,6 +6391,8 @@ class BandcampDownloaderGUI:
                             self.root.update_idletasks()
                             # Bring to front after fade completes
                             self._bring_to_front()
+                            # Pre-import libraries after fade-in completes (non-blocking)
+                            self._start_preimports()
                         else:
                             self.root.attributes('-alpha', current_opacity)
                             # Continue fade
@@ -5671,12 +6412,16 @@ class BandcampDownloaderGUI:
                 self.root.deiconify()
                 self.root.update_idletasks()
                 self._bring_to_front()
+                # Pre-import libraries after window is shown (non-blocking)
+                self._start_preimports()
         except Exception:
             # Fallback: just show the window normally
             try:
                 self.root.deiconify()
                 self.root.update_idletasks()
                 self._bring_to_front()
+                # Pre-import libraries after window is shown (non-blocking)
+                self._start_preimports()
             except Exception:
                 pass
     
@@ -5730,11 +6475,77 @@ class BandcampDownloaderGUI:
                 except Exception:
                     pass
     
-    def on_closing(self):
-        """Handle window closing - also close console."""
-        # Cancel all pending timers
-        self._cancel_all_timers()
-        
+    def _close_window_with_fade(self):
+        """Close the main window with smooth fade-out effect."""
+        try:
+            # Check if alpha/opacity is supported
+            try:
+                current_alpha = self.root.attributes('-alpha')
+                alpha_supported = True
+            except (TclError, AttributeError):
+                # Alpha not supported, just destroy immediately
+                alpha_supported = False
+            
+            if alpha_supported:
+                # Fade out over 250ms with ease-out curve (fast start, slow end)
+                fade_steps = 25
+                fade_duration_ms = 250
+                step_delay = max(1, fade_duration_ms // fade_steps)
+                step = 0
+                start_alpha = current_alpha if current_alpha is not None else 1.0
+                
+                def fade_step():
+                    nonlocal step
+                    try:
+                        step += 1
+                        # Ease-out quadratic: 1 - (1 - progress)^2
+                        progress = step / fade_steps
+                        eased_progress = 1 - (1 - progress) * (1 - progress)
+                        current_opacity = max(0.0, start_alpha * (1 - eased_progress))
+                        
+                        if step >= fade_steps:
+                            # Final step - ensure fully transparent, then close
+                            try:
+                                self.root.attributes('-alpha', 0.0)
+                                self.root.update_idletasks()
+                            except:
+                                pass
+                            # Close console and destroy after fade completes
+                            try:
+                                # Close console window
+                                kernel32 = ctypes.windll.kernel32
+                                hwnd = kernel32.GetConsoleWindow()
+                                if hwnd:
+                                    kernel32.FreeConsole()
+                            except (AttributeError, OSError):
+                                pass
+                            # Destroy the GUI
+                            try:
+                                self.root.destroy()
+                            except:
+                                pass
+                        else:
+                            self.root.attributes('-alpha', current_opacity)
+                            # Continue fade
+                            self.root.after(step_delay, fade_step)
+                    except (TclError, RuntimeError):
+                        # Window may have been closed, just destroy
+                        try:
+                            self.root.destroy()
+                        except:
+                            pass
+                
+                # Start fade-out
+                self.root.after(10, fade_step)
+            else:
+                # Alpha not supported - close normally
+                self._close_window_immediately()
+        except Exception:
+            # Fallback: close normally
+            self._close_window_immediately()
+    
+    def _close_window_immediately(self):
+        """Close the main window immediately (fallback when fade not supported)."""
         try:
             # Close console window
             kernel32 = ctypes.windll.kernel32
@@ -5745,6 +6556,37 @@ class BandcampDownloaderGUI:
             pass
         # Close the GUI
         self.root.destroy()
+    
+    def on_closing(self):
+        """Handle window closing - save state, fade out then close console and destroy."""
+        # Save window linking state and geometry before closing
+        self._save_window_linking_settings()
+        # Close detached window if it exists
+        if self.detached_window and self.detached_window.winfo_exists():
+            # Calculate and save relative offset before closing
+            try:
+                main_x = self.root.winfo_x()
+                main_y = self.root.winfo_y()
+                detached_x = self.detached_window.winfo_x()
+                detached_y = self.detached_window.winfo_y()
+                self.window_offset = (detached_x - main_x, detached_y - main_y)
+                
+                # Save window size
+                geometry = self.detached_window.geometry()
+                if 'x' in geometry:
+                    size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
+                    self.status_window_size = size_part
+            except:
+                pass
+            self.detached_window.destroy()
+            self.detached_window = None
+            self.detached_frame = None
+        
+        # Cancel all pending timers
+        self._cancel_all_timers()
+        
+        # Close with fade-out effect
+        self._close_window_with_fade()
     
     def _deselect_combobox_text(self, event):
         """Deselect text and remove focus from combobox after selection."""
@@ -5826,7 +6668,7 @@ class BandcampDownloaderGUI:
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get().strip()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 content = ""
         else:
             content = ""
@@ -5835,10 +6677,7 @@ class BandcampDownloaderGUI:
         if not content:
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.format_suggestion_shown = False
-            self.current_thumbnail_url = None
-            self.current_bio_pic_url = None
-            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
-            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
+            self._reset_artwork_state()
             self.album_art_fetching = False
             self.update_preview()
             self.clear_album_art()
@@ -5849,6 +6688,8 @@ class BandcampDownloaderGUI:
             return
         
         # Process URL tags (convert URLs to styled tags) - reprocess to protect tags
+        # Note: This runs asynchronously, so _check_url might run before tags are processed
+        # This is okay - _extract_urls_from_content handles both tagged and untagged URLs
         if self.url_text_widget and self.url_text_widget.winfo_viewable():
             self.root.after(50, self._process_url_tags)  # Small delay to let content settle
         
@@ -5902,7 +6743,7 @@ class BandcampDownloaderGUI:
             # Currently in Entry mode - expand to ScrolledText
             content = self.url_var.get().strip()
             # Remove placeholder text if present
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 content = ""
             # Expand to multi-line
             self._expand_to_multiline(content)
@@ -5950,9 +6791,12 @@ class BandcampDownloaderGUI:
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             # Entry is visible - clear it and restore placeholder
             self.url_var.set("")
-            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
             # Unfocus
             self.root.focus_set()
+        
+        # Adjust window height if detached (reset to minimum when URL field is cleared)
+        self.root.after(50, self._adjust_window_height_for_url_field)
         
         # Update clear button visibility
         self._update_url_clear_button()
@@ -5960,8 +6804,7 @@ class BandcampDownloaderGUI:
         # Reset metadata and preview immediately
         self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
         self.format_suggestion_shown = False  # Reset format suggestion flag
-        self.current_thumbnail_url = None
-        self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
+        self._reset_artwork_state()
         self.album_art_fetching = False
         self.update_preview()
         self.clear_album_art()
@@ -5977,7 +6820,7 @@ class BandcampDownloaderGUI:
         # Clear placeholder text if present before pasting
         if self.url_entry_widget:
             current_content = self.url_var.get()
-            if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 # Clear placeholder text
                 self.url_entry_widget.delete(0, END)
                 self.url_entry_widget.config(foreground='#CCCCCC')  # Normal text color
@@ -6031,7 +6874,7 @@ class BandcampDownloaderGUI:
             current_content_raw = self.url_var.get()
             current_content = current_content_raw.strip()
             # Skip placeholder text
-            if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 current_content = ""
                 current_content_raw = ""
             
@@ -6342,7 +7185,7 @@ class BandcampDownloaderGUI:
         if self.url_entry_widget:
             content = self.url_var.get()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 content = ""
             if '\n' in content:
                 # Has newlines - expand to multi-line
@@ -6360,7 +7203,7 @@ class BandcampDownloaderGUI:
         if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 return
             if '\n' in content:
                 # Has newlines - expand to multi-line
@@ -6375,7 +7218,7 @@ class BandcampDownloaderGUI:
             elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
                 current_content = self.url_var.get().strip()
                 # Skip placeholder text
-                if current_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+                if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                     current_content = ""
             else:
                 current_content = ""
@@ -6463,15 +7306,12 @@ class BandcampDownloaderGUI:
                 self._expand_to_multiline(previous_content)
             else:
                 # Handle empty content - clear preview and artwork
-                if not previous_content or not previous_content.strip() or previous_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+                if not previous_content or not previous_content.strip() or previous_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                     self.url_var.set("")
-                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
-                    self.current_thumbnail_url = None
-                    self.current_bio_pic_url = None
-                    self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
-                    self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
+                    self._reset_artwork_state()
                     self.album_art_fetching = False
                     self.update_preview()
                     self.clear_album_art()
@@ -6494,13 +7334,10 @@ class BandcampDownloaderGUI:
             
             # Clear the field
             self.url_var.set("")
-            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
             # Immediately clear preview and artwork
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
-            self.current_thumbnail_url = None
-            self.current_bio_pic_url = None
-            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
-            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
+            self._reset_artwork_state()
             self.album_art_fetching = False
             self.update_preview()
             self.clear_album_art()
@@ -6543,15 +7380,12 @@ class BandcampDownloaderGUI:
                 self._expand_to_multiline(next_content)
             else:
                 # Handle empty content - clear preview and artwork
-                if not next_content or not next_content.strip() or next_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+                if not next_content or not next_content.strip() or next_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                     self.url_var.set("")
-                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
-                    self.current_thumbnail_url = None
-                    self.current_bio_pic_url = None
-                    self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
-                    self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
+                    self._reset_artwork_state()
                     self.album_art_fetching = False
                     self.update_preview()
                     self.clear_album_art()
@@ -6630,10 +7464,7 @@ class BandcampDownloaderGUI:
             self._update_text_placeholder_visibility()
             # Immediately clear preview and artwork
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
-            self.current_thumbnail_url = None
-            self.current_bio_pic_url = None
-            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
-            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
+            self._reset_artwork_state()
             self.album_art_fetching = False
             self.update_preview()
             self.clear_album_art()
@@ -6871,7 +7702,7 @@ class BandcampDownloaderGUI:
         if not initial_content and self.url_entry_widget:
             initial_content = self.url_var.get()
             # Remove placeholder text if present
-            if initial_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if initial_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 initial_content = ""
         
         # Extract URLs from the single-line content (handles multiple URLs on one line)
@@ -6994,7 +7825,7 @@ class BandcampDownloaderGUI:
         if not text or not text.strip():
             return 0
         # Skip placeholder text
-        if text.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+        if text.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
             return 0
         # Count occurrences of 'bandcamp.com' (case-insensitive)
         text_lower = text.lower()
@@ -7795,7 +8626,7 @@ class BandcampDownloaderGUI:
             self._tag_overlay_show_timer = None
         
         # Hide any existing overlay immediately (no fade when switching)
-        # First cancel any fade-out animation that might be running
+        # First cancel any fade-out or fade-in animation that might be running
         old_overlay = self.url_tag_overlay
         if old_overlay:
             # Cancel any pending timers
@@ -7805,6 +8636,13 @@ class BandcampDownloaderGUI:
                 except:
                     pass
                 self._overlay_fade_timer = None
+            
+            # Cancel any fade-in timer
+            if hasattr(old_overlay, '_fade_in_timer'):
+                try:
+                    old_overlay.after_cancel(old_overlay._fade_in_timer)
+                except:
+                    pass
             
             # Immediately destroy old overlay
             try:
@@ -8001,7 +8839,14 @@ class BandcampDownloaderGUI:
         # Delete button - inherit tag colors
         # Using ✕ (multiplication x) for delete
         def delete_handler(e):
+            # Check if this will be the last URL before deleting
+            will_be_last = len(self.url_tag_mapping) == 1
             self._delete_tag(tag_id)
+            # If this was the last URL, immediately start unfocus process
+            # (unfocus will also be scheduled in _delete_tag, but this helps ensure it happens)
+            if will_be_last:
+                # Immediately try to unfocus to prevent button click from refocusing text widget
+                self.root.after(0, lambda: self.root.focus_force())
             return "break"  # Stop event propagation
         delete_btn = Button(button_frame, text="✕", font=("Segoe UI", 11),
                            bg=tag_bg, fg=tag_fg, relief='flat', bd=0,
@@ -8038,11 +8883,85 @@ class BandcampDownloaderGUI:
         
         overlay.geometry(f"{overlay_width}x{overlay_height}+{overlay_x}+{overlay_y}")
         
-        # No transparency - overlay should look like part of the tag
-        
-        # Store overlay reference
+        # Store overlay reference before fade-in
         self.url_tag_overlay = overlay
         self.url_tag_overlay_tag_id = tag_id
+        
+        # Fade in overlay after it's fully rendered to prevent pop-in on slower systems
+        def fade_in_overlay():
+            try:
+                # Check if overlay still exists and is still for this tag
+                if not overlay.winfo_exists() or self.url_tag_overlay_tag_id != tag_id:
+                    return
+                
+                # Check if alpha/opacity is supported
+                try:
+                    # Set alpha to 0 BEFORE showing to eliminate initial flicker
+                    overlay.attributes('-alpha', 0.0)
+                    alpha_supported = True
+                except (TclError, AttributeError):
+                    # Alpha not supported, just show normally
+                    alpha_supported = False
+                
+                if alpha_supported:
+                    # Show the overlay while still transparent (no flicker)
+                    overlay.deiconify()
+                    # Ensure overlay is fully rendered before starting fade
+                    overlay.update_idletasks()
+                    
+                    # Fade in over 100ms with ease-in curve (quick, snappy fade for responsiveness)
+                    fade_steps = 10
+                    fade_duration_ms = 100
+                    step_delay = max(1, fade_duration_ms // fade_steps)
+                    step = 0
+                    
+                    def fade_step():
+                        nonlocal step
+                        try:
+                            # Check if overlay still exists and is still for this tag
+                            if not overlay.winfo_exists() or self.url_tag_overlay_tag_id != tag_id:
+                                return
+                            
+                            step += 1
+                            # Ease-in quadratic: progress^2
+                            progress = step / fade_steps
+                            eased_progress = progress * progress
+                            current_opacity = min(1.0, eased_progress)
+                            
+                            if step >= fade_steps:
+                                # Final step - ensure fully opaque
+                                overlay.attributes('-alpha', 1.0)
+                                overlay.update_idletasks()
+                            else:
+                                overlay.attributes('-alpha', current_opacity)
+                                # Continue fade
+                                overlay.after(step_delay, fade_step)
+                        except (TclError, RuntimeError):
+                            # Overlay may have been closed, just ensure it's visible
+                            try:
+                                overlay.attributes('-alpha', 1.0)
+                            except Exception:
+                                pass
+                    
+                    # Start fade-in after a small delay to ensure rendering is complete
+                    fade_timer = overlay.after(10, fade_step)
+                    overlay._fade_in_timer = fade_timer  # Store timer so we can cancel if needed
+                else:
+                    # Alpha not supported - just show normally
+                    overlay.deiconify()
+                    overlay.update_idletasks()
+            except Exception:
+                # Fallback: just show the overlay normally
+                try:
+                    overlay.deiconify()
+                    overlay.update_idletasks()
+                except:
+                    pass
+        
+        # Initially hide overlay, then fade it in after rendering
+        overlay.withdraw()
+        # Wait for full rendering, then fade in
+        overlay.after_idle(fade_in_overlay)
         
         # Keep overlay visible when hovering over it - prevent flickering
         def keep_overlay_visible(e):
@@ -8143,11 +9062,23 @@ class BandcampDownloaderGUI:
         
         # Hide overlay when clicking outside or when tag scrolls out of view
         def hide_on_click(event):
+            # Fast path: if overlay is not active, do nothing at all
+            if not self.url_tag_overlay or self.url_tag_overlay_tag_id != tag_id:
+                return None  # Allow event to propagate normally
+            
+            # Only hide if clicking outside the overlay
             if event.widget != overlay and event.widget not in overlay.winfo_children():
-                self._hide_tag_overlay(None)
+                # Schedule hide in next event loop iteration to avoid blocking current event
+                self.root.after_idle(lambda: self._hide_tag_overlay(None) if (self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id) else None)
+            return None  # Explicitly return None to allow event propagation
+        
+        # Store root binding so we can remove it later
+        if not hasattr(self, '_overlay_root_bindings'):
+            self._overlay_root_bindings = []
         
         # Bind to root for clicks outside
-        self.root.bind("<Button-1>", hide_on_click, add='+')
+        binding_id_root = self.root.bind("<Button-1>", hide_on_click, add='+')
+        self._overlay_root_bindings.append(('root', '<Button-1>', binding_id_root, hide_on_click, tag_id))
         
         # Monitor scrolling
         def check_scroll(*args):
@@ -8160,14 +9091,51 @@ class BandcampDownloaderGUI:
                 except:
                     self._hide_tag_overlay(None)
         
-        text_widget.bind("<Button-1>", lambda e: self._hide_tag_overlay(None), add='+')
-        text_widget.bind("<Key>", lambda e: self._hide_tag_overlay(None), add='+')
+        # Create handler functions that check if overlay is still active before hiding
+        # These handlers must NOT block event propagation - they should return None
+        # Make them completely no-ops when overlay is not active to avoid any interference
+        def hide_overlay_on_click(e):
+            # Fast path: if overlay is not active, do nothing at all
+            if not self.url_tag_overlay or self.url_tag_overlay_tag_id != tag_id:
+                return None  # Allow event to propagate normally
+            
+            # Only hide if this overlay is still the active one
+            # Schedule hide in next event loop iteration to avoid blocking current event
+            self.root.after_idle(lambda: self._hide_tag_overlay(None) if (self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id) else None)
+            return None  # Explicitly return None to allow event propagation
+        
+        def hide_overlay_on_key(e):
+            # Fast path: if overlay is not active, do nothing at all
+            if not self.url_tag_overlay or self.url_tag_overlay_tag_id != tag_id:
+                return None  # Allow event to propagate normally
+            
+            # Only hide if this overlay is still the active one
+            # Schedule hide in next event loop iteration to avoid blocking current event
+            self.root.after_idle(lambda: self._hide_tag_overlay(None) if (self.url_tag_overlay and self.url_tag_overlay_tag_id == tag_id) else None)
+            return None  # Explicitly return None to allow event propagation
+        
+        # Store binding info for cleanup
+        if not hasattr(self, '_overlay_text_bindings'):
+            self._overlay_text_bindings = []
+        
+        # Store the handler functions and tag_id so we can identify and remove them later
+        binding_id_1 = text_widget.bind("<Button-1>", hide_overlay_on_click, add='+')
+        binding_id_2 = text_widget.bind("<Key>", hide_overlay_on_key, add='+')
+        self._overlay_text_bindings.append(('text', '<Button-1>', binding_id_1, hide_overlay_on_click, tag_id))
+        self._overlay_text_bindings.append(('text', '<Key>', binding_id_2, hide_overlay_on_key, tag_id))
     
     def _hide_tag_overlay(self, tag_id):
         """Hide hover overlay for URL tag with fade-out."""
+        # Early return if overlay is already hidden - prevents unnecessary work
+        if not self.url_tag_overlay:
+            return
+        
         # Only hide if tag_id matches or is None (force hide)
         if tag_id is not None and self.url_tag_overlay_tag_id != tag_id:
             return  # Different tag, don't hide
+        
+        # Store the tag_id we're hiding before clearing it
+        hiding_tag_id = self.url_tag_overlay_tag_id
         
         # Cancel any pending timers
         if hasattr(self, '_overlay_hide_timer') and self._overlay_hide_timer:
@@ -8183,6 +9151,35 @@ class BandcampDownloaderGUI:
             except:
                 pass
             self._tag_overlay_show_timer = None
+        
+        # Remove event bindings that were added when overlay was shown
+        # This prevents them from interfering with URL checking after overlay is hidden
+        if hasattr(self, '_overlay_text_bindings') and self._overlay_text_bindings:
+            text_widget = self.url_text_widget
+            if text_widget:
+                # Remove bindings for this specific tag_id
+                bindings_to_remove = []
+                for binding_info in self._overlay_text_bindings[:]:
+                    if len(binding_info) >= 5 and binding_info[4] == self.url_tag_overlay_tag_id:
+                        bindings_to_remove.append(binding_info)
+                
+                # Try to unbind - Tkinter doesn't support removing specific bindings easily,
+                # but we can try to unbind the event and rebind without our handler
+                # Actually, the safest approach is to just remove from our tracking list
+                # The handlers already check overlay state, so they're safe
+                for binding_info in bindings_to_remove:
+                    self._overlay_text_bindings.remove(binding_info)
+        
+        # Remove root bindings for this specific tag_id
+        if hasattr(self, '_overlay_root_bindings') and self._overlay_root_bindings:
+            # Remove bindings for this specific tag_id
+            bindings_to_remove = []
+            for binding_info in self._overlay_root_bindings[:]:
+                if len(binding_info) >= 5 and binding_info[4] == self.url_tag_overlay_tag_id:
+                    bindings_to_remove.append(binding_info)
+            
+            for binding_info in bindings_to_remove:
+                self._overlay_root_bindings.remove(binding_info)
         
         if self.url_tag_overlay:
             overlay = self.url_tag_overlay
@@ -8210,6 +9207,9 @@ class BandcampDownloaderGUI:
                     if self.url_tag_overlay == overlay:
                         self.url_tag_overlay = None
                         self.url_tag_overlay_tag_id = None
+                        # Ensure URL checking can continue after overlay is hidden
+                        # Trigger a check to ensure preview updates if URL field has content
+                        self.root.after_idle(self._ensure_url_check_continues)
                     self._overlay_fade_timer = None
                     return
                 
@@ -8222,9 +9222,41 @@ class BandcampDownloaderGUI:
                     if self.url_tag_overlay == overlay:
                         self.url_tag_overlay = None
                         self.url_tag_overlay_tag_id = None
+                        # Ensure URL checking can continue after overlay is hidden
+                        # Trigger a check to ensure preview updates if URL field has content
+                        self.root.after_idle(self._ensure_url_check_continues)
                     self._overlay_fade_timer = None
             
             self._overlay_fade_timer = self.root.after(15, lambda: fade_out(0, 8))
+    
+    def _ensure_url_check_continues(self):
+        """Ensure URL checking mechanism continues after overlay is hidden.
+        
+        This method is called after the overlay is hidden to ensure that URL checking
+        and preview updates continue to work normally. It checks if there's content
+        in the URL field and triggers a check if needed.
+        """
+        # Check if URL field has content
+        if self.url_text_widget and self.url_text_widget.winfo_viewable():
+            content = self.url_text_widget.get(1.0, END).strip()
+        elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+            content = self.url_var.get().strip()
+            # Skip placeholder text
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+                content = ""
+        else:
+            content = ""
+        
+        # If there's content, ensure URL check runs (it should already be scheduled, but this ensures it)
+        if content:
+            # Cancel any pending timer and schedule a fresh check
+            if self.url_check_timer:
+                try:
+                    self.root.after_cancel(self.url_check_timer)
+                except:
+                    pass
+            # Schedule URL check with normal debounce
+            self.url_check_timer = self.root.after(200, self._check_url)
     
     def _open_tag_in_browser(self, tag_id):
         """Open tag URL in default web browser."""
@@ -8298,13 +9330,33 @@ class BandcampDownloaderGUI:
         
         # Create metadata dialog
         dialog = Toplevel(self.root)
-        dialog.title("Metadata")
+        # Hide dialog initially to prevent flicker (will be shown with fade-in)
+        dialog.withdraw()
+        
+        dialog.title(" Metadata")
         dialog.transient(self.root)
         dialog.grab_set()
+        
+        # Set dialog size (user-specified dimensions)
+        dialog.geometry("500x350")  # Fixed width and height
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 250
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 175
+        dialog.geometry(f"500x350+{x}+{y}")
         
         # Apply theme
         colors = self.theme_colors
         dialog.configure(bg=colors.bg)
+        
+        # Intercept close events to use fade-out
+        def on_dialog_close():
+            self._close_dialog_with_fade(dialog)
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+        
+        # Show dialog with fade-in effect
+        self._show_dialog_with_fade(dialog)
         
         # Create scrollable text widget for metadata
         frame = Frame(dialog, bg=colors.bg)
@@ -8361,14 +9413,144 @@ class BandcampDownloaderGUI:
         
         url_text.bind("<Button-1>", copy_url_on_click)
         
-        # Metadata content
-        metadata_label = Label(frame, text="Metadata:", bg=colors.bg, fg=colors.fg, font=("Segoe UI", 9, "bold"))
-        metadata_label.pack(anchor=W, pady=(0, 5))
+        # Metadata content row: label with eye icon (when artwork hidden), then horizontal container for metadata text and artwork panel
+        metadata_label_row = Frame(frame, bg=colors.bg)
+        metadata_label_row.pack(fill=X, pady=(0, 5))
         
-        metadata_text = scrolledtext.ScrolledText(frame, wrap=WORD, bg=colors.entry_bg, fg=colors.entry_fg,
-                                                 font=("Segoe UI", 9), relief='flat', bd=1, height=12,
-                                                 highlightthickness=1, highlightcolor=colors.accent, highlightbackground=colors.border)
-        metadata_text.pack(fill=BOTH, expand=True, pady=(0, 10))
+        metadata_label = Label(metadata_label_row, text="Metadata:", bg=colors.bg, fg=colors.fg, font=("Segoe UI", 9, "bold"))
+        metadata_label.pack(side=LEFT)
+        
+        # Eye icon button (shown when artwork is hidden, like main interface)
+        eye_icon = self._get_icon('eye')
+        eye_font = ("Webdings", 12) if self._is_windows_7() else ("Segoe UI", 10)
+        show_artwork_btn = Label(
+            metadata_label_row,
+            text=eye_icon,
+            font=eye_font,
+            bg=colors.bg,
+            fg=colors.disabled_fg,
+            cursor='hand2',
+            width=2
+        )
+        show_artwork_btn.pack(side=RIGHT)  # Always visible (same as main interface)
+        
+        # Horizontal container for metadata text and artwork panel (same row, like main interface)
+        metadata_row = Frame(frame, bg=colors.bg)
+        metadata_row.pack(fill=BOTH, expand=True, pady=(0, 10))
+        metadata_row.columnconfigure(0, weight=1)  # Metadata text expands
+        metadata_row.columnconfigure(1, weight=0)   # Artwork panel fixed width
+        
+        # Metadata text field (left side, expands when artwork is hidden)
+        # Use Text widget with separate ttk.Scrollbar (like URL field) for proper styling
+        metadata_text_frame = Frame(metadata_row, bg=colors.bg)
+        metadata_text_frame.grid(row=0, column=0, sticky=(W, E, N, S), padx=(0, 6))
+        metadata_text_frame.columnconfigure(0, weight=1)
+        metadata_text_frame.columnconfigure(1, weight=0)
+        metadata_text_frame.rowconfigure(0, weight=1)
+        metadata_row.rowconfigure(0, weight=1)
+        
+        metadata_text = Text(
+            metadata_text_frame,
+            wrap=WORD,
+            bg=colors.entry_bg,
+            fg=colors.entry_fg,
+            font=("Segoe UI", 9),
+            relief='flat',
+            borderwidth=1,
+            highlightthickness=1,
+            highlightcolor=colors.accent,
+            highlightbackground=colors.border,
+            height=12
+        )
+        metadata_text.grid(row=0, column=0, sticky=(W, E, N, S))
+        
+        # Dark themed vertical scrollbar bound to the Text widget (match main interface)
+        # Scrollbar: use default style in light mode, custom dark style in dark mode
+        scrollbar_style = 'TScrollbar' if self.current_theme == 'light' else 'Dark.Vertical.TScrollbar'
+        metadata_scrollbar = ttk.Scrollbar(
+            metadata_text_frame,
+            orient='vertical',
+            style='TScrollbar',  # Start with base style
+            command=metadata_text.yview
+        )
+        metadata_scrollbar.grid(row=0, column=1, sticky=(N, S))
+        metadata_text.configure(yscrollcommand=metadata_scrollbar.set)
+        # Apply the correct style after creation (ensures proper initialization)
+        if scrollbar_style != 'TScrollbar':
+            dialog.update_idletasks()  # Force update
+            metadata_scrollbar.configure(style=scrollbar_style)
+        
+        # Artwork panel (right side, same size as main interface: 170x170 frame, 168x168 canvas)
+        # Frame background: dark mode uses bg, light mode uses select_bg (white)
+        album_art_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        artwork_frame = Frame(metadata_row, bg=album_art_bg, relief='flat', bd=0, highlightbackground=colors.border, highlightthickness=1)
+        artwork_frame.grid(row=0, column=1, sticky=(N, S), padx=0)
+        artwork_frame.grid_propagate(False)
+        artwork_frame.config(width=170, height=170)  # Same size as main interface
+        artwork_frame.columnconfigure(0, weight=1)
+        artwork_frame.rowconfigure(0, weight=1)
+        
+        # Artwork canvas - same size as main interface (168x168)
+        canvas_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+        artwork_canvas = Canvas(
+            artwork_frame,
+            width=168,
+            height=168,
+            bg=canvas_bg,
+            highlightthickness=0,
+            borderwidth=0,
+            cursor='hand2'  # Show hand cursor to indicate it's clickable
+        )
+        artwork_canvas.grid(row=0, column=0, padx=1, pady=1, sticky=(N, S, E, W))
+        
+        # Placeholder text on canvas (centered)
+        artwork_canvas.create_text(
+            84, 84,
+            text="Album Art",
+            fill=colors.disabled_fg,
+            font=("Segoe UI", 8)
+        )
+        
+        # Initialize unified artwork list system for this dialog (same as main interface)
+        dialog._artwork_list = []  # List of all artwork URLs: [album_art, *extra_artwork, bio_pic]
+        dialog._artwork_index = 0  # Current index in artwork_list
+        dialog._artwork_visible = True  # Whether artwork panel is visible
+        
+        # Show/hide artwork function (eye icon only)
+        def toggle_dialog_artwork_visibility():
+            dialog._artwork_visible = not dialog._artwork_visible
+            if dialog._artwork_visible:
+                # Show artwork panel
+                artwork_frame.grid()
+                metadata_text.grid_configure(padx=(0, 6))  # Restore right padding when artwork visible
+                # Display current artwork
+                if dialog._artwork_list:
+                    self._display_dialog_artwork_at_index(dialog, artwork_canvas, dialog._artwork_index, url, normalized_url, colors)
+            else:
+                # Hide artwork panel
+                artwork_frame.grid_remove()
+                metadata_text.grid_configure(padx=(0, 0))  # Remove right padding when artwork hidden
+        
+        # Cycle artwork function (canvas click only)
+        def cycle_dialog_artwork():
+            # Only cycle if artwork is visible
+            if not dialog._artwork_visible:
+                return
+            # Build artwork list if empty
+            if not dialog._artwork_list:
+                self._build_dialog_artwork_list(dialog, url, normalized_url)
+            # Cycle to next artwork
+            if dialog._artwork_list:
+                dialog._artwork_index = (dialog._artwork_index + 1) % len(dialog._artwork_list)
+                self._display_dialog_artwork_at_index(dialog, artwork_canvas, dialog._artwork_index, url, normalized_url, colors)
+        
+        # Bind eye icon button (show/hide only)
+        show_artwork_btn.bind("<Button-1>", lambda e: toggle_dialog_artwork_visibility())
+        show_artwork_btn.bind("<Enter>", lambda e: show_artwork_btn.config(fg=colors.hover_fg))
+        show_artwork_btn.bind("<Leave>", lambda e: show_artwork_btn.config(fg=colors.disabled_fg))
+        
+        # Make canvas clickable to cycle artwork (only when visible)
+        artwork_canvas.bind("<Button-1>", lambda e: cycle_dialog_artwork())
         
         # Format and display metadata - show all available fields
         metadata_content = ""
@@ -8501,6 +9683,8 @@ class BandcampDownloaderGUI:
                         "referer": "https://bandcamp.com/",
                     }
                     
+                    # Ensure yt-dlp is loaded (lazy import)
+                    yt_dlp = self._ensure_ytdlp_loaded()
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                     
@@ -8605,21 +9789,679 @@ class BandcampDownloaderGUI:
         extract_btn.pack(side=LEFT, padx=(0, 10))
         
         # Close button
-        close_btn = Button(button_row, text="Close", command=dialog.destroy,
+        close_btn = Button(button_row, text="Close", command=lambda: self._close_dialog_with_fade(dialog),
                           bg=colors.select_bg, fg=colors.fg, relief='flat', bd=0,
                           padx=15, pady=5, cursor='hand2', font=("Segoe UI", 9),
                           activebackground=colors.hover_bg, activeforeground=colors.fg)
         close_btn.pack(side=RIGHT)
         
-        # Center dialog
+        # Center dialog (keep fixed size: 500x350)
         dialog.update_idletasks()
-        dialog_width = dialog.winfo_width()
-        dialog_height = dialog.winfo_height()
+        dialog_width = 500  # Fixed width
+        dialog_height = 350  # Fixed height
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         x = (screen_width // 2) - (dialog_width // 2)
         y = (screen_height // 2) - (dialog_height // 2)
         dialog.geometry(f"{dialog_width}x{dialog_height}+{x}+{y}")
+        
+        # Fetch and display artwork for this tag's URL (if available)
+        # Use cached metadata if available for faster loading
+        thumbnail_url = metadata.get('thumbnail_url') or metadata.get('thumbnail')
+        bio_pic_url = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+        
+        # Build artwork list and display initial artwork (album art at index 0)
+        if thumbnail_url or bio_pic_url:
+            # We have some artwork URLs, build the list and display
+            self._build_dialog_artwork_list(dialog, url, normalized_url, metadata)
+            if dialog._artwork_list:
+                dialog._artwork_index = 0
+                self._display_dialog_artwork_at_index(dialog, artwork_canvas, 0, url, normalized_url, colors)
+        else:
+            # Try to fetch metadata and artwork from URL if not in cache
+            self._fetch_metadata_and_artwork_for_dialog(dialog, artwork_canvas, url, normalized_url, colors)
+    
+    def _fetch_and_display_dialog_album_art(self, dialog, canvas, url, normalized_url, colors, artwork_mode):
+        """Fetch and display album art in metadata dialog."""
+        # Get metadata from cache
+        metadata = self.url_tag_metadata_cache.get(normalized_url, {})
+        if not metadata:
+            metadata = self.url_metadata_cache.get(normalized_url, {})
+        
+        thumbnail_url = metadata.get('thumbnail_url') or metadata.get('thumbnail')
+        
+        # If not in cache, try to extract from URL (this should have been done already, but double-check)
+        if not thumbnail_url:
+            # This function should only be called when thumbnail_url exists
+            # If it doesn't, the caller should have called _fetch_metadata_and_artwork_for_dialog first
+            return
+        
+        # Call the display function with the thumbnail URL
+        self._fetch_and_display_dialog_album_art_with_url(dialog, canvas, thumbnail_url, colors, artwork_mode)
+    
+    def _fetch_and_display_dialog_album_art_with_url(self, dialog, canvas, thumbnail_url, colors, artwork_mode):
+        """Fetch and display album art in metadata dialog using provided thumbnail URL."""
+        def download_and_display():
+            try:
+                import io
+                # Ensure PIL is loaded (lazy import)
+                Image, ImageTk = self._ensure_pil_loaded()
+                if Image is None or ImageTk is None:
+                    return
+                
+                # Check if we have a preloaded image (faster display)
+                img = None
+                if hasattr(dialog, '_preloaded_album_art') and dialog._preloaded_album_art.get('url') == thumbnail_url:
+                    img = dialog._preloaded_album_art.get('image')
+                
+                # If not preloaded, download now
+                if img is None:
+                    # Download the image with retry logic
+                    image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
+                    
+                    # Open and resize image
+                    img = Image.open(io.BytesIO(image_data))
+                    img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                
+                # Convert to PhotoImage
+                photo = ImageTk.PhotoImage(img)
+                
+                # Update UI on main thread
+                def update_ui():
+                    if not dialog.winfo_exists():
+                        return
+                    
+                    # Display regardless of mode (unified artwork list system)
+                    
+                    # Clear canvas
+                    canvas.delete("all")
+                    
+                    # Create blurred background if image doesn't fill the canvas
+                    blurred_bg = self._create_blurred_background(img)
+                    if blurred_bg:
+                        canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                    
+                    # Display image centered
+                    canvas.create_image(84, 84, image=photo, anchor='center')
+                    
+                    # Keep reference to prevent garbage collection
+                    if not hasattr(dialog, '_artwork_image_ref'):
+                        dialog._artwork_image_ref = []
+                    dialog._artwork_image_ref.append(photo)
+                    if blurred_bg:
+                        dialog._artwork_image_ref.append(blurred_bg)
+                
+                dialog.after(0, update_ui)
+                
+            except Exception:
+                # Failed to load - show placeholder
+                def show_error():
+                    if dialog.winfo_exists() and dialog._artwork_visible:
+                        canvas.create_text(
+                            84, 84, text="Artwork\n\nFailed to load",
+                            fill=colors.disabled_fg, font=("Segoe UI", 8), justify='center'
+                        )
+                dialog.after(0, show_error)
+        
+        # Download in background thread
+        threading.Thread(target=download_and_display, daemon=True).start()
+    
+    def _fetch_and_display_dialog_bio_pic(self, dialog, canvas, url, normalized_url, colors, artwork_mode):
+        """Fetch and display bio pic in metadata dialog."""
+        # Get metadata from cache
+        metadata = self.url_tag_metadata_cache.get(normalized_url, {})
+        if not metadata:
+            metadata = self.url_metadata_cache.get(normalized_url, {})
+        
+        bio_pic_url = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+        
+        # If not in cache, try to extract from HTML
+        if not bio_pic_url:
+            # Try to extract bio pic URL from HTML (similar to thumbnail extraction)
+            self._fetch_bio_pic_and_display_for_dialog(dialog, canvas, url, normalized_url, colors)
+            return
+        
+        # Update dialog and rebuild artwork list
+        dialog._bio_pic_url = bio_pic_url
+        self._build_and_display_dialog_artwork(dialog, canvas, url, normalized_url, colors)
+    
+    def _fetch_metadata_and_artwork_for_dialog(self, dialog, canvas, url, normalized_url, colors):
+        """Fetch metadata and artwork from URL if not in cache."""
+        def fetch_metadata():
+            try:
+                # Use same HTML extraction method as main interface (regex-based, more reliable)
+                import urllib.request
+                import re
+                from urllib.parse import urlparse
+                
+                # Create request with proper headers
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                })
+                
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    html_content = response.read().decode('utf-8', errors='ignore')
+                
+                # Extract thumbnail, bio pic, and extra artwork (same as main interface)
+                thumbnail_url = None
+                bio_pic_url = None
+                
+                # Look for album art using same patterns as main interface
+                patterns = [
+                    r'popupImage["\']?\s*:\s*["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'data-popup-image=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<img[^>]*id=["\']tralbum-art["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<img[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'property=["\']og:image["\'][^>]*content=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, html_content, re.IGNORECASE)
+                    if match:
+                        thumbnail_url = match.group(1)
+                        # Make sure it's a full URL
+                        if thumbnail_url.startswith('//'):
+                            thumbnail_url = 'https:' + thumbnail_url
+                        elif thumbnail_url.startswith('/'):
+                            parsed = urlparse(url)
+                            thumbnail_url = f"{parsed.scheme}://{parsed.netloc}{thumbnail_url}"
+                        break
+                
+                # Look for bio pic
+                bio_pic_patterns = [
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
+                ]
+                
+                for pattern in bio_pic_patterns:
+                    match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        bio_pic_url = match.group(1)
+                        if bio_pic_url.startswith('//'):
+                            bio_pic_url = 'https:' + bio_pic_url
+                        elif bio_pic_url.startswith('/'):
+                            parsed = urlparse(url)
+                            bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                        break
+                
+                # If bio pic not found, try bio-container more broadly
+                if not bio_pic_url:
+                    bio_container_match = re.search(r'<div[^>]*id=["\']bio-container["\'][^>]*>(.*?)</div>', html_content, re.IGNORECASE | re.DOTALL)
+                    if bio_container_match:
+                        bio_content = bio_container_match.group(1)
+                        img_match = re.search(r'(?:href|src)=["\']([^"\']+\.(jpg|jpeg|png|webp))', bio_content, re.IGNORECASE)
+                        if img_match:
+                            bio_pic_url = img_match.group(1)
+                            if bio_pic_url.startswith('//'):
+                                bio_pic_url = 'https:' + bio_pic_url
+                            elif bio_pic_url.startswith('/'):
+                                parsed = urlparse(url)
+                                bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                
+                # Upgrade URLs to higher quality (same as main interface)
+                high_quality_thumbnail = thumbnail_url
+                if thumbnail_url and ('_' in thumbnail_url or 'bcbits.com' in thumbnail_url):
+                    for size in ['_500', '_300', '_200', '_100', '_64']:
+                        if size in thumbnail_url:
+                            break
+                        test_url = thumbnail_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                        if test_url != thumbnail_url:
+                            high_quality_thumbnail = test_url
+                            break
+                
+                high_quality_bio_pic = bio_pic_url
+                if bio_pic_url and ('_' in bio_pic_url or 'bcbits.com' in bio_pic_url):
+                    for size in ['_500', '_300', '_200', '_100', '_64']:
+                        if size in bio_pic_url:
+                            break
+                        test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                        if test_url != bio_pic_url:
+                            high_quality_bio_pic = test_url
+                            break
+                
+                # Extract extra artwork URLs (popup images)
+                extra_artwork_urls = self._extract_extra_artwork_urls_from_html(
+                    html_content, url, high_quality_thumbnail, high_quality_bio_pic
+                )
+                
+                # Update cache
+                if normalized_url not in self.url_tag_metadata_cache:
+                    self.url_tag_metadata_cache[normalized_url] = {}
+                if high_quality_thumbnail:
+                    self.url_tag_metadata_cache[normalized_url]['thumbnail_url'] = high_quality_thumbnail
+                if high_quality_bio_pic:
+                    self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = high_quality_bio_pic
+                if extra_artwork_urls:
+                    self.url_tag_metadata_cache[normalized_url]['extra_artwork_urls'] = extra_artwork_urls
+                
+                # Build artwork list and display
+                dialog._thumbnail_url = high_quality_thumbnail
+                dialog._bio_pic_url = high_quality_bio_pic
+                dialog._extra_artwork_urls = extra_artwork_urls
+                
+                # Build list and display initial artwork
+                dialog.after(0, lambda: self._build_and_display_dialog_artwork(dialog, canvas, url, normalized_url, colors))
+                
+            except Exception as e:
+                # Failed to fetch - show placeholder (silently fail)
+                pass
+        
+        # Fetch in background thread
+        threading.Thread(target=fetch_metadata, daemon=True).start()
+    
+    def _fetch_bio_pic_and_display_for_dialog(self, dialog, canvas, url, normalized_url, colors):
+        """Fetch bio pic from HTML and display in metadata dialog."""
+        def fetch_bio_pic():
+            try:
+                # Use same HTML extraction method as main interface (regex-based, more reliable)
+                import urllib.request
+                import re
+                
+                # Create request with proper headers
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                })
+                
+                with urllib.request.urlopen(req, timeout=15) as response:
+                    html_content = response.read().decode('utf-8', errors='ignore')
+                
+                # Look for bio pic using same patterns as main interface
+                bio_pic_url = None
+                
+                # Pattern: Look for bio pic in the bio-container section
+                bio_pic_patterns = [
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                    r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
+                ]
+                
+                for pattern in bio_pic_patterns:
+                    match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
+                    if match:
+                        bio_pic_url = match.group(1)
+                        # Make sure it's a full URL
+                        if bio_pic_url.startswith('//'):
+                            bio_pic_url = 'https:' + bio_pic_url
+                        elif bio_pic_url.startswith('/'):
+                            # Extract base URL
+                            from urllib.parse import urlparse
+                            parsed = urlparse(url)
+                            bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                        break
+                
+                # If bio pic not found with popupImage, try finding it in bio-container more broadly
+                if not bio_pic_url:
+                    # Look for bio-container and then find any image within it
+                    bio_container_match = re.search(r'<div[^>]*id=["\']bio-container["\'][^>]*>(.*?)</div>', html_content, re.IGNORECASE | re.DOTALL)
+                    if bio_container_match:
+                        bio_content = bio_container_match.group(1)
+                        # Look for any image URL in the bio container
+                        img_match = re.search(r'(?:href|src)=["\']([^"\']+\.(jpg|jpeg|png|webp))', bio_content, re.IGNORECASE)
+                        if img_match:
+                            bio_pic_url = img_match.group(1)
+                            if bio_pic_url.startswith('//'):
+                                bio_pic_url = 'https:' + bio_pic_url
+                            elif bio_pic_url.startswith('/'):
+                                from urllib.parse import urlparse
+                                parsed = urlparse(url)
+                                bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                
+                # If found, try to get a larger/higher quality size
+                if bio_pic_url:
+                    # Try to get a larger size
+                    high_quality_bio_pic = bio_pic_url
+                    if '_' in bio_pic_url or 'bcbits.com' in bio_pic_url:
+                        # Try common larger sizes (in order of preference)
+                        for size in ['_500', '_300', '_200', '_100', '_64']:
+                            if size in bio_pic_url:
+                                break
+                            # Try replacing smaller sizes with larger ones
+                            test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                            if test_url != bio_pic_url:
+                                high_quality_bio_pic = test_url
+                                break
+                    bio_pic_url = high_quality_bio_pic
+                    
+                    # Update cache
+                    if normalized_url not in self.url_tag_metadata_cache:
+                        self.url_tag_metadata_cache[normalized_url] = {}
+                    self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = bio_pic_url
+                    
+                    # Update dialog attributes and rebuild artwork list
+                    dialog._bio_pic_url = bio_pic_url
+                    dialog.after(0, lambda: self._build_and_display_dialog_artwork(dialog, canvas, url, normalized_url, colors))
+            except Exception as e:
+                # Failed to fetch - show placeholder (silently fail)
+                pass
+        
+        # Fetch in background thread
+        threading.Thread(target=fetch_bio_pic, daemon=True).start()
+    
+    def _fetch_and_display_dialog_bio_pic_with_url(self, dialog, canvas, bio_pic_url, colors, artwork_mode):
+        """Fetch and display bio pic in metadata dialog using provided bio pic URL."""
+        def download_and_display():
+            try:
+                import io
+                # Ensure PIL is loaded (lazy import)
+                Image, ImageTk = self._ensure_pil_loaded()
+                if Image is None or ImageTk is None:
+                    return
+                
+                # Check if we have a preloaded image (faster display)
+                img = None
+                if hasattr(dialog, '_preloaded_bio_pic') and dialog._preloaded_bio_pic.get('url') == bio_pic_url:
+                    img = dialog._preloaded_bio_pic.get('image')
+                
+                # If not preloaded, download now
+                if img is None:
+                    # Download the image with retry logic
+                    image_data = self._fetch_with_retry(bio_pic_url, max_retries=3, timeout=15)
+                    
+                    # Open and resize image
+                    img = Image.open(io.BytesIO(image_data))
+                    img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                
+                # Convert to PhotoImage
+                photo = ImageTk.PhotoImage(img)
+                
+                # Update UI on main thread
+                def update_ui():
+                    if not dialog.winfo_exists():
+                        return
+                    
+                    # Check if we're still in bio_pic mode (user might have toggled)
+                    # Display regardless of mode (unified artwork list system)
+                    
+                    # Clear canvas
+                    canvas.delete("all")
+                    
+                    # Create blurred background if image doesn't fill the canvas
+                    blurred_bg = self._create_blurred_background(img)
+                    if blurred_bg:
+                        canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                    
+                    # Display image centered
+                    canvas.create_image(84, 84, image=photo, anchor='center')
+                    
+                    # Keep reference to prevent garbage collection
+                    if not hasattr(dialog, '_artwork_image_ref'):
+                        dialog._artwork_image_ref = []
+                    dialog._artwork_image_ref.append(photo)
+                    if blurred_bg:
+                        dialog._artwork_image_ref.append(blurred_bg)
+                
+                dialog.after(0, update_ui)
+                
+            except Exception:
+                # Failed to load - show placeholder
+                def show_error():
+                    if dialog.winfo_exists() and dialog._artwork_visible:
+                        canvas.create_text(
+                            84, 84, text="Artwork\n\nFailed to load",
+                            fill=colors.disabled_fg, font=("Segoe UI", 8), justify='center'
+                        )
+                dialog.after(0, show_error)
+        
+        # Download in background thread
+        threading.Thread(target=download_and_display, daemon=True).start()
+    
+    def _preload_dialog_bio_pic(self, dialog, canvas, url, normalized_url, colors):
+        """Preload bio pic in background when album art is visible (for faster toggle)."""
+        def preload():
+            try:
+                # Get metadata from cache
+                metadata = self.url_tag_metadata_cache.get(normalized_url, {})
+                if not metadata:
+                    metadata = self.url_metadata_cache.get(normalized_url, {})
+                
+                bio_pic_url = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+                
+                # If not in cache, try to extract from HTML
+                if not bio_pic_url:
+                    # Try to extract bio pic URL from HTML
+                    try:
+                        import urllib.request
+                        import re
+                        
+                        req = urllib.request.Request(url, headers={
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                        })
+                        
+                        with urllib.request.urlopen(req, timeout=15) as response:
+                            html_content = response.read().decode('utf-8', errors='ignore')
+                        
+                        # Look for bio pic using same patterns as main interface
+                        bio_patterns = [
+                            r'<img[^>]*class=["\'][^"]*bio-pic[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                            r'<img[^>]*id=["\']bio-pic["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                            r'data-bio-pic=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                        ]
+                        
+                        for pattern in bio_patterns:
+                            match = re.search(pattern, html_content, re.IGNORECASE)
+                            if match:
+                                bio_pic_url = match.group(1)
+                                if bio_pic_url.startswith('//'):
+                                    bio_pic_url = 'https:' + bio_pic_url
+                                elif bio_pic_url.startswith('/'):
+                                    from urllib.parse import urlparse
+                                    parsed = urlparse(url)
+                                    bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
+                                
+                                # Update cache
+                                if normalized_url not in self.url_tag_metadata_cache:
+                                    self.url_tag_metadata_cache[normalized_url] = {}
+                                self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = bio_pic_url
+                                break
+                    except Exception:
+                        pass  # Silently fail
+                
+                # If we have a bio pic URL, preload it (download but don't display)
+                if bio_pic_url:
+                    try:
+                        import io
+                        Image, ImageTk = self._ensure_pil_loaded()
+                        if Image is None or ImageTk is None:
+                            return
+                        
+                        # Download the image (preload for faster toggle)
+                        image_data = self._fetch_with_retry(bio_pic_url, max_retries=2, timeout=10)
+                        
+                        # Process image (resize, etc.) and store in cache for quick access
+                        img = Image.open(io.BytesIO(image_data))
+                        img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                        
+                        # Store processed image in dialog cache for instant display when toggled
+                        if not hasattr(dialog, '_preloaded_bio_pic'):
+                            dialog._preloaded_bio_pic = {}
+                        dialog._preloaded_bio_pic['image'] = img
+                        dialog._preloaded_bio_pic['url'] = bio_pic_url
+                    except Exception:
+                        pass  # Silently fail - preload is optional
+            except Exception:
+                pass  # Silently fail - preload is optional
+        
+        # Preload in background thread (low priority)
+        threading.Thread(target=preload, daemon=True).start()
+    
+    def _build_dialog_artwork_list(self, dialog, url, normalized_url, metadata=None):
+        """Build unified artwork list for dialog: [album_art, *extra_artwork, bio_pic].
+        
+        Args:
+            dialog: The dialog window
+            url: The URL being processed
+            normalized_url: Normalized URL for cache lookup
+            metadata: Optional metadata dict (if None, will fetch from cache)
+        """
+        if metadata is None:
+            metadata = self.url_tag_metadata_cache.get(normalized_url, {})
+            if not metadata:
+                metadata = self.url_metadata_cache.get(normalized_url, {})
+        
+        # Get URLs from metadata or dialog attributes
+        thumbnail_url = getattr(dialog, '_thumbnail_url', None) or metadata.get('thumbnail_url') or metadata.get('thumbnail')
+        bio_pic_url = getattr(dialog, '_bio_pic_url', None) or metadata.get('bio_pic_url') or metadata.get('bio_pic')
+        extra_artwork_urls = getattr(dialog, '_extra_artwork_urls', None) or metadata.get('extra_artwork_urls', [])
+        
+        dialog._artwork_list = []
+        
+        # Add album art first (index 0) - REQUIRED
+        if thumbnail_url:
+            dialog._artwork_list.append(thumbnail_url)
+        
+        # Normalize URLs for comparison (to handle different size suffixes)
+        normalized_thumbnail = self._normalize_image_url_for_comparison(thumbnail_url) if thumbnail_url else None
+        normalized_bio_pic = self._normalize_image_url_for_comparison(bio_pic_url) if bio_pic_url else None
+        
+        # Add extra artwork URLs (optional)
+        if extra_artwork_urls:
+            for extra_url in extra_artwork_urls:
+                if extra_url in dialog._artwork_list:
+                    continue
+                
+                normalized_extra = self._normalize_image_url_for_comparison(extra_url)
+                if normalized_thumbnail and normalized_extra == normalized_thumbnail:
+                    continue  # Skip - same as album art
+                if normalized_bio_pic and normalized_extra == normalized_bio_pic:
+                    continue  # Skip - same as bio pic
+                
+                normalized_existing = [self._normalize_image_url_for_comparison(u) for u in dialog._artwork_list]
+                if normalized_extra not in normalized_existing:
+                    dialog._artwork_list.append(extra_url)
+        
+        # Add bio pic last (optional)
+        if bio_pic_url:
+            if bio_pic_url not in dialog._artwork_list:
+                normalized_existing = [self._normalize_image_url_for_comparison(u) for u in dialog._artwork_list]
+                if normalized_bio_pic not in normalized_existing:
+                    dialog._artwork_list.append(bio_pic_url)
+    
+    def _build_and_display_dialog_artwork(self, dialog, canvas, url, normalized_url, colors):
+        """Build artwork list and display initial artwork (index 0)."""
+        self._build_dialog_artwork_list(dialog, url, normalized_url)
+        if dialog._artwork_list:
+            dialog._artwork_index = 0
+            self._display_dialog_artwork_at_index(dialog, canvas, 0, url, normalized_url, colors)
+    
+    def _display_dialog_artwork_at_index(self, dialog, canvas, index, url, normalized_url, colors):
+        """Display artwork at specific index from dialog's artwork_list.
+        
+        Args:
+            dialog: The dialog window
+            canvas: Canvas to display on
+            index: Index in artwork_list to display
+            url: The URL being processed
+            normalized_url: Normalized URL for cache lookup
+            colors: Theme colors
+        """
+        if not hasattr(dialog, '_artwork_list') or not dialog._artwork_list:
+            return
+        
+        if index < 0 or index >= len(dialog._artwork_list):
+            return
+        
+        dialog._artwork_index = index
+        artwork_url = dialog._artwork_list[index]
+        
+        # Determine which display function to use based on URL type
+        metadata = self.url_tag_metadata_cache.get(normalized_url, {})
+        if not metadata:
+            metadata = self.url_metadata_cache.get(normalized_url, {})
+        
+        thumbnail_url = metadata.get('thumbnail_url') or metadata.get('thumbnail')
+        bio_pic_url = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+        
+        # Check if this is album art (index 0 and matches thumbnail)
+        if index == 0 and thumbnail_url and artwork_url == thumbnail_url:
+            self._fetch_and_display_dialog_album_art_with_url(dialog, canvas, artwork_url, colors, "album_art")
+        # Check if this is bio pic (matches bio_pic_url)
+        elif bio_pic_url and artwork_url == bio_pic_url:
+            self._fetch_and_display_dialog_bio_pic_with_url(dialog, canvas, artwork_url, colors, "bio_pic")
+        else:
+            # Extra artwork - use album art display function (same format)
+            self._fetch_and_display_dialog_album_art_with_url(dialog, canvas, artwork_url, colors, "extra_art")
+    
+    def _preload_dialog_album_art(self, dialog, canvas, url, normalized_url, colors):
+        """Preload album art in background when bio pic is visible (for faster toggle)."""
+        def preload():
+            try:
+                # Get metadata from cache
+                metadata = self.url_tag_metadata_cache.get(normalized_url, {})
+                if not metadata:
+                    metadata = self.url_metadata_cache.get(normalized_url, {})
+                
+                thumbnail_url = metadata.get('thumbnail_url') or metadata.get('thumbnail')
+                
+                # If not in cache, try to extract from HTML
+                if not thumbnail_url:
+                    # Try to extract thumbnail URL from HTML
+                    try:
+                        import urllib.request
+                        import re
+                        
+                        req = urllib.request.Request(url, headers={
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                        })
+                        
+                        with urllib.request.urlopen(req, timeout=15) as response:
+                            html_content = response.read().decode('utf-8', errors='ignore')
+                        
+                        # Look for album art using same patterns as main interface
+                        patterns = [
+                            r'popupImage["\']?\s*:\s*["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                            r'data-popup-image=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                            r'<img[^>]*id=["\']tralbum-art["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                            r'<img[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                            r'property=["\']og:image["\'][^>]*content=["\']([^"\']+\.(jpg|jpeg|png|webp))',
+                        ]
+                        
+                        for pattern in patterns:
+                            match = re.search(pattern, html_content, re.IGNORECASE)
+                            if match:
+                                thumbnail_url = match.group(1)
+                                if thumbnail_url.startswith('//'):
+                                    thumbnail_url = 'https:' + thumbnail_url
+                                elif thumbnail_url.startswith('/'):
+                                    from urllib.parse import urlparse
+                                    parsed = urlparse(url)
+                                    thumbnail_url = f"{parsed.scheme}://{parsed.netloc}{thumbnail_url}"
+                                
+                                # Update cache
+                                if normalized_url not in self.url_tag_metadata_cache:
+                                    self.url_tag_metadata_cache[normalized_url] = {}
+                                self.url_tag_metadata_cache[normalized_url]['thumbnail_url'] = thumbnail_url
+                                break
+                    except Exception:
+                        pass  # Silently fail
+                
+                # If we have a thumbnail URL, preload it (download but don't display)
+                if thumbnail_url:
+                    try:
+                        import io
+                        Image, ImageTk = self._ensure_pil_loaded()
+                        if Image is None or ImageTk is None:
+                            return
+                        
+                        # Download the image (preload for faster toggle)
+                        image_data = self._fetch_with_retry(thumbnail_url, max_retries=2, timeout=10)
+                        
+                        # Process image (resize, etc.) and store in cache for quick access
+                        img = Image.open(io.BytesIO(image_data))
+                        img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                        
+                        # Store processed image in dialog cache for instant display when toggled
+                        if not hasattr(dialog, '_preloaded_album_art'):
+                            dialog._preloaded_album_art = {}
+                        dialog._preloaded_album_art['image'] = img
+                        dialog._preloaded_album_art['url'] = thumbnail_url
+                    except Exception:
+                        pass  # Silently fail - preload is optional
+            except Exception:
+                pass  # Silently fail - preload is optional
+        
+        # Preload in background thread (low priority)
+        threading.Thread(target=preload, daemon=True).start()
     
     def _update_metadata_dialog(self, dialog, metadata_text, extract_btn, url, colors, error_msg=None, all_metadata=None):
         """Update metadata dialog with comprehensive metadata or error message."""
@@ -8757,16 +10599,21 @@ class BandcampDownloaderGUI:
                     pass
                 self._overlay_fade_timer = None
             
-            # Start fade-out immediately
-            self._hide_tag_overlay(None)
+            # Start fade-out immediately (but don't block - use after_idle to ensure it doesn't interfere)
+            # Schedule hide in next event loop iteration to avoid blocking clipboard operations
+            self.root.after_idle(lambda: self._hide_tag_overlay(None) if (self.url_tag_overlay_tag_id == tag_id) else None)
         
-        # Do clipboard operations after starting fade
+        # Do clipboard operations immediately (before overlay fully hides)
         self.root.clipboard_clear()
         self.root.clipboard_append(url)
         
         # Show "Copied" tooltip if we have position info
         if tooltip_x is not None and tooltip_y is not None:
             self._show_copied_tooltip(tooltip_x, tooltip_y, tag_bg, tag_fg)
+        
+        # Ensure URL checking mechanism isn't blocked
+        # The URL field change handlers will detect new content automatically
+        # No need to manually trigger - the normal event flow will handle it
     
     def _show_copied_tooltip(self, x, y, bg_color=None, fg_color=None):
         """Show a 'Copied' tooltip at the specified position."""
@@ -8960,8 +10807,42 @@ class BandcampDownloaderGUI:
         # We'll inject this into the existing_tag_data in _process_url_tags
         self._pending_tag_restore = adjusted_remaining_tags
         
+        # Check if this was the last URL - if so, clear preview
+        if len(adjusted_remaining_tags) == 0:
+            # This was the last URL - clear preview like Clear All does
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.format_suggestion_shown = False  # Reset format suggestion flag
+            self._reset_artwork_state()
+            self.album_art_fetching = False
+            self.update_preview()
+            self.clear_album_art()
+            # Cancel any pending URL check timer
+            if self.url_check_timer:
+                self.root.after_cancel(self.url_check_timer)
+                self.url_check_timer = None
+            # Immediately check URL to ensure empty state is processed
+            self._check_url()
+            # Unfocus URL field so placeholder text can be seen (same as Clear button)
+            # Use after_idle with a small delay to ensure it happens after all event processing,
+            # overlay hiding, and tag reprocessing complete
+            def unfocus_after_processing():
+                # Update placeholder visibility first to ensure it's shown
+                if self.url_text_widget:
+                    self._update_text_placeholder_visibility()
+                # Force focus to root window to unfocus URL field
+                # Use focus_force() which is more aggressive than focus_set()
+                try:
+                    self.root.focus_force()
+                except:
+                    self.root.focus_set()
+            # Use after_idle plus a small delay to ensure overlay is fully hidden and tag processing is done
+            self.root.after_idle(lambda: self.root.after(100, unfocus_after_processing))
+        
         # Reprocess tags - this will restore the remaining tags using our saved data
         self.root.after(10, self._process_url_tags_with_restore)
+        
+        # Update download button text to reflect new URL count
+        self.root.after(50, self._update_url_count_and_button)
     
     def _paste_from_overlay(self, tag_id):
         """Paste from overlay menu - same as ➕ paste button for convenience/accessibility."""
@@ -9211,6 +11092,24 @@ class BandcampDownloaderGUI:
         except:
             pass
         
+        # Check if this was the last URL - if so, clear preview
+        if len(self.url_tag_mapping) == 0:
+            # This was the last URL - clear preview like Clear All does
+            self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None}
+            self.format_suggestion_shown = False  # Reset format suggestion flag
+            self._reset_artwork_state()
+            self.album_art_fetching = False
+            self.update_preview()
+            self.clear_album_art()
+            # Cancel any pending URL check timer
+            if self.url_check_timer:
+                self.root.after_cancel(self.url_check_timer)
+                self.url_check_timer = None
+            # Immediately check URL to ensure empty state is processed
+            self._check_url()
+            # Unfocus URL field so placeholder text can be seen (same as Clear button)
+            self.root.focus_set()
+        
         # Reprocess tags to update styling and find any new URLs
         self.root.after(50, self._process_url_tags)
         
@@ -9242,25 +11141,10 @@ class BandcampDownloaderGUI:
         return None
     
     def _handle_url_tag_delete(self, event):
-        """Handle delete key - delete entire tag if cursor is in a tag."""
-        if not self.url_text_widget or not self.url_text_widget.winfo_viewable():
-            return None
-        
-        # Process tags first to ensure positions are current
-        # But don't wait - check current positions
-        text_widget = self.url_text_widget
-        cursor_pos = text_widget.index(INSERT)
-        
-        # Check if cursor is inside or at the start of a tag
-        for tag_id, (start, end) in list(self.url_tag_positions.items()):
-            try:
-                if text_widget.compare(cursor_pos, ">=", start) and text_widget.compare(cursor_pos, "<=", end):
-                    # Cursor is inside the tag, delete the entire tag
-                    self._remove_url_tag(tag_id)
-                    return "break"
-            except:
-                pass
-        return None
+        """Handle delete key - silently block deletion in URL field."""
+        # Silently prevent Delete key from working in URL field
+        # Backspace still works for tag deletion via _handle_url_tag_backspace
+        return "break"
     
     def _extract_urls_from_content(self, content):
         """Extract URLs from content string, handling both single and multi-line input.
@@ -9269,16 +11153,30 @@ class BandcampDownloaderGUI:
         if not content or not content.strip():
             return []
         # Skip placeholder text
-        if content.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+        if content.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
             return []
         
         # Check if we have URL tags (tag mapping exists and has entries)
         if self.url_tag_mapping:
             # Reconstruct URLs from tags
             # Extract URLs from tag mapping (these are the full URLs)
+            # IMPORTANT: Preserve order by iterating in tag position order, not dict iteration order
+            # This ensures duplicates appear in the correct order (last one is truly last)
             all_urls = []
-            for tag_id, full_url in self.url_tag_mapping.items():
-                all_urls.append(full_url)
+            # Get all tag positions to sort by position
+            tag_positions_list = []
+            for tag_id, (start_pos, end_pos) in self.url_tag_positions.items():
+                if tag_id in self.url_tag_mapping:
+                    tag_positions_list.append((start_pos, tag_id))
+            
+            # Sort by position (start position in text)
+            tag_positions_list.sort(key=lambda x: x[0])
+            
+            # Add URLs in order of appearance (preserve duplicates for correct last-URL selection)
+            for start_pos, tag_id in tag_positions_list:
+                full_url = self.url_tag_mapping[tag_id]
+                all_urls.append(full_url)  # Append even if duplicate - preserves order for last-URL selection
+            
             # Also check for any non-tagged URLs in content (fallback for URLs that weren't converted)
             # This includes both Bandcamp URLs and potential proxy URLs that redirect to Bandcamp
             import re
@@ -9287,15 +11185,14 @@ class BandcampDownloaderGUI:
             remaining_matches = re.findall(url_pattern, content, re.IGNORECASE)
             for match in remaining_matches:
                 url = match.rstrip(' \t,;')
-                # If it's already a Bandcamp URL, add it
+                # If it's already a Bandcamp URL, add it (even if duplicate - we want to preserve order)
                 if 'bandcamp.com' in url.lower():
-                    if url not in all_urls:
-                        all_urls.append(url)
+                    all_urls.append(url)  # Always append to preserve order, duplicates are okay
                 else:
                     # Try to resolve redirects for non-Bandcamp URLs
                     resolved_url = self._resolve_url_redirects(url)
-                    if resolved_url and resolved_url not in all_urls:
-                        all_urls.append(resolved_url)
+                    if resolved_url:
+                        all_urls.append(resolved_url)  # Always append to preserve order
             return all_urls if all_urls else []
         
         # No tags - use existing extraction logic
@@ -9306,7 +11203,7 @@ class BandcampDownloaderGUI:
         
         for line in lines:
             line = line.strip()
-            if not line or line == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if not line or line == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 continue
             
             # Check if line contains multiple URLs (by counting 'bandcamp.com' or 'https://' patterns)
@@ -9383,11 +11280,11 @@ class BandcampDownloaderGUI:
             if not text_content:
                 return []
             # Skip placeholder text
-            if text_content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if text_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 return []
             # Split by lines and filter out empty lines and placeholder
             urls = [line.strip() for line in text_content.split('\n') 
-                   if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste."]
+                   if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs"]
             return urls
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             # Fallback to Entry widget
@@ -9395,12 +11292,12 @@ class BandcampDownloaderGUI:
             if not content:
                 return []
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 return []
             # Check if it has newlines (shouldn't happen in Entry, but handle it)
             if '\n' in content:
                 urls = [line.strip() for line in content.split('\n') 
-                       if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste."]
+                       if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs"]
                 return urls
             return [content] if content else []
         return []
@@ -9411,7 +11308,7 @@ class BandcampDownloaderGUI:
             return ""
         
         # Remove placeholder text if present
-        if text.strip() == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+        if text.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
             return ""
         
         import re
@@ -9424,7 +11321,7 @@ class BandcampDownloaderGUI:
                 continue
             
             # Skip placeholder text
-            if line == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+            if line == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                 continue
             
             # Check if line contains multiple 'bandcamp.com' occurrences
@@ -9605,25 +11502,23 @@ class BandcampDownloaderGUI:
         
         # Extract URLs using the proper method that handles space-separated URLs
         urls = self._extract_urls_from_content(content)
-        # Remove duplicates to match button counting behavior
+        # Remove duplicates to match button counting behavior (for download count)
         unique_urls = self._remove_duplicate_urls(urls)
-        # Use last URL (most recently pasted) for preview instead of first URL
-        url = unique_urls[-1] if unique_urls else ""
+        # Use last URL from original list (most recently pasted) for preview
+        # This allows preview to update even for duplicates, while duplicates aren't counted for download
+        url = urls[-1] if urls else ""
         
         # Strip whitespace and check if URL is actually empty
         url = url.strip() if url else ""
         
         # Reset metadata if URL is empty or just whitespace
-        if not url or url == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+        if not url or url == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
             # Cancel any in-flight artwork fetches
             self.artwork_fetch_id += 1
             self.current_url_being_processed = None
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self.format_suggestion_shown = False  # Reset format suggestion flag
-            self.current_thumbnail_url = None
-            self.current_bio_pic_url = None
-            self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
-            self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
+            self._reset_artwork_state()
             self.album_art_fetching = False
             # Clear split album detection state to reset preview formatting
             if hasattr(self, 'download_info'):
@@ -9645,19 +11540,123 @@ class BandcampDownloaderGUI:
         if "bandcamp.com" not in url.lower() and not url.startswith(("http://", "https://")):
             return
         
-        # Only cancel artwork fetches if the URL actually changed
-        # This prevents cancelling valid fetches when _check_url is called multiple times for the same URL
-        if self.current_url_being_processed != url:
+        # Always update current_url_being_processed to the last URL (even if duplicate)
+        # This ensures preview updates when duplicate URLs are pasted
+        # Normalize URLs for comparison to handle trailing slashes and other variations
+        def normalize_for_comparison(u):
+            if not u:
+                return ""
+            u = u.strip().rstrip('/').lower()
+            if not u.startswith(('http://', 'https://')):
+                u = 'https://' + u
+            return u.rstrip('/')
+        
+        normalized_current = normalize_for_comparison(self.current_url_being_processed) if self.current_url_being_processed else ""
+        normalized_new = normalize_for_comparison(url)
+        url_changed = (normalized_current != normalized_new)
+        
+        if url_changed:
             # URL changed - cancel any in-flight artwork fetches for the old URL
             self.artwork_fetch_id += 1
-            self.current_url_being_processed = url
+            # Reset artwork state (will be rebuilt when new URLs are extracted)
+            self.artwork_list = []
+            self.artwork_index = 0
+            self.extra_artwork_urls = []
             self.current_thumbnail_url = None
             self.current_bio_pic_url = None
             self.preloaded_album_art_image = None  # Clear preloaded cache when URL is cleared
             self.preloaded_album_art_pil = None  # Clear preloaded PIL image cache
             self.album_art_fetching = False
+        else:
+            # Even if URL is the same (duplicate), increment fetch_id to force fresh fetch
+            # This ensures preview updates when duplicate URLs are pasted
+            self.artwork_fetch_id += 1
         
-        # Fetch metadata in background thread (only for last URL for preview)
+        # Always update current_url_being_processed to ensure preview updates for duplicates
+        # This allows preview to refresh even when the same URL is pasted again
+        self.current_url_being_processed = url
+        
+        # For duplicate URLs, immediately update preview from cache if available
+        # This provides instant feedback while fresh metadata fetches in background
+        if not url_changed:
+            # URL is a duplicate - try to update preview from cache immediately
+            # Use the same normalization as when storing in cache (must match exactly)
+            normalized_url_for_cache = url.rstrip(' \t,;')
+            if not normalized_url_for_cache.startswith(('http://', 'https://')):
+                normalized_url_for_cache = 'https://' + normalized_url_for_cache
+            normalized_url_for_cache = normalized_url_for_cache.rstrip('/').lower()
+            
+            # Try all possible normalizations to find cached metadata
+            # (in case the URL was stored with slightly different normalization)
+            cache_keys_to_try = [
+                normalized_url_for_cache,
+                url.rstrip('/').lower(),
+                url.lower(),
+            ]
+            # Also try with/without https prefix
+            if normalized_url_for_cache.startswith('https://'):
+                cache_keys_to_try.append(normalized_url_for_cache.replace('https://', 'http://'))
+            if not normalized_url_for_cache.startswith(('http://', 'https://')):
+                cache_keys_to_try.append('https://' + normalized_url_for_cache)
+                cache_keys_to_try.append('http://' + normalized_url_for_cache)
+            
+            cached_metadata = None
+            cache_key_used = None
+            for cache_key in cache_keys_to_try:
+                if cache_key in self.url_metadata_cache:
+                    cached_metadata = self.url_metadata_cache[cache_key]
+                    cache_key_used = cache_key
+                    break
+            
+            if cached_metadata:
+                # We have cached metadata - update preview immediately
+                # Store the fetch_id and URL at the time we're updating from cache
+                cache_fetch_id = self.artwork_fetch_id
+                cache_url = url  # Store the exact URL string
+                
+                # Update preview immediately with cached data
+                def update_from_cache():
+                    # Double-check that URL hasn't changed and fetch_id hasn't changed
+                    # Compare normalized URLs to handle variations
+                    current_normalized = normalize_for_comparison(self.current_url_being_processed) if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed else ""
+                    cache_url_normalized = normalize_for_comparison(cache_url)
+                    
+                    if (current_normalized == cache_url_normalized and
+                        hasattr(self, 'artwork_fetch_id') and
+                        self.artwork_fetch_id == cache_fetch_id):
+                        self.album_info = {
+                            "artist": cached_metadata.get("artist", "Artist"),
+                            "album": cached_metadata.get("album", "Album"),
+                            "title": "Track",
+                            "thumbnail_url": cached_metadata.get("thumbnail_url"),
+                            "year": cached_metadata.get("year"),
+                            "first_track_title": cached_metadata.get("first_track_title"),
+                            "first_track_number": cached_metadata.get("first_track_number"),
+                            "track_titles": cached_metadata.get("track_titles", []),
+                            "album_artist": cached_metadata.get("album_artist", cached_metadata.get("artist", "Artist"))
+                        }
+                        self.update_preview()
+                        
+                        # Also trigger artwork fetch if we have a thumbnail URL
+                        if cached_metadata.get("thumbnail_url"):
+                            self.current_thumbnail_url = cached_metadata.get("thumbnail_url")
+                            # Reset artwork list to force rebuild
+                            self.artwork_list = []
+                            self.artwork_index = 0
+                            self._build_artwork_list()
+                            if self.artwork_list:
+                                # Double-check URL is still current before displaying (normalized comparison)
+                                current_check = normalize_for_comparison(self.current_url_being_processed) if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed else ""
+                                if current_check == cache_url_normalized:
+                                    self._display_artwork_at_index(0)
+                
+                # Schedule update immediately (use after_idle to ensure it runs after any pending updates)
+                self.root.after_idle(update_from_cache)
+        
+        # Always fetch metadata in background thread (even for duplicates) to ensure preview updates
+        # The fetch_album_metadata function will update the preview when metadata arrives
+        # Pass the current fetch_id so it can check if it's still valid
+        current_fetch_id = self.artwork_fetch_id
         threading.Thread(target=self.fetch_album_metadata, args=(url,), daemon=True).start()
         
         # Also fetch metadata for all other URLs in the field (for tag display)
@@ -9690,7 +11689,8 @@ class BandcampDownloaderGUI:
                     'Referer': 'https://bandcamp.com/',
                 }
                 req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=15) as response:
+                # Increased timeout to 20 seconds for throttled connections
+                with urllib.request.urlopen(req, timeout=20) as response:
                     html_content = response.read().decode('utf-8', errors='ignore')
                 
                 artist = None
@@ -9905,20 +11905,23 @@ class BandcampDownloaderGUI:
                 # Also store in tag metadata cache (only HTML extraction, stage 1)
                 self.url_tag_metadata_cache[normalized_url] = metadata
                 
-                # Update preview immediately if we got data from HTML (for first URL)
+                # Update preview immediately if we got data from HTML
+                # Always update preview, even for duplicate URLs, to ensure it shows the latest URL
                 if artist or album:
-                    self.album_info = {
-                        "artist": artist or "Artist",
-                        "album": album or "Album",
-                        "title": "Track",
-                        "thumbnail_url": None,
-                        "year": year,  # Store year if found
-                        "first_track_title": first_track_title,  # Store first track title if found
-                        "first_track_number": first_track_number,  # Store first track number if found
-                        "track_titles": [first_track_title] if first_track_title else [],  # Store track titles for split album detection
-                        "album_artist": album_artist or artist or "Artist"  # Main album artist
-                    }
-                    self.root.after(0, self.update_preview)
+                    # Check if this URL is still the current one being processed (might have changed if user pasted another URL)
+                    if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                        self.album_info = {
+                            "artist": artist or "Artist",
+                            "album": album or "Album",
+                            "title": "Track",
+                            "thumbnail_url": None,
+                            "year": year,  # Store year if found
+                            "first_track_title": first_track_title,  # Store first track title if found
+                            "first_track_number": first_track_number,  # Store first track number if found
+                            "track_titles": [first_track_title] if first_track_title else [],  # Store track titles for split album detection
+                            "album_artist": album_artist or artist or "Artist"  # Main album artist
+                        }
+                        self.root.after(0, self.update_preview)
                     # Also update Additional Settings dialog preview if open
                     if hasattr(self, '_additional_settings_dialogs'):
                         for dialog_ref in self._additional_settings_dialogs:
@@ -9934,6 +11937,76 @@ class BandcampDownloaderGUI:
                     # Also fetch thumbnail from HTML (fast)
                     self.root.after(50, lambda: self.fetch_thumbnail_from_html(url))
                     
+                    # If HTML extraction didn't find first track title, try to get it quickly
+                    # This is important for preview - we only need the first track
+                    if not first_track_title:
+                        def fetch_first_track_title():
+                            """Quickly fetch just the first track title for preview."""
+                            try:
+                                # Do a quick yt-dlp extraction with extract_flat to get entry URLs
+                                yt_dlp = self._ensure_ytdlp_loaded()
+                                if yt_dlp:
+                                    quick_opts = {
+                                        "quiet": True,
+                                        "no_warnings": True,
+                                        "extract_flat": True,  # Fast - just get structure
+                                        "socket_timeout": 20,
+                                        "retries": 2,
+                                        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                        "referer": "https://bandcamp.com/",
+                                    }
+                                    with yt_dlp.YoutubeDL(quick_opts) as ydl:
+                                        info = ydl.extract_info(url, download=False)
+                                        if info and info.get("entries"):
+                                            entries = [e for e in info.get("entries", []) if e]
+                                            if entries and entries[0].get("url"):
+                                                # Extract first track with full extraction to get title
+                                                track_url = entries[0].get("url")
+                                                track_opts = {
+                                                    "quiet": True,
+                                                    "no_warnings": True,
+                                                    "extract_flat": False,  # Full extraction for title
+                                                    "socket_timeout": 15,  # Quick timeout
+                                                    "retries": 2,
+                                                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                                    "referer": "https://bandcamp.com/",
+                                                }
+                                                with yt_dlp.YoutubeDL(track_opts) as track_ydl:
+                                                    track_info = track_ydl.extract_info(track_url, download=False)
+                                                    if track_info and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                                                        raw_title = track_info.get("title", "")
+                                                        if raw_title:
+                                                            entry_artist = track_info.get("artist") or track_info.get("uploader") or track_info.get("creator")
+                                                            track_title = self._clean_title(raw_title, entry_artist)
+                                                            track_number = track_info.get("track_number") or track_info.get("track")
+                                                            if track_number:
+                                                                try:
+                                                                    if isinstance(track_number, str):
+                                                                        import re
+                                                                        match = re.search(r'(\d+)', str(track_number))
+                                                                        if match:
+                                                                            track_number = int(match.group(1))
+                                                                        else:
+                                                                            track_number = None
+                                                                    elif isinstance(track_number, (int, float)):
+                                                                        track_number = int(track_number)
+                                                                    else:
+                                                                        track_number = None
+                                                                except:
+                                                                    track_number = None
+                                                            
+                                                            # Update album_info with first track title
+                                                            if hasattr(self, 'album_info') and self.album_info:
+                                                                self.album_info["first_track_title"] = track_title
+                                                                if track_number:
+                                                                    self.album_info["first_track_number"] = track_number
+                                                                self.root.after(0, self.update_preview)
+                            except Exception:
+                                pass  # Silently fail - preview will work without track title
+                        
+                        # Fetch first track title in background (non-blocking)
+                        threading.Thread(target=fetch_first_track_title, daemon=True).start()
+                    
                     # Still do yt-dlp extraction in background for more complete data
                     # but don't block on it
                     threading.Thread(target=fetch_from_ytdlp, daemon=True).start()
@@ -9941,8 +12014,8 @@ class BandcampDownloaderGUI:
                     # If HTML extraction failed, use yt-dlp
                     fetch_from_ytdlp()
                     
-            except Exception:
-                # If HTML extraction fails, use yt-dlp
+            except Exception as e:
+                # If HTML extraction fails (timeout, network error, etc.), use yt-dlp
                 fetch_from_ytdlp()
         
         def fetch_from_ytdlp():
@@ -9963,6 +12036,8 @@ class BandcampDownloaderGUI:
                     "referer": "https://bandcamp.com/",
                 }
                 
+                # Ensure yt-dlp is loaded (lazy import)
+                yt_dlp = self._ensure_ytdlp_loaded()
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     
@@ -10116,6 +12191,54 @@ class BandcampDownloaderGUI:
                                 except (ValueError, TypeError):
                                     first_track_number = None
                             
+                            # If extract_flat mode didn't provide track title, try extracting first track URL with full extraction
+                            if not first_track_title and first_entry.get("url"):
+                                try:
+                                    # Do a quick full extraction of just the first track to get its title
+                                    track_url = first_entry.get("url")
+                                    if track_url:
+                                        track_ydl_opts = {
+                                            "quiet": True,
+                                            "no_warnings": True,
+                                            "extract_flat": False,  # Full extraction to get track title
+                                            "socket_timeout": 20,  # Shorter timeout for single track
+                                            "retries": 3,
+                                            "fragment_retries": 3,
+                                            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                            "referer": "https://bandcamp.com/",
+                                        }
+                                        yt_dlp = self._ensure_ytdlp_loaded()
+                                        with yt_dlp.YoutubeDL(track_ydl_opts) as track_ydl:
+                                            track_info = track_ydl.extract_info(track_url, download=False)
+                                            if track_info:
+                                                raw_title = track_info.get("title", "")
+                                                if raw_title:
+                                                    entry_artist = track_info.get("artist") or track_info.get("uploader") or track_info.get("creator") or artist
+                                                    first_track_title = self._clean_title(raw_title, entry_artist)
+                                                    track_titles.append(raw_title)
+                                                    
+                                                    # Also get track number if available
+                                                    if not first_track_number:
+                                                        first_track_number = track_info.get("track_number") or track_info.get("track")
+                                                        if first_track_number:
+                                                            try:
+                                                                if isinstance(first_track_number, str):
+                                                                    import re
+                                                                    track_match = re.search(r'(\d+)', str(first_track_number))
+                                                                    if track_match:
+                                                                        first_track_number = int(track_match.group(1))
+                                                                    else:
+                                                                        first_track_number = None
+                                                                elif isinstance(first_track_number, (int, float)):
+                                                                    first_track_number = int(first_track_number)
+                                                                else:
+                                                                    first_track_number = None
+                                                            except (ValueError, TypeError):
+                                                                first_track_number = None
+                                except Exception:
+                                    # Silently fail - track title extraction is optional for preview
+                                    pass
+                            
                             # Extract additional track titles (up to 3) for better split album detection
                             for entry in entries[1:4]:  # Check next 3 tracks
                                 raw_title = entry.get("title", "")
@@ -10203,19 +12326,22 @@ class BandcampDownloaderGUI:
                         existing_album_artist = self.album_info.get("album_artist")
                         final_album_artist = existing_album_artist or album_artist_from_ytdlp
                         
-                        self.album_info = {
-                            "artist": final_artist,
-                            "album": final_album,
-                            "title": "Track",
-                            "thumbnail_url": thumbnail_url or self.album_info.get("thumbnail_url"),
-                            "year": year or self.album_info.get("year"),  # Store year if found
-                            "first_track_title": final_first_track_title,  # Store first track title
-                            "first_track_number": final_first_track_number,  # Store first track number
-                            "track_titles": final_track_titles,  # Store multiple track titles for split album detection
-                            "album_artist": final_album_artist  # Main album artist
-                        }
-                        
-                        self.root.after(0, self.update_preview)
+                        # Always update preview, even for duplicate URLs, to ensure it shows the latest URL
+                        # Check if this URL is still the current one being processed (might have changed if user pasted another URL)
+                        if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                            self.album_info = {
+                                "artist": final_artist,
+                                "album": final_album,
+                                "title": "Track",
+                                "thumbnail_url": thumbnail_url or self.album_info.get("thumbnail_url"),
+                                "year": year or self.album_info.get("year"),  # Store year if found
+                                "first_track_title": final_first_track_title,  # Store first track title
+                                "first_track_number": final_first_track_number,  # Store first track number
+                                "track_titles": final_track_titles,  # Store multiple track titles for split album detection
+                                "album_artist": final_album_artist  # Main album artist
+                            }
+                            
+                            self.root.after(0, self.update_preview)
                         # Also update Additional Settings dialog preview if open
                         if hasattr(self, '_additional_settings_dialogs'):
                             for dialog_ref in self._additional_settings_dialogs:
@@ -10228,12 +12354,20 @@ class BandcampDownloaderGUI:
                         # Don't update tags when yt-dlp metadata arrives - tags should only use HTML extraction (stage 1)
                         # This prevents tag updates from overriding other URLs that were pasted
                     
-                    # Fetch and display album art if we found a thumbnail
-                    # Reset current_thumbnail_url check to allow fetching even if URL is same (new album might have same art)
-                    # The flag reset in _check_url ensures we fetch new artwork when URL changes
-                    if thumbnail_url and not self.album_art_fetching:
+                    # Store thumbnail URL if found (will be used by artwork list system)
+                    # Don't display directly - let the artwork list system handle it
+                    # Only update if this URL is still the current one being processed
+                    if thumbnail_url and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
                         self.current_thumbnail_url = thumbnail_url
-                        self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
+                        # Build artwork list and display if not already built
+                        if not self.artwork_list:
+                            self._build_artwork_list()
+                            if self.artwork_list:
+                                # Double-check URL is still current before displaying (race condition protection)
+                                def display_artwork():
+                                    if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                                        self._display_artwork_at_index(0)
+                                self.root.after(0, display_artwork)
                     
                     # Try to detect format from first track (if entries available)
                     detected_format = None
@@ -10277,6 +12411,8 @@ class BandcampDownloaderGUI:
                                             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                                             "referer": "https://bandcamp.com/",
                                         }
+                                        # Ensure yt-dlp is loaded (lazy import)
+                                        yt_dlp = self._ensure_ytdlp_loaded()
                                         with yt_dlp.YoutubeDL(format_ydl_opts) as format_ydl:
                                             track_info = format_ydl.extract_info(track_url, download=False)
                                             if track_info:
@@ -10339,6 +12475,8 @@ class BandcampDownloaderGUI:
                                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                                 "referer": "https://bandcamp.com/",
                             }
+                            # Ensure yt-dlp is loaded (lazy import)
+                            yt_dlp = self._ensure_ytdlp_loaded()
                             with yt_dlp.YoutubeDL(full_extract_opts) as full_ydl:
                                 full_info = full_ydl.extract_info(url, download=False)
                                 if full_info:
@@ -10410,6 +12548,310 @@ class BandcampDownloaderGUI:
             format_name = format_names.get(detected_format, detected_format.upper())
             self.log(f"ℹ Detected format: {format_name}. Consider using 'Original' format to download without conversion.")
             self.format_suggestion_shown = True  # Mark as shown
+    
+    def _normalize_image_url_for_comparison(self, img_url):
+        """Normalize image URL for comparison by removing size suffixes.
+        
+        Bandcamp URLs often have size suffixes like _5, _10, _16, _32, _64, _100, _200, _300, _500
+        This function removes these to compare the base image URL.
+        
+        Args:
+            img_url: Image URL string
+            
+        Returns:
+            Normalized URL without size suffix for comparison
+        """
+        if not img_url:
+            return img_url
+        
+        import re
+        # Remove size suffixes: _5, _10, _16, _32, _64, _100, _200, _300, _500
+        # Pattern matches: _ followed by digits before the file extension
+        # Example: ...img/abc123_10.jpg -> ...img/abc123.jpg
+        normalized = re.sub(r'_(\d+)(\.(jpg|jpeg|png|webp))$', r'\2', img_url, flags=re.IGNORECASE)
+        return normalized
+    
+    def _extract_extra_artwork_urls_from_html(self, html_content, url, thumbnail_url=None, bio_pic_url=None):
+        """Extract all popupImage links for extra artwork from HTML.
+        
+        Args:
+            html_content: HTML content as string
+            url: Base URL for resolving relative URLs
+            thumbnail_url: Main thumbnail URL to filter out (optional)
+            bio_pic_url: Bio pic URL to filter out (optional)
+            
+        Returns:
+            List of extra artwork URLs (max 10, filtered to exclude duplicates)
+        """
+        import re
+        from urllib.parse import urlparse
+        
+        # Normalize URLs for comparison (remove size suffixes)
+        normalized_thumbnail = self._normalize_image_url_for_comparison(thumbnail_url) if thumbnail_url else None
+        normalized_bio_pic = self._normalize_image_url_for_comparison(bio_pic_url) if bio_pic_url else None
+        
+        extra_artwork_urls = []
+        # Pattern: <a class="popupImage" href="URL">
+        popup_pattern = r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))'
+        popup_matches = re.finditer(popup_pattern, html_content, re.IGNORECASE)
+        for match in popup_matches:
+            extra_url = match.group(1)
+            # Make sure it's a full URL
+            if extra_url.startswith('//'):
+                extra_url = 'https:' + extra_url
+            elif extra_url.startswith('/'):
+                parsed = urlparse(url)
+                extra_url = f"{parsed.scheme}://{parsed.netloc}{extra_url}"
+            
+            # Normalize for comparison
+            normalized_extra = self._normalize_image_url_for_comparison(extra_url)
+            
+            # Filter out the main thumbnail_url to avoid duplicates (compare normalized)
+            if normalized_thumbnail and normalized_extra == normalized_thumbnail:
+                continue
+            # Filter out bio pic URL to avoid duplicates (compare normalized)
+            if normalized_bio_pic and normalized_extra == normalized_bio_pic:
+                continue
+            # Avoid duplicates in the list (compare normalized)
+            normalized_existing = [self._normalize_image_url_for_comparison(u) for u in extra_artwork_urls]
+            if normalized_extra not in normalized_existing:
+                extra_artwork_urls.append(extra_url)
+        
+        # Limit to 10 extra artwork images
+        return extra_artwork_urls[:10]
+    
+    def _reset_artwork_state(self):
+        """Reset artwork state when URLs are cleared."""
+        self.artwork_list = []
+        self.artwork_index = 0
+        self.extra_artwork_urls = []
+        self.current_thumbnail_url = None
+        self.current_bio_pic_url = None
+        self.preloaded_album_art_image = None
+        self.preloaded_album_art_pil = None
+    
+    def _build_artwork_list(self, preserve_index=False):
+        """Build unified artwork list: [album_art, *extra_artwork, bio_pic].
+        
+        This creates a single ordered list of all available artwork URLs.
+        
+        Args:
+            preserve_index: If True, try to preserve current index position after rebuilding.
+                           If False, reset index to 0 (for new URLs).
+        """
+        old_index = self.artwork_index if preserve_index else 0
+        self.artwork_list = []
+        
+        # Add album art first (index 0) - REQUIRED
+        if self.current_thumbnail_url:
+            self.artwork_list.append(self.current_thumbnail_url)
+        
+        # Normalize URLs for comparison (to handle different size suffixes)
+        normalized_thumbnail = self._normalize_image_url_for_comparison(self.current_thumbnail_url) if self.current_thumbnail_url else None
+        normalized_bio_pic = self._normalize_image_url_for_comparison(self.current_bio_pic_url) if self.current_bio_pic_url else None
+        
+        # Add extra artwork URLs (optional)
+        if self.extra_artwork_urls:
+            # Filter out any duplicates that might have slipped through
+            for extra_url in self.extra_artwork_urls:
+                # Check if already in list (exact match)
+                if extra_url in self.artwork_list:
+                    continue
+                
+                # Check if normalized version matches thumbnail (different size of same image)
+                normalized_extra = self._normalize_image_url_for_comparison(extra_url)
+                if normalized_thumbnail and normalized_extra == normalized_thumbnail:
+                    continue  # Skip - this is the same image as album art, just different size
+                
+                # Also make sure it's not the bio pic (normalized comparison)
+                if normalized_bio_pic and normalized_extra == normalized_bio_pic:
+                    continue  # Skip - this is the bio pic, just different size
+                
+                # Check against existing items in list (normalized comparison)
+                normalized_existing = [self._normalize_image_url_for_comparison(u) for u in self.artwork_list]
+                if normalized_extra not in normalized_existing:
+                    self.artwork_list.append(extra_url)
+        
+        # Add bio pic last (optional but should be included if available)
+        # IMPORTANT: Make sure bio pic is added even if it wasn't found initially
+        if self.current_bio_pic_url:
+            # Make sure bio pic isn't already in the list (exact or normalized match)
+            if self.current_bio_pic_url not in self.artwork_list:
+                # Also check normalized version
+                normalized_existing = [self._normalize_image_url_for_comparison(u) for u in self.artwork_list]
+                if normalized_bio_pic not in normalized_existing:
+                    self.artwork_list.append(self.current_bio_pic_url)
+        
+        # Debug: Log list contents (always log to help diagnose)
+        if self.artwork_list:
+            bio_pic_included = self.current_bio_pic_url in self.artwork_list if self.current_bio_pic_url else False
+            print(f"[DEBUG] Artwork list built: {len(self.artwork_list)} items")
+            print(f"[DEBUG] - Album art: {self.current_thumbnail_url is not None}")
+            print(f"[DEBUG] - Extra artwork: {len(self.extra_artwork_urls)} items")
+            print(f"[DEBUG] - Bio pic URL: {self.current_bio_pic_url}")
+            print(f"[DEBUG] - Bio pic in list: {bio_pic_included}")
+            print(f"[DEBUG] - List contents: {[url[-30:] for url in self.artwork_list]}")  # Show last 30 chars of each URL
+            if self.debug_mode:
+                self._log_debug(f"Artwork list: {len(self.artwork_list)} items, bio_pic={bio_pic_included}")
+        
+        # Set index appropriately
+        if preserve_index and self.artwork_list:
+            # Try to preserve old index, but clamp to valid range
+            self.artwork_index = min(old_index, len(self.artwork_list) - 1)
+        else:
+            # Reset to 0 (album art) when building list for new URL
+            self.artwork_index = 0
+    
+    def _display_artwork_at_index(self, index):
+        """Display artwork at the given index in artwork_list.
+        
+        Args:
+            index: Index in artwork_list (0 = album art, last = bio pic, middle = extra artwork)
+        """
+        # Validate and clamp index
+        if not self.artwork_list:
+            self.clear_album_art()
+            return
+        
+        # Clamp index to valid range
+        if index < 0:
+            index = 0
+        elif index >= len(self.artwork_list):
+            index = len(self.artwork_list) - 1
+        
+        # Update artwork_index to match what we're displaying (keep in sync)
+        self.artwork_index = index
+        
+        artwork_url = self.artwork_list[index]
+        
+        # Log to status log (visible to user)
+        if self.debug_mode:
+            self.log(f"[Artwork] Displaying index {index}/{len(self.artwork_list)-1}: ...{artwork_url[-30:]}")
+        
+        # Determine what type of artwork this is
+        if index == 0 and self.current_thumbnail_url and artwork_url == self.current_thumbnail_url:
+            # Album art - use preloaded if available
+            if self.preloaded_album_art_image:
+                self.album_art_canvas.delete("all")
+                
+                blurred_bg = None
+                if self.preloaded_album_art_pil:
+                    blurred_bg = self._create_blurred_background(self.preloaded_album_art_pil)
+                
+                if blurred_bg:
+                    self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                
+                self.album_art_canvas.create_image(84, 84, 
+                                                   image=self.preloaded_album_art_image, anchor='center')
+                
+                self.album_art_image = self.preloaded_album_art_image
+                if blurred_bg:
+                    if not hasattr(self, '_blurred_bg_image'):
+                        self._blurred_bg_image = None
+                    self._blurred_bg_image = blurred_bg
+                
+                self.preloaded_album_art_image = None
+                self.preloaded_album_art_pil = None
+            else:
+                self.fetch_and_display_album_art(artwork_url)
+        elif (self.current_bio_pic_url and 
+              index == len(self.artwork_list) - 1 and 
+              artwork_url == self.current_bio_pic_url):
+            # Bio pic
+            self.fetch_and_display_bio_pic(artwork_url)
+        else:
+            # Extra artwork - fetch and display
+            self._fetch_and_display_extra_artwork(artwork_url)
+    
+    def _fetch_and_display_extra_artwork(self, extra_artwork_url):
+        """Fetch and display extra artwork (package images, etc.) in main interface."""
+        def download_and_display():
+            try:
+                import io
+                # Ensure PIL is loaded (lazy import)
+                Image, ImageTk = self._ensure_pil_loaded()
+                if Image is None or ImageTk is None:
+                    return
+                
+                # Get current fetch ID to check if we should still display
+                fetch_id = self.artwork_fetch_id
+                
+                # Download the image with retry logic
+                image_data = self._fetch_with_retry(extra_artwork_url, max_retries=3, timeout=15)
+                
+                # Check if URL field was cleared during download
+                if self._is_url_field_empty():
+                    return
+                
+                # Open and resize image
+                img = Image.open(io.BytesIO(image_data))
+                
+                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
+                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                
+                # Convert to PhotoImage
+                photo = ImageTk.PhotoImage(img)
+                
+                # Update UI on main thread
+                def update_ui():
+                    # Check if URL field was cleared
+                    if self._is_url_field_empty():
+                        return
+                    
+                    # Only update if this is still the current fetch
+                    if fetch_id != self.artwork_fetch_id:
+                        return
+                    
+                    # Clear canvas
+                    self.album_art_canvas.delete("all")
+                    
+                    # Create blurred background if image doesn't fill the canvas
+                    blurred_bg = self._create_blurred_background(img)
+                    if blurred_bg:
+                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                    
+                    # Display image centered
+                    self.album_art_canvas.create_image(84, 84, image=photo, anchor='center')
+                    
+                    # Store reference to prevent garbage collection
+                    self.album_art_image = photo
+                    if blurred_bg:
+                        if not hasattr(self, '_blurred_bg_image'):
+                            self._blurred_bg_image = None
+                        self._blurred_bg_image = blurred_bg
+                
+                if fetch_id == self.artwork_fetch_id:  # Only update if still current
+                    self.root.after(0, update_ui)
+                
+                # Always reset flag after completion
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
+                
+            except Exception:
+                # Failed to load - show placeholder
+                def show_error():
+                    if not self._is_url_field_empty():
+                        self.album_art_canvas.delete("all")
+                        self.album_art_canvas.create_text(
+                            84, 84, text="Extra Artwork\n\nFailed to load",
+                            fill='#808080', font=("Segoe UI", 8), justify='center'
+                        )
+                self.root.after(0, show_error)
+                # Always reset flag after error
+                def reset_flag():
+                    self.album_art_fetching = False
+                    if hasattr(self, '_artwork_fetch_start_time'):
+                        del self._artwork_fetch_start_time
+                self.root.after(0, reset_flag)
+        
+        # Set fetching flag
+        self.album_art_fetching = True
+        
+        # Download in background thread
+        threading.Thread(target=download_and_display, daemon=True).start()
     
     def fetch_thumbnail_from_html(self, url):
         """Extract thumbnail URL directly from Bandcamp HTML page (fast method)."""
@@ -10498,55 +12940,80 @@ class BandcampDownloaderGUI:
                                 parsed = urlparse(url)
                                 bio_pic_url = f"{parsed.scheme}://{parsed.netloc}{bio_pic_url}"
                 
-                # Store bio pic URL if found
-                if bio_pic_url:
-                    # Try to get a larger/higher quality size for bio pic
-                    high_quality_bio_pic = bio_pic_url
-                    if '_' in bio_pic_url or 'bcbits.com' in bio_pic_url:
-                        # Try common larger sizes (in order of preference)
-                        for size in ['_500', '_300', '_200', '_100', '_64']:
-                            if size in bio_pic_url:
-                                break
-                            test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
-                            if test_url != bio_pic_url:
-                                high_quality_bio_pic = test_url
-                                break
-                    self.current_bio_pic_url = high_quality_bio_pic
+                # Upgrade thumbnail and bio pic URLs to higher quality BEFORE extracting extra artwork
+                # This ensures we filter out the correct (upgraded) URLs from extra artwork
+                high_quality_thumbnail = thumbnail_url
+                if thumbnail_url and ('_' in thumbnail_url or 'bcbits.com' in thumbnail_url):
+                    # Try common larger sizes (in order of preference)
+                    for size in ['_500', '_300', '_200', '_100', '_64']:
+                        if size in thumbnail_url:
+                            # Already has a good size
+                            break
+                        # Try replacing smaller sizes with larger ones
+                        test_url = thumbnail_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                        if test_url != thumbnail_url:
+                            high_quality_thumbnail = test_url
+                            break
                 
-                # If found, try to get a larger/higher quality size for better image quality
-                if thumbnail_url and not self.album_art_fetching:
-                    # Try to get a larger thumbnail by modifying the URL
-                    # Bandcamp often has sizes like _16, _32, _64, _100, _200, _300, _500 in the URL
-                    # Prefer larger sizes for better quality now that loading is fast
-                    high_quality_thumbnail = thumbnail_url
+                high_quality_bio_pic = bio_pic_url
+                if bio_pic_url and ('_' in bio_pic_url or 'bcbits.com' in bio_pic_url):
+                    # Try common larger sizes (in order of preference)
+                    for size in ['_500', '_300', '_200', '_100', '_64']:
+                        if size in bio_pic_url:
+                            break
+                        test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
+                        if test_url != bio_pic_url:
+                            high_quality_bio_pic = test_url
+                            break
+                
+                # Extract extra artwork URLs (popup images) - filter out duplicates
+                # IMPORTANT: Pass the UPGRADED URLs so we filter out the correct versions
+                extra_artwork_urls = self._extract_extra_artwork_urls_from_html(
+                    html_content, url, high_quality_thumbnail, high_quality_bio_pic
+                )
+                self.extra_artwork_urls = extra_artwork_urls
+                
+                # Store the upgraded URLs
+                self.current_thumbnail_url = high_quality_thumbnail if thumbnail_url else None
+                self.current_bio_pic_url = high_quality_bio_pic if bio_pic_url else None
+                
+                if self.current_bio_pic_url and self.debug_mode:
+                    self.log(f"Bio pic found: ...{self.current_bio_pic_url[-40:]}")
+                elif not self.current_bio_pic_url and self.debug_mode:
+                    self.log("Bio pic not found in HTML")
+                
+                # If found, display the artwork (only if this URL is still the current one being processed)
+                # Check current_url_being_processed to ensure we only display artwork for the latest URL
+                if self.current_thumbnail_url and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                    # Build unified artwork list now that we have all URLs
+                    # This should include: album_art, extra_artwork, and bio_pic
+                    self._build_artwork_list()
                     
-                    # Try to find a larger size in the URL
-                    if '_' in thumbnail_url or 'bcbits.com' in thumbnail_url:
-                        # Try common larger sizes (in order of preference)
-                        for size in ['_500', '_300', '_200', '_100', '_64']:
-                            if size in thumbnail_url:
-                                # Already has a good size
-                                break
-                            # Try replacing smaller sizes with larger ones
-                            test_url = thumbnail_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
-                            if test_url != thumbnail_url:
-                                high_quality_thumbnail = test_url
-                                break
-                    
-                    self.current_thumbnail_url = high_quality_thumbnail
-                    # Display appropriate image based on current mode
-                    if self.album_art_mode == "album_art" or not hasattr(self, 'album_art_mode'):
-                        self.root.after(0, lambda url=high_quality_thumbnail: self.fetch_and_display_album_art(url))
-                    elif self.album_art_mode == "bio_pic" and self.current_bio_pic_url:
-                        self.root.after(0, lambda url=self.current_bio_pic_url: self.fetch_and_display_bio_pic(url))
-                else:
-                    # Fallback to yt-dlp extraction if HTML method fails
+                    # Auto-display album art (index 0) when URL is first detected
+                    # Explicitly set index to 0 and display
+                    if self.artwork_list:
+                        # Ensure index is definitely 0 before displaying
+                        self.artwork_index = 0
+                        if self.debug_mode:
+                            bio_in_list = self.current_bio_pic_url in self.artwork_list if self.current_bio_pic_url else False
+                            self.log(f"Initial display: index=0, list={len(self.artwork_list)} items, bio_pic={bio_in_list}")
+                        # Use a lambda that captures the current state
+                        def display_initial():
+                            # Double-check URL is still current before displaying (race condition protection)
+                            if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                                self.artwork_index = 0  # Ensure it's still 0
+                                self._display_artwork_at_index(0)
+                        self.root.after(0, display_initial)
+                elif not thumbnail_url:
+                    # Fallback to yt-dlp extraction if HTML method fails (only if URL is still current)
+                    if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                        if not self.album_art_fetching:
+                            self.root.after(0, lambda: self.fetch_thumbnail_separately(url))
+            except Exception:
+                # If HTML extraction fails, try yt-dlp method (only if URL is still current)
+                if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
                     if not self.album_art_fetching:
                         self.root.after(0, lambda: self.fetch_thumbnail_separately(url))
-            except Exception:
-                # If HTML extraction fails, try yt-dlp method
-                if not self.album_art_fetching:
-                    self.root.after(0, lambda: self.fetch_thumbnail_separately(url))
         
         threading.Thread(target=fetch, daemon=True).start()
     
@@ -10570,6 +13037,8 @@ class BandcampDownloaderGUI:
                     "referer": "https://bandcamp.com/",
                 }
                 
+                # Ensure yt-dlp is loaded (lazy import)
+                yt_dlp = self._ensure_ytdlp_loaded()
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     
@@ -10599,10 +13068,14 @@ class BandcampDownloaderGUI:
                                                entry.get("artwork_url") or
                                                entry.get("cover"))
                         
-                        # If found, display it (only if not already fetching)
+                        # If found, store it and use artwork list system (only if not already fetching)
                         if thumbnail_url and not self.album_art_fetching:
                             self.current_thumbnail_url = thumbnail_url
-                            self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
+                            # Build artwork list and display if not already built
+                            if not self.artwork_list:
+                                self._build_artwork_list()
+                                if self.artwork_list:
+                                    self.root.after(0, lambda: self._display_artwork_at_index(0))
                         
                         # Also detect format from this full extraction (since we have full info here)
                         # This is a good fallback if format wasn't detected earlier
@@ -10697,7 +13170,7 @@ class BandcampDownloaderGUI:
             elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
                 content = self.url_var.get().strip()
                 # Skip placeholder text
-                if content == "Paste one URL or multiple to create a batch.\nPress ➕ Button, Right Click or CTRL+V to Paste.":
+                if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
                     content = ""
             else:
                 content = ""
@@ -10762,9 +13235,7 @@ class BandcampDownloaderGUI:
             self.clear_album_art()
             return
         
-        # Only fetch if we're in bio_pic mode
-        if self.album_art_mode != "bio_pic":
-            return
+        # Note: Mode check removed - we now use artwork list system, mode is updated after display
         
         # Prevent multiple simultaneous fetches
         if self.album_art_fetching:
@@ -10796,8 +13267,8 @@ class BandcampDownloaderGUI:
                     self.root.after(0, reset_flag)
                     return
                 
-                # Check again before downloading (field might have been cleared or mode changed)
-                if self._is_url_field_empty() or self.album_art_mode != "bio_pic":
+                # Check again before downloading (field might have been cleared)
+                if self._is_url_field_empty():
                     if fetch_id == self.artwork_fetch_id:
                         self.root.after(0, self.clear_album_art)
                     def reset_flag():
@@ -10808,20 +13279,24 @@ class BandcampDownloaderGUI:
                     return
                 
                 import io
-                from PIL import Image, ImageTk
+                # Ensure PIL is loaded (lazy import)
+                Image, ImageTk = self._ensure_pil_loaded()
+                if Image is None or ImageTk is None:
+                    self.root.after(0, lambda: self.log("Error: PIL/Pillow not available for bio pic display"))
+                    return
                 
                 # Download the image with retry logic
                 image_data = self._fetch_with_retry(bio_pic_url, max_retries=3, timeout=15)
                 
                 # Check if this fetch was cancelled during download
-                if fetch_id != self.artwork_fetch_id or self.album_art_mode != "bio_pic":
+                if fetch_id != self.artwork_fetch_id:
                     def reset_flag():
                         self.album_art_fetching = False
                     self.root.after(0, reset_flag)
                     return
                 
                 # Check again after download
-                if self._is_url_field_empty() or self.album_art_mode != "bio_pic":
+                if self._is_url_field_empty():
                     if fetch_id == self.artwork_fetch_id:
                         self.root.after(0, self.clear_album_art)
                     def reset_flag():
@@ -10844,11 +13319,11 @@ class BandcampDownloaderGUI:
                 # Update UI on main thread
                 def update_ui():
                     # Check if this fetch was cancelled before updating UI
-                    if fetch_id != self.artwork_fetch_id or self.album_art_mode != "bio_pic":
+                    if fetch_id != self.artwork_fetch_id:
                         return
                     
                     # Final check before displaying
-                    if self._is_url_field_empty() or self.album_art_mode != "bio_pic":
+                    if self._is_url_field_empty():
                         self.clear_album_art()
                         return
                     
@@ -10920,9 +13395,7 @@ class BandcampDownloaderGUI:
             self.clear_album_art()
             return
         
-        # Only fetch if we're in album_art mode
-        if self.album_art_mode != "album_art":
-            return
+        # Note: Mode check removed - we now use artwork list system, mode is updated after display
         
         # Prevent multiple simultaneous fetches
         # If flag is stuck (has been True for more than 30 seconds), reset it to allow new fetches
@@ -10958,8 +13431,8 @@ class BandcampDownloaderGUI:
                     self.root.after(0, reset_flag)
                     return
                 
-                # Check again before downloading (field might have been cleared or mode changed)
-                if self._is_url_field_empty() or self.album_art_mode != "album_art":
+                # Check again before downloading (field might have been cleared)
+                if self._is_url_field_empty():
                     if fetch_id == self.artwork_fetch_id:  # Only clear if still current
                         self.root.after(0, self.clear_album_art)
                     # Reset flag in a thread-safe way
@@ -10971,21 +13444,25 @@ class BandcampDownloaderGUI:
                     return
                 
                 import io
-                from PIL import Image, ImageTk
+                # Ensure PIL is loaded (lazy import)
+                Image, ImageTk = self._ensure_pil_loaded()
+                if Image is None or ImageTk is None:
+                    self.root.after(0, lambda: self.log("Error: PIL/Pillow not available for album art display"))
+                    return
                 
                 # Download the image with retry logic
                 image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
                 
-                # Check if this fetch was cancelled during download or mode changed
-                if fetch_id != self.artwork_fetch_id or self.album_art_mode != "album_art":
+                # Check if this fetch was cancelled during download
+                if fetch_id != self.artwork_fetch_id:
                     # Reset flag in a thread-safe way
                     def reset_flag():
                         self.album_art_fetching = False
                     self.root.after(0, reset_flag)
                     return
                 
-                # Check again after download (field might have been cleared or mode changed during download)
-                if self._is_url_field_empty() or self.album_art_mode != "album_art":
+                # Check again after download (field might have been cleared during download)
+                if self._is_url_field_empty():
                     if fetch_id == self.artwork_fetch_id:  # Only clear if still current
                         self.root.after(0, self.clear_album_art)
                     # Reset flag in a thread-safe way
@@ -11008,12 +13485,12 @@ class BandcampDownloaderGUI:
                 
                 # Update UI on main thread
                 def update_ui():
-                    # Check if this fetch was cancelled before updating UI or mode changed
-                    if fetch_id != self.artwork_fetch_id or self.album_art_mode != "album_art":
+                    # Check if this fetch was cancelled before updating UI
+                    if fetch_id != self.artwork_fetch_id:
                         return
                     
-                    # Final check before displaying - field might have been cleared or mode changed
-                    if self._is_url_field_empty() or self.album_art_mode != "album_art":
+                    # Final check before displaying - field might have been cleared
+                    if self._is_url_field_empty():
                         self.clear_album_art()
                         return
                     
@@ -11092,7 +13569,10 @@ class BandcampDownloaderGUI:
         def preload():
             try:
                 import io
-                from PIL import Image, ImageTk
+                # Ensure PIL is loaded (lazy import)
+                Image, ImageTk = self._ensure_pil_loaded()
+                if Image is None or ImageTk is None:
+                    return  # PIL not available
                 
                 # Download the image with retry logic
                 image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
@@ -11139,7 +13619,12 @@ class BandcampDownloaderGUI:
             PhotoImage of the blurred background, or None if image already fills canvas
         """
         try:
-            from PIL import Image, ImageFilter, ImageTk
+            # Ensure PIL is loaded (lazy import)
+            Image, ImageTk = self._ensure_pil_loaded()
+            if Image is None or ImageTk is None:
+                return None  # PIL not available
+            
+            from PIL import ImageFilter
             
             # Check if image already fills the canvas (square and 165x165)
             if img.width == 165 and img.height == 165:
@@ -11213,88 +13698,144 @@ class BandcampDownloaderGUI:
         except Exception:
             pass
     
-    def toggle_album_art(self):
-        """Cycle through album art panel modes: album_art → bio_pic → hidden → album_art."""
-        # Store previous mode to detect transitions
-        previous_mode = self.album_art_mode
+    def cycle_artwork_type(self):
+        """Cycle through artwork types: album_art → extra_artwork → bio_pic → album_art (only when panel is visible)."""
+        # Only cycle if panel is visible (not hidden)
+        if self.album_art_mode == "hidden":
+            return  # Don't cycle when hidden
         
-        # Cycle through states: album_art → bio_pic → hidden → album_art
-        if self.album_art_mode == "album_art":
+        # Ensure artwork list exists (should already be built when URL was detected)
+        if not self.artwork_list:
+            # List doesn't exist, build it fresh
+            self._build_artwork_list(preserve_index=False)
+        
+        # If list exists but bio pic might be missing, check and rebuild if needed
+        # Only rebuild if bio pic is available but not in list
+        if self.artwork_list and self.current_bio_pic_url:
+            if self.current_bio_pic_url not in self.artwork_list:
+                # Bio pic is available but not in list - rebuild to include it
+                old_index = self.artwork_index
+                self._build_artwork_list(preserve_index=True)
+                # Index was preserved, continue with cycle
+        
+        # If no artwork available, can't cycle
+        if not self.artwork_list:
+            return
+        
+        # Ensure index is valid (safety check)
+        if self.artwork_index < 0:
+            print(f"[CYCLE] Index negative ({self.artwork_index}), resetting to 0")
+            self.artwork_index = 0
+        elif self.artwork_index >= len(self.artwork_list):
+            print(f"[CYCLE] Index out of range ({self.artwork_index}/{len(self.artwork_list)}), resetting")
+            self.artwork_index = len(self.artwork_list) - 1
+        
+        # Debug: Log before cycle
+        print(f"[CYCLE] BEFORE: index={self.artwork_index}, list_length={len(self.artwork_list)}")
+        if self.current_bio_pic_url:
+            print(f"[CYCLE] Bio pic in list: {self.current_bio_pic_url in self.artwork_list}")
+        
+        # Simple cycle: increment index and wrap around
+        # This should always work: (current + 1) % length wraps from last to 0
+        old_index = self.artwork_index
+        self.artwork_index = (self.artwork_index + 1) % len(self.artwork_list)
+        
+        # Debug: Log after cycle
+        print(f"[CYCLE] AFTER: {old_index} -> {self.artwork_index}")
+        if self.artwork_list:
+            print(f"[CYCLE] URL: ...{self.artwork_list[self.artwork_index][-40:]}")
+        
+        # Display artwork at new index (this will also update artwork_index to match)
+        self._display_artwork_at_index(self.artwork_index)
+        
+        # Update album_art_mode for compatibility (though we use artwork_index now)
+        if self.artwork_index == 0:
+            self.album_art_mode = "album_art"
+        elif (self.current_bio_pic_url and 
+              self.artwork_index == len(self.artwork_list) - 1 and 
+              self.artwork_list[self.artwork_index] == self.current_bio_pic_url):
             self.album_art_mode = "bio_pic"
-        elif self.album_art_mode == "bio_pic":
-            self.album_art_mode = "hidden"
-        else:  # hidden
+        else:
+            # Extra artwork - keep mode as album_art for compatibility
             self.album_art_mode = "album_art"
         
+        # Don't save state on every cycle - only save when toggling visibility
+        # This prevents interference with the artwork list system
+    
+    def toggle_album_art(self):
+        """Toggle album art panel visibility (show/hide) while preserving current mode."""
         if self.album_art_mode == "hidden":
-            # Hide album art panel
-            self.album_art_frame.grid_remove()
-            # Update settings frame to span 3 columns (full width)
-            self.settings_frame.grid_configure(columnspan=3)
-            # Show the show album art button by adding it back to grid
+            # Show panel - restore to album_art mode (default, index 0)
+            self.album_art_mode = "album_art"
+            # Ensure artwork list is built (should already exist, but rebuild if needed)
+            if not self.artwork_list:
+                self._build_artwork_list()
+            else:
+                # List exists - just reset index to 0 (album art) when showing panel
+                self.artwork_index = 0
+            # Show album art panel
+            self.album_art_frame.grid()
+            # Update settings frame to span 2 columns (leaving room for album art)
+            self.settings_frame.grid_configure(columnspan=2)
+            # Keep eye icon button visible so it can toggle panel visibility
             self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
-            self.show_album_art_btn.config(fg='#808080', cursor='hand2')  # Visible, hand cursor
+            self.show_album_art_btn.config(fg='#808080', cursor='hand2')
             
-            # If switching from bio_pic to hidden, clear canvas and preload album art
-            if previous_mode == "bio_pic":
+            # Display album art (index 0)
+            if self.artwork_list:
+                self._display_artwork_at_index(0)
+            elif self.preloaded_album_art_image:
+                # Display preloaded image immediately
+                self.album_art_canvas.delete("all")
+                
+                # Create blurred background if image doesn't fill the canvas
+                blurred_bg = None
+                if self.preloaded_album_art_pil:
+                    blurred_bg = self._create_blurred_background(self.preloaded_album_art_pil)
+                
+                if blurred_bg:
+                    # Draw blurred background first (fills entire canvas)
+                    self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                
+                # Display original image centered
+                self.album_art_canvas.create_image(84, 84, 
+                                                   image=self.preloaded_album_art_image, anchor='center')
+                
+                # Use preloaded image as current image
+                self.album_art_image = self.preloaded_album_art_image
+                if blurred_bg:
+                    # Store blurred background reference
+                    if not hasattr(self, '_blurred_bg_image'):
+                        self._blurred_bg_image = None
+                    self._blurred_bg_image = blurred_bg
+                
+                # Clear preloaded cache (will be refreshed if needed)
+                self.preloaded_album_art_image = None
+                self.preloaded_album_art_pil = None
+            elif self.artwork_list:
+                # No preloaded image, use artwork list system
+                self._display_artwork_at_index(0)
+            else:
+                # Show placeholder if album art not available
+                self.clear_album_art()
+        else:
+            # Hide panel - store current mode for potential future use, but set to hidden
+            # Preload album art if we're hiding from bio_pic mode
+            if self.album_art_mode == "bio_pic":
                 # Clear the canvas immediately to remove bio pic
                 self.clear_album_art()
                 # Preload album art in background for instant display when switching back
                 if hasattr(self, 'current_thumbnail_url') and self.current_thumbnail_url:
                     self._preload_album_art(self.current_thumbnail_url)
-        else:
-            # Show album art panel (either album_art or bio_pic mode)
-            self.album_art_frame.grid()
-            # Update settings frame to span 2 columns (leaving room for album art)
-            self.settings_frame.grid_configure(columnspan=2)
-            # Remove the show album art button from grid to free up space
-            self.show_album_art_btn.grid_remove()
             
-            # Display appropriate image based on mode
-            if self.album_art_mode == "bio_pic":
-                # Try to fetch and display bio pic if available
-                if hasattr(self, 'current_bio_pic_url') and self.current_bio_pic_url:
-                    self.fetch_and_display_bio_pic(self.current_bio_pic_url)
-                else:
-                    # Show placeholder if bio pic not available
-                    self.clear_album_art()
-            else:  # album_art mode
-                # Check if we have a preloaded image first (for instant display)
-                if self.preloaded_album_art_image:
-                    # Display preloaded image immediately
-                    self.album_art_canvas.delete("all")
-                    
-                    # Create blurred background if image doesn't fill the canvas
-                    blurred_bg = None
-                    if self.preloaded_album_art_pil:
-                        blurred_bg = self._create_blurred_background(self.preloaded_album_art_pil)
-                    
-                    if blurred_bg:
-                        # Draw blurred background first (fills entire canvas)
-                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
-                    
-                    # Display original image centered (anchor='center' means x,y is the center point)
-                    # Canvas center is 84, 84 (half of 168x168) - this centers both horizontally and vertically
-                    self.album_art_canvas.create_image(84, 84, 
-                                                       image=self.preloaded_album_art_image, anchor='center')
-                    
-                    # Use preloaded image as current image
-                    self.album_art_image = self.preloaded_album_art_image
-                    if blurred_bg:
-                        # Store blurred background reference
-                        if not hasattr(self, '_blurred_bg_image'):
-                            self._blurred_bg_image = None
-                        self._blurred_bg_image = blurred_bg
-                    
-                    # Clear preloaded cache (will be refreshed if needed)
-                    self.preloaded_album_art_image = None
-                    self.preloaded_album_art_pil = None
-                elif hasattr(self, 'current_thumbnail_url') and self.current_thumbnail_url:
-                    # No preloaded image, fetch normally
-                    self.fetch_and_display_album_art(self.current_thumbnail_url)
-                else:
-                    # Show placeholder if album art not available
-                    self.clear_album_art()
+            # Hide album art panel
+            self.album_art_mode = "hidden"
+            self.album_art_frame.grid_remove()
+            # Update settings frame to span 3 columns (full width)
+            self.settings_frame.grid_configure(columnspan=3)
+            # Ensure eye icon button is visible (should already be in grid)
+            self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
+            self.show_album_art_btn.config(fg='#808080', cursor='hand2')
         
         # Save the state
         self.save_album_art_state()
@@ -11729,6 +14270,9 @@ class BandcampDownloaderGUI:
         
         # Show only the path (no "Preview: " prefix - that's handled by the label)
         self.preview_var.set(preview_path)
+        
+        # Adjust window height if detached (preview frame height may have changed due to wrapping)
+        self.root.after(50, self._adjust_window_height_for_dynamic_content)
     
     def on_format_change(self, event=None):
         """Update format warnings based on selection."""
@@ -11860,6 +14404,20 @@ class BandcampDownloaderGUI:
         self.log_text.delete(1.0, END)
         self.log_text.config(state='disabled')
         
+        # Also clear detached log text if it exists
+        if hasattr(self, 'detached_log_text') and self.detached_log_text:
+            try:
+                self.detached_log_text.config(state='normal')
+                self.detached_log_text.delete(1.0, END)
+                self.detached_log_text.config(state='disabled')
+                # Clear search highlights in detached log too
+                if hasattr(self, 'search_tag_name'):
+                    self.detached_log_text.tag_remove(self.search_tag_name, 1.0, END)
+                if hasattr(self, 'current_match_tag_name'):
+                    self.detached_log_text.tag_remove(self.current_match_tag_name, 1.0, END)
+            except:
+                pass
+        
         # Clear stored log messages
         if hasattr(self, 'log_messages'):
             self.log_messages = []
@@ -11894,9 +14452,26 @@ class BandcampDownloaderGUI:
                 if not is_debug or self.debug_mode:
                     self.log_text.insert(END, message + "\n")
             
+            # Also rebuild detached log text if it exists
+            if hasattr(self, 'detached_log_text') and self.detached_log_text:
+                try:
+                    self.detached_log_text.config(state='normal')
+                    self.detached_log_text.delete(1.0, END)
+                    for message, is_debug in self.log_messages:
+                        if not is_debug or self.debug_mode:
+                            self.detached_log_text.insert(END, message + "\n")
+                    self.detached_log_text.config(state='disabled')
+                except:
+                    pass
+            
             # Restore scroll position
             try:
                 self.log_text.see(scroll_position)
+                if hasattr(self, 'detached_log_text') and self.detached_log_text:
+                    try:
+                        self.detached_log_text.see(scroll_position)
+                    except:
+                        pass
             except:
                 # If exact position doesn't exist, try to scroll to end or approximate position
                 try:
@@ -11928,11 +14503,27 @@ class BandcampDownloaderGUI:
         """Toggle word wrap for the status log."""
         word_wrap_enabled = self.word_wrap_var.get()
         
+        # Sync detached toggle if it exists
+        if hasattr(self, 'detached_word_wrap_var'):
+            self.detached_word_wrap_var.set(word_wrap_enabled)
+        
         # Update the log text widget wrap setting
         if word_wrap_enabled:
             self.log_text.config(wrap=WORD)
+            # Also update detached log text if it exists
+            if hasattr(self, 'detached_log_text') and self.detached_log_text:
+                try:
+                    self.detached_log_text.config(wrap=WORD)
+                except:
+                    pass
         else:
             self.log_text.config(wrap='none')
+            # Also update detached log text if it exists
+            if hasattr(self, 'detached_log_text') and self.detached_log_text:
+                try:
+                    self.detached_log_text.config(wrap='none')
+                except:
+                    pass
         
         # Save the setting
         settings = self._load_settings()
@@ -11942,6 +14533,10 @@ class BandcampDownloaderGUI:
     def _toggle_debug_mode(self):
         """Toggle debug mode on/off and rebuild log to show/hide existing debug messages."""
         self.debug_mode = self.debug_mode_var.get()
+        
+        # Sync detached toggle if it exists
+        if hasattr(self, 'detached_debug_var'):
+            self.detached_debug_var.set(self.debug_mode)
         
         # Rebuild the log content based on debug mode
         if hasattr(self, 'log_text') and hasattr(self, 'log_messages'):
@@ -11957,6 +14552,18 @@ class BandcampDownloaderGUI:
                 for message, is_debug in self.log_messages:
                     if not is_debug or self.debug_mode:
                         self.log_text.insert(END, message + "\n")
+                
+                # Also rebuild detached log text if it exists
+                if hasattr(self, 'detached_log_text') and self.detached_log_text:
+                    try:
+                        self.detached_log_text.config(state='normal')
+                        self.detached_log_text.delete(1.0, END)
+                        for message, is_debug in self.log_messages:
+                            if not is_debug or self.debug_mode:
+                                self.detached_log_text.insert(END, message + "\n")
+                        self.detached_log_text.config(state='disabled')
+                    except:
+                        pass
                 
                 # Restore scroll position to the same line (if it still exists)
                 try:
@@ -11982,6 +14589,999 @@ class BandcampDownloaderGUI:
             except Exception:
                 pass
             self.log_text.config(state='disabled')
+    
+    def _toggle_detach_status(self):
+        """Toggle between attached and detached status window."""
+        if self.status_detached:
+            self._reattach_status_window()
+        else:
+            self._detach_status_window()
+    
+    def _detach_status_window(self):
+        """Detach status window to separate window."""
+        if self.status_detached:
+            return  # Already detached
+        
+        # Store original window geometry and minimum size (only on first detach)
+        if self.original_window_geometry is None:
+            self.original_window_geometry = self.root.geometry()
+            self.original_min_width = self.root.winfo_width()
+            self.original_min_height = self.root.winfo_height()
+            # Get actual minsize values
+            try:
+                minsize = self.root.winfo_toplevel().winfo_reqwidth(), self.root.winfo_toplevel().winfo_reqheight()
+                # But we know from init it's 520x580, so use that
+                self.original_min_width = 520
+                self.original_min_height = 580
+            except:
+                # Fallback to current size
+                self.original_min_width = self.root.winfo_width()
+                self.original_min_height = self.root.winfo_height()
+        
+        # Create detached window
+        self._create_detached_status_window()
+        
+        # Move widgets
+        self._move_widgets_to_detached_window()
+        
+        # Hide log_frame in main window
+        self.log_frame.grid_remove()
+        
+        # Hide detach button (it's now in detached window as "Attach")
+        self.detach_btn.grid_remove()
+        
+        # Hide expand/collapse button when detached
+        if hasattr(self, 'expand_collapse_btn'):
+            self.expand_collapse_btn.place_forget()
+        
+        # Remove row weight from main window so it doesn't take up space
+        # Find the main_frame (parent of log_frame)
+        main_frame = self.log_frame.master
+        
+        # Calculate window decorations height before removing weight
+        # This is the difference between root height and main_frame height
+        decorations_height = 0  # Default fallback
+        if hasattr(self, 'main_frame') and self.main_frame:
+            current_root_height = self.root.winfo_height()
+            current_main_frame_height = self.main_frame.winfo_height()
+            decorations_height = current_root_height - current_main_frame_height
+        
+        if main_frame:
+            main_frame.rowconfigure(10, weight=0)  # Remove expansion weight
+        
+        # Force layout update to recalculate sizes without the log section
+        self.root.update_idletasks()
+        
+        # Store minimum URL field height (in pixels) for future adjustments
+        self.url_field_min_height_px = self._get_url_field_height_px()
+        
+        # Store minimum preview frame height (in pixels) for future adjustments
+        self.preview_frame_min_height_px = self._get_preview_frame_height_px()
+        
+        # Calculate new minimum height based on visible content (rows 0-9)
+        # Measure the main_frame required height
+        if hasattr(self, 'main_frame') and self.main_frame:
+            main_frame_height = self.main_frame.winfo_reqheight()
+            
+            # Calculate new minimum height: main_frame content + decorations + small padding
+            new_min_height = main_frame_height + decorations_height + 10  # 10px padding buffer
+            
+            # Ensure minimum is reasonable (at least 300px)
+            new_min_height = max(new_min_height, 300)
+            
+            # Store base minimum height (without URL field and preview frame expansion)
+            self.detached_base_min_height = int(new_min_height)
+            
+            # Adjust for current URL field height (if expanded beyond minimum)
+            current_url_height_px = self._get_url_field_height_px()
+            if current_url_height_px > self.url_field_min_height_px:
+                height_difference = current_url_height_px - self.url_field_min_height_px
+                new_min_height += height_difference
+            
+            # Adjust for current preview frame height (if expanded beyond minimum)
+            current_preview_height_px = self._get_preview_frame_height_px()
+            if current_preview_height_px > self.preview_frame_min_height_px:
+                height_difference = current_preview_height_px - self.preview_frame_min_height_px
+                new_min_height += height_difference
+            
+            # Set new minimum size (width stays the same)
+            self.root.minsize(self.original_min_width, int(new_min_height))
+            
+            # Resize window to new minimum (or current size if smaller)
+            current_height = self.root.winfo_height()
+            target_height = int(new_min_height)
+            if current_height > target_height:
+                # Resize to target height to eliminate empty space
+                current_width = self.root.winfo_width()
+                current_x = self.root.winfo_x()
+                current_y = self.root.winfo_y()
+                self.root.geometry(f"{current_width}x{target_height}+{current_x}+{current_y}")
+                self.root.update_idletasks()
+            elif current_height < target_height:
+                # Resize to target height if current is smaller
+                current_width = self.root.winfo_width()
+                current_x = self.root.winfo_x()
+                current_y = self.root.winfo_y()
+                self.root.geometry(f"{current_width}x{target_height}+{current_x}+{current_y}")
+                self.root.update_idletasks()
+        
+        # Update state
+        self.status_detached = True
+        
+        # Save settings
+        self._save_window_linking_settings()
+    
+    def _get_url_field_height_px(self):
+        """Get current URL field height in pixels."""
+        try:
+            if self.url_text_widget and self.url_text_widget.winfo_viewable():
+                # Text widget is visible - get its actual height
+                return self.url_text_widget.winfo_height()
+            elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
+                # Entry widget is visible - get its actual height
+                return self.url_entry_widget.winfo_height()
+            else:
+                # Neither visible, return 0 or default
+                return 0
+        except Exception:
+            return 0
+    
+    def _get_preview_frame_height_px(self):
+        """Get current preview frame height in pixels."""
+        try:
+            if hasattr(self, 'preview_frame') and self.preview_frame and self.preview_frame.winfo_exists():
+                return self.preview_frame.winfo_height()
+            else:
+                return 0
+        except Exception:
+            return 0
+    
+    def _adjust_window_height_for_dynamic_content(self):
+        """Adjust window height based on URL field and preview frame height differences (only when detached)."""
+        if not self.status_detached or self.url_field_min_height_px is None or self.detached_base_min_height is None:
+            return
+        
+        try:
+            # Get current URL field height
+            current_url_height_px = self._get_url_field_height_px()
+            
+            # Calculate URL field height difference from minimum
+            url_height_difference = current_url_height_px - self.url_field_min_height_px
+            # Allow negative differences (URL field can shrink)
+            
+            # Get current preview frame height
+            current_preview_height_px = self._get_preview_frame_height_px()
+            
+            # Calculate preview frame height difference from minimum
+            preview_height_difference = 0
+            if self.preview_frame_min_height_px is not None:
+                preview_height_difference = current_preview_height_px - self.preview_frame_min_height_px
+                # Allow negative differences (preview frame can shrink)
+            
+            # Calculate new minimum height: base + URL field expansion + preview frame expansion
+            new_min_height = self.detached_base_min_height + url_height_difference + preview_height_difference
+            
+            # Ensure minimum is reasonable (at least 300px)
+            new_min_height = max(new_min_height, 300)
+            
+            # Set new minimum size
+            self.root.minsize(self.original_min_width, int(new_min_height))
+            
+            # Get current window height
+            current_height = self.root.winfo_height()
+            target_height = int(new_min_height)
+            
+            # Resize window to match new minimum if needed
+            if current_height != target_height:
+                current_width = self.root.winfo_width()
+                current_x = self.root.winfo_x()
+                current_y = self.root.winfo_y()
+                self.root.geometry(f"{current_width}x{target_height}+{current_x}+{current_y}")
+                self.root.update_idletasks()
+        except Exception:
+            pass  # Silently fail if there's an issue
+    
+    def _adjust_window_height_for_url_field(self):
+        """Adjust window height based on URL field height difference (only when detached)."""
+        # Redirect to the combined function
+        self._adjust_window_height_for_dynamic_content()
+    
+    def _toggle_window_linking(self):
+        """Toggle linking between main window and detached status window."""
+        self.status_window_linked = not self.status_window_linked
+        
+        if self.status_window_linked:
+            self._initialize_window_linking()
+        else:
+            self._deinitialize_window_linking()
+        
+        # Update checkbox state if it exists
+        if hasattr(self, 'detached_link_var') and self.detached_link_var:
+            self.detached_link_var.set(self.status_window_linked)
+        
+        # Save linking state to settings
+        self._save_window_linking_settings()
+    
+    def _update_link_checkbox_state(self):
+        """Update link checkbox state based on linking state."""
+        if hasattr(self, 'detached_link_var') and self.detached_link_var:
+            self.detached_link_var.set(self.status_window_linked)
+    
+    def _setup_detached_window_bindings(self):
+        """Set up click and focus bindings for the detached window. Called whenever the window is created or recreated."""
+        if not self.detached_window:
+            return
+        
+        try:
+            # Check if window still exists
+            if not self.detached_window.winfo_exists():
+                return
+            
+            # Always re-bind to ensure they work after multiple attach/detach cycles
+            # Use bind_all on the window to catch all clicks, even on child widgets
+            self.detached_window.bind('<Button-1>', self._on_detached_window_click, add='+')
+            self.detached_window.bind('<FocusIn>', self._on_detached_window_focus, add='+')
+            
+            # Also bind to the window's frame and all child widgets to catch clicks everywhere
+            if hasattr(self, 'detached_frame') and self.detached_frame:
+                try:
+                    if self.detached_frame.winfo_exists():
+                        self.detached_frame.bind('<Button-1>', self._on_detached_window_click, add='+')
+                        # Recursively bind to all child widgets
+                        self._bind_to_all_children(self.detached_frame, '<Button-1>', self._on_detached_window_click)
+                except:
+                    pass
+        except Exception:
+            pass  # Silently fail if window is being destroyed
+    
+    def _bind_to_all_children(self, widget, event, handler):
+        """Recursively bind an event to a widget and all its children."""
+        try:
+            widget.bind(event, handler, add='+')
+            for child in widget.winfo_children():
+                self._bind_to_all_children(child, event, handler)
+        except:
+            pass
+    
+    def _initialize_window_linking(self):
+        """Initialize window linking - set up event handlers and calculate initial offset."""
+        if not self.status_detached or not self.detached_window:
+            return
+        
+        try:
+            # Calculate initial offset between windows
+            main_x = self.root.winfo_x()
+            main_y = self.root.winfo_y()
+            detached_x = self.detached_window.winfo_x()
+            detached_y = self.detached_window.winfo_y()
+            
+            self._window_link_offset = (detached_x - main_x, detached_y - main_y)
+            
+            # Store initial positions for movement detection
+            self._last_main_window_pos = (main_x, main_y)
+            self._last_detached_window_pos = (detached_x, detached_y)
+            
+            # Bind to main window Configure event
+            self.root.bind('<Configure>', self._on_main_window_configure)
+        except Exception:
+            pass
+    
+    def _deinitialize_window_linking(self):
+        """Deinitialize window linking - remove event handlers."""
+        try:
+            # Unbind main window Configure event
+            self.root.unbind('<Configure>', self._on_main_window_configure)
+        except Exception:
+            pass
+    
+    def _handle_main_window_movement(self, event):
+        """Handle main window movement - move detached window if linked."""
+        if not self.status_detached or not self.detached_window or not self.detached_window.winfo_exists():
+            return
+        
+        if self._moving_detached_programmatically:
+            return  # Prevent infinite loops
+        
+        try:
+            # Get current main window position
+            current_main_x = self.root.winfo_x()
+            current_main_y = self.root.winfo_y()
+            
+            # Check if position actually changed (not just a resize)
+            if self._last_main_window_pos:
+                old_main_x, old_main_y = self._last_main_window_pos
+                if current_main_x == old_main_x and current_main_y == old_main_y:
+                    return  # No position change, just a resize
+            
+            # Calculate new detached window position
+            if self._window_link_offset:
+                offset_x, offset_y = self._window_link_offset
+                new_detached_x = current_main_x + offset_x
+                new_detached_y = current_main_y + offset_y
+                
+                # Get current detached window size
+                detached_width = self.detached_window.winfo_width()
+                detached_height = self.detached_window.winfo_height()
+                
+                # Set flag to prevent recursive updates
+                self._moving_detached_programmatically = True
+                
+                # Move detached window
+                self.detached_window.geometry(f"{detached_width}x{detached_height}+{new_detached_x}+{new_detached_y}")
+                
+                # Update stored positions
+                self._last_main_window_pos = (current_main_x, current_main_y)
+                self._last_detached_window_pos = (new_detached_x, new_detached_y)
+                
+                # Clear flag after a short delay
+                self.root.after(50, lambda: setattr(self, '_moving_detached_programmatically', False))
+        except Exception:
+            self._moving_detached_programmatically = False
+    
+    def _handle_detached_window_movement(self, event):
+        """Handle detached window movement - recalculate offset if moved manually."""
+        if not self.status_window_linked or not self.detached_window:
+            return
+        
+        if self._moving_detached_programmatically:
+            return  # This is a programmatic move, don't recalculate offset
+        
+        try:
+            # Get current positions
+            current_main_x = self.root.winfo_x()
+            current_main_y = self.root.winfo_y()
+            current_detached_x = self.detached_window.winfo_x()
+            current_detached_y = self.detached_window.winfo_y()
+            
+            # Check if position actually changed (not just a resize)
+            if self._last_detached_window_pos:
+                old_detached_x, old_detached_y = self._last_detached_window_pos
+                if current_detached_x == old_detached_x and current_detached_y == old_detached_y:
+                    return  # No position change, just a resize
+            
+            # Recalculate offset (user moved detached window manually)
+            self._window_link_offset = (current_detached_x - current_main_x, current_detached_y - current_main_y)
+            
+            # Update stored positions
+            self._last_main_window_pos = (current_main_x, current_main_y)
+            self._last_detached_window_pos = (current_detached_x, current_detached_y)
+        except Exception:
+            pass
+    
+    def _schedule_detached_window_size_save(self):
+        """Schedule a debounced save of detached window size."""
+        # Cancel any pending save
+        if hasattr(self, '_detached_window_size_save_timer') and self._detached_window_size_save_timer:
+            try:
+                self.root.after_cancel(self._detached_window_size_save_timer)
+            except:
+                pass
+        
+        # Schedule save after 500ms of no resize activity
+        self._detached_window_size_save_timer = self.root.after(500, self._save_detached_window_size)
+    
+    def _save_detached_window_size(self):
+        """Save detached window size to settings."""
+        try:
+            if self.status_detached and self.detached_window and self.detached_window.winfo_exists():
+                settings = self._load_settings(use_cache=False)
+                # Save window size (extract from geometry)
+                geometry = self.detached_window.geometry()
+                # Geometry format: "widthxheight+x+y" or "widthxheight"
+                if 'x' in geometry:
+                    size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
+                    settings["status_window_size"] = size_part
+                    self._save_settings(settings, debounce=True)
+        except Exception:
+            pass
+    
+    def _save_window_linking_settings(self):
+        """Save window linking state, relative offset, and size to settings."""
+        try:
+            settings = self._load_settings(use_cache=False)
+            settings["status_window_linked"] = self.status_window_linked
+            
+            # Save detached window relative offset and size if detached
+            if self.status_detached and self.detached_window and self.detached_window.winfo_exists():
+                try:
+                    # Calculate and save relative offset
+                    main_x = self.root.winfo_x()
+                    main_y = self.root.winfo_y()
+                    detached_x = self.detached_window.winfo_x()
+                    detached_y = self.detached_window.winfo_y()
+                    relative_offset = (detached_x - main_x, detached_y - main_y)
+                    settings["status_window_offset"] = list(relative_offset)
+                    
+                    # Save window size (extract from geometry)
+                    geometry = self.detached_window.geometry()
+                    # Geometry format: "widthxheight+x+y" or "widthxheight"
+                    if 'x' in geometry:
+                        size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
+                        settings["status_window_size"] = size_part
+                    
+                    settings["status_window_detached"] = True
+                except Exception:
+                    pass
+            else:
+                settings["status_window_detached"] = False
+            
+            self._save_settings(settings, debounce=True)
+        except Exception:
+            pass
+    
+    def _check_and_restore_detached_state(self):
+        """Restore detached state if it was previously detached (deprecated - always start attached now)."""
+        # This function is kept for backwards compatibility but no longer auto-detaches
+        # App always starts with log attached as requested
+        # Linking state is already loaded in __init__ from settings
+        pass
+    
+    def _reattach_status_window(self):
+        """Reattach status window to main window."""
+        if not self.status_detached:
+            return  # Already attached
+        
+        # Deinitialize linking before closing
+        if self.status_window_linked:
+            self._deinitialize_window_linking()
+        
+        # Calculate and save relative offset before closing
+        if self.detached_window and self.detached_window.winfo_exists():
+            try:
+                # Calculate current relative offset
+                main_x = self.root.winfo_x()
+                main_y = self.root.winfo_y()
+                detached_x = self.detached_window.winfo_x()
+                detached_y = self.detached_window.winfo_y()
+                self.window_offset = (detached_x - main_x, detached_y - main_y)
+                
+                # Save window size
+                geometry = self.detached_window.geometry()
+                if 'x' in geometry:
+                    size_part = geometry.split('+')[0] if '+' in geometry else geometry.split('-')[0] if '-' in geometry else geometry
+                    self.status_window_size = size_part
+            except Exception:
+                pass
+            
+            self.detached_window.destroy()
+            self.detached_window = None
+            self.detached_frame = None
+        
+        # Move widgets back to main window
+        self._move_widgets_to_main_window()
+        
+        # Show log_frame in main window
+        self.log_frame.grid()
+        
+        # Show detach button again
+        self.detach_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
+        
+        # Restore row weight in main window so log section expands again
+        main_frame = self.log_frame.master
+        if main_frame:
+            main_frame.rowconfigure(10, weight=1)  # Restore expansion weight
+        
+        # Restore original minimum size and window geometry
+        if self.original_min_width is not None and self.original_min_height is not None:
+            self.root.minsize(self.original_min_width, self.original_min_height)
+        
+        # Restore original window size and position
+        if self.original_window_geometry:
+            self.root.geometry(self.original_window_geometry)
+            self.root.update_idletasks()
+        
+        # Restore expand/collapse button position
+        if hasattr(self, 'expand_collapse_btn'):
+            self.root.after(100, lambda: self._position_expand_button())
+        
+        # Update state
+        self.status_detached = False
+        
+        # Save settings
+        self._save_window_linking_settings()
+    
+    def _position_expand_button(self):
+        """Reposition expand/collapse button after reattach."""
+        if hasattr(self, 'expand_collapse_btn') and self.expand_collapse_btn.winfo_exists():
+            frame_width = self.log_frame.winfo_width()
+            if frame_width > 1:
+                self.expand_collapse_btn.place(relx=0.5, rely=1.0, anchor='s', y=-2)
+    
+    def _create_detached_status_window(self):
+        """Create a new window for the detached status log."""
+        # Check if window already exists and is valid
+        if self.detached_window:
+            try:
+                if self.detached_window.winfo_exists():
+                    return  # Already exists and is valid
+                else:
+                    # Window was destroyed but reference still exists - clear it
+                    self.detached_window = None
+            except:
+                # Window reference is invalid - clear it
+                self.detached_window = None
+        
+        colors = self.theme_colors
+        log_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        
+        # Create Toplevel window
+        self.detached_window = Toplevel(self.root)
+        self.detached_window.title("Status Log")
+        self.detached_window.resizable(True, True)
+        self.detached_window.minsize(400, 150)  # Minimum usable size
+        
+        # Set initial size to match current status section
+        if hasattr(self, 'log_frame') and self.log_frame.winfo_exists():
+            try:
+                current_width = self.log_frame.winfo_width()
+                current_height = self.log_frame.winfo_height()
+                if current_width < 400:
+                    current_width = 520  # Use main window width as default
+                if current_height < 150:
+                    current_height = 200  # Minimum height
+            except:
+                current_width = 520
+                current_height = 200
+        else:
+            current_width = 520
+            current_height = 200
+        
+        # Load saved size from settings if available
+        settings = self._load_settings(use_cache=False)
+        saved_size = settings.get("status_window_size", None)
+        if saved_size and 'x' in saved_size:
+            try:
+                # Use saved size
+                size_parts = saved_size.split('x')
+                if len(size_parts) == 2:
+                    saved_width = int(size_parts[0])
+                    saved_height = int(size_parts[1])
+                    # Validate saved size (must meet minimum requirements)
+                    if saved_width >= 400 and saved_height >= 150:
+                        current_width = saved_width
+                        current_height = saved_height
+            except Exception:
+                pass  # Use calculated size if parsing fails
+        
+        # Position window relative to main window using saved offset
+        main_x = self.root.winfo_x()
+        main_y = self.root.winfo_y()
+        offset_x, offset_y = self.window_offset
+        
+        # Calculate detached window position
+        detached_x = main_x + offset_x
+        detached_y = main_y + offset_y
+        
+        # Ensure window stays on screen (basic bounds checking)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        if detached_x < 0:
+            detached_x = main_x + self.root.winfo_width() + 20  # Default to right side
+        if detached_y < 0:
+            detached_y = main_y
+        if detached_x + current_width > screen_width:
+            detached_x = screen_width - current_width - 20
+        if detached_y + current_height > screen_height:
+            detached_y = screen_height - current_height - 20
+        
+        # Set window geometry with relative position
+        self.detached_window.geometry(f"{current_width}x{current_height}+{detached_x}+{detached_y}")
+        
+        # Configure window background
+        self.detached_window.configure(bg=log_frame_bg)
+        
+        # Create container frame matching log_frame structure
+        self.detached_frame = Frame(self.detached_window, bg=log_frame_bg, relief='flat', 
+                          bd=1, highlightbackground=colors.border, highlightthickness=1)
+        self.detached_frame.pack(fill=BOTH, expand=True, padx=0, pady=0)
+        
+        # Handle window close - reattach instead of destroying
+        self.detached_window.protocol("WM_DELETE_WINDOW", self._reattach_status_window)
+        
+        # Bind to window movement/resize to destroy any active tooltips and handle linking
+        # This prevents tooltips from getting stuck when the window moves
+        self.detached_window.bind('<Configure>', self._on_detached_window_move)
+        
+        # Bind to click and focus events to bring both windows to front when either is clicked
+        # Use a helper function to ensure bindings are always set
+        self._setup_detached_window_bindings()
+        
+        # Make sure window is visible and updated before moving widgets
+        self.detached_window.deiconify()  # Ensure window is visible
+        self.detached_window.lift()  # Bring to front
+        self.detached_window.update_idletasks()
+        
+        # Apply theme to window
+        self._apply_theme_to_detached_window()
+        
+        # Initialize movement tracking and linking AFTER window is positioned and visible
+        # This ensures we can properly calculate the offset with accurate window positions
+        if self.status_window_linked:
+            # Use after() to ensure window is fully positioned and rendered before initializing
+            # This gives the window manager time to position the window correctly
+            def init_linking_after_positioned():
+                if self.status_detached and self.detached_window and self.detached_window.winfo_exists():
+                    try:
+                        # Verify window has valid position before initializing
+                        x = self.detached_window.winfo_x()
+                        y = self.detached_window.winfo_y()
+                        if x > 0 or y > 0:  # Window has been positioned
+                            self._initialize_window_linking()
+                        else:
+                            # Window not positioned yet, try again
+                            self.detached_window.after(50, init_linking_after_positioned)
+                    except:
+                        pass
+            self.detached_window.after(100, init_linking_after_positioned)
+    
+    def _apply_theme_to_detached_window(self):
+        """Apply current theme to detached window."""
+        if not self.detached_window or not self.detached_window.winfo_exists():
+            return
+        
+        colors = self.theme_colors
+        log_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        
+        # Update window background
+        self.detached_window.configure(bg=log_frame_bg)
+        
+        # Update frame background
+        if hasattr(self, 'detached_frame') and self.detached_frame:
+            self.detached_frame.configure(bg=log_frame_bg, highlightbackground=colors.border)
+        
+        # Update label backgrounds
+        if hasattr(self, 'detached_log_label') and self.detached_log_label:
+            self.detached_log_label.configure(bg=log_frame_bg, fg=colors.fg)
+        
+        # Update log text background
+        log_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        if hasattr(self, 'log_text') and self.log_text:
+            self.log_text.configure(bg=log_bg, fg=colors.fg, insertbackground=colors.fg)
+        
+        # Update link checkbox for theme
+        if hasattr(self, 'detached_link_toggle') and self.detached_link_toggle:
+            self.detached_link_toggle.configure(bg=log_frame_bg, fg=colors.fg, 
+                                               selectcolor=log_frame_bg,
+                                               activebackground=log_frame_bg,
+                                               activeforeground=colors.fg)
+        
+        # Update checkboxes
+        if hasattr(self, 'word_wrap_toggle') and self.word_wrap_toggle:
+            self.word_wrap_toggle.configure(bg=log_frame_bg, fg=colors.fg, 
+                                        selectcolor=log_frame_bg,
+                                        activebackground=log_frame_bg,
+                                        activeforeground=colors.fg)
+        if hasattr(self, 'debug_toggle') and self.debug_toggle:
+            self.debug_toggle.configure(bg=log_frame_bg, fg=colors.fg,
+                                       selectcolor=log_frame_bg,
+                                       activebackground=log_frame_bg,
+                                       activeforeground=colors.fg)
+    
+    def _move_widgets_to_detached_window(self):
+        """Move all status widgets from main window to detached window."""
+        if not self.detached_window or not self.detached_frame:
+            return
+        
+        # Store original parent (main_frame) for later restoration
+        if not hasattr(self, '_original_log_frame_parent'):
+            self._original_log_frame_parent = self.log_frame.master
+        
+        # Move the entire log_frame to the detached window
+        # First, remove it from main window
+        self.log_frame.grid_forget()
+        
+        # Hide detach button (will be replaced with Attach button)
+        self.detach_btn.grid_forget()
+        
+        # Hide expand/collapse button
+        if hasattr(self, 'expand_collapse_btn'):
+            self.expand_collapse_btn.place_forget()
+        
+        # Create a complete duplicate of the log section in the detached window
+        # (We can't move widgets between parents in Tkinter, so we create a duplicate)
+        self._create_detached_log_section()
+        
+        # Hide the original log_frame in main window
+        self.log_frame.grid_remove()
+        
+        # Hide detach button
+        self.detach_btn.grid_remove()
+        
+        # Force update to ensure all widgets are visible and content is displayed
+        self.detached_window.update_idletasks()
+        self.detached_window.update()
+        
+        # Ensure click and focus bindings are set (re-establish after widget movement)
+        # Always re-establish bindings to ensure they work after multiple attach/detach cycles
+        # Use a delayed call to ensure window is fully ready
+        self.detached_window.after(10, self._setup_detached_window_bindings)
+        
+        # Ensure the detached log text widget is properly displayed
+        if hasattr(self, 'detached_log_text') and self.detached_log_text:
+            try:
+                self.detached_log_text.update_idletasks()
+                # Force a refresh of the content display
+                self.detached_window.after(10, lambda: self.detached_log_text.update_idletasks() if hasattr(self, 'detached_log_text') and self.detached_log_text else None)
+            except:
+                pass
+    
+    def _create_detached_log_section(self):
+        """Create a complete duplicate of the log section in the detached window."""
+        colors = self.theme_colors
+        log_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        log_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        
+        # Create duplicate log_frame structure in detached window
+        detached_log_frame = Frame(self.detached_frame, bg=log_frame_bg, relief='flat', 
+                                   bd=1, highlightbackground=colors.border, highlightthickness=1)
+        detached_log_frame.pack(fill=BOTH, expand=True, padx=0, pady=0)
+        self.detached_log_frame = detached_log_frame
+        
+        # Header row
+        detached_log_label = Label(detached_log_frame, text="Status", 
+                                  bg=log_frame_bg, fg=colors.fg, font=("Segoe UI", 9))
+        detached_log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 2))
+        
+        # Link checkbox - toggle linking between main and detached windows
+        detached_link_var = BooleanVar(value=self.status_window_linked)
+        # Create a wrapper function that syncs with the linking state
+        def sync_window_linking():
+            # Update linking state
+            self.status_window_linked = detached_link_var.get()
+            if self.status_window_linked:
+                self._initialize_window_linking()
+            else:
+                self._deinitialize_window_linking()
+            # Save linking state to settings
+            self._save_window_linking_settings()
+        
+        detached_link_toggle = Checkbutton(
+            detached_log_frame,
+            text="Link",
+            variable=detached_link_var,
+            bg=log_frame_bg,
+            fg=colors.fg,
+            selectcolor=log_frame_bg,
+            activebackground=log_frame_bg,
+            activeforeground=colors.fg,
+            font=("Segoe UI", 8),
+            command=sync_window_linking
+        )
+        detached_link_toggle.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
+        self.detached_link_toggle = detached_link_toggle
+        self.detached_link_var = detached_link_var
+        
+        # Attach button
+        self.attach_btn = ttk.Button(
+            detached_log_frame,
+            text="Attach",
+            command=self._reattach_status_window,
+            cursor='hand2',
+            style='Small.TButton',
+            state='normal'
+        )
+        self.attach_btn.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(0, 0))
+        #self._create_tooltip(self.attach_btn, "Reattach status log to main window")
+        
+        # Clear Log button - create new one that calls the same function
+        detached_clear_btn = ttk.Button(
+            detached_log_frame,
+            text="Clear Log",
+            command=self._clear_log,
+            cursor='arrow',
+            style='Small.TButton',
+            state=self.clear_log_btn.cget('state')  # Match state of original
+        )
+        detached_clear_btn.grid(row=0, column=3, sticky=E, padx=(0, 6), pady=(0, 0))
+        self.detached_clear_log_btn = detached_clear_btn
+        
+        # Word Wrap toggle - create new one that syncs with main toggle
+        detached_word_wrap_var = BooleanVar(value=self.word_wrap_var.get())
+        # Create a wrapper function that syncs both toggles
+        def sync_word_wrap():
+            # Update main toggle
+            self.word_wrap_var.set(detached_word_wrap_var.get())
+            # Call the toggle function which handles both widgets
+            self._toggle_word_wrap()
+        detached_word_wrap_toggle = Checkbutton(
+            detached_log_frame,
+            text="Word wrap",
+            variable=detached_word_wrap_var,
+            bg=log_frame_bg,
+            fg=colors.fg,
+            selectcolor=log_frame_bg,
+            activebackground=log_frame_bg,
+            activeforeground=colors.fg,
+            font=("Segoe UI", 8),
+            command=sync_word_wrap
+        )
+        detached_word_wrap_toggle.grid(row=0, column=3, sticky=E, padx=(0, 6), pady=(0, 0))
+        self.detached_word_wrap_toggle = detached_word_wrap_toggle
+        self.detached_word_wrap_var = detached_word_wrap_var
+        
+        # Debug toggle - create new one that syncs with main toggle
+        detached_debug_var = BooleanVar(value=self.debug_mode_var.get())
+        # Create a wrapper function that syncs both toggles
+        def sync_debug_mode():
+            # Update main toggle
+            self.debug_mode_var.set(detached_debug_var.get())
+            # Call the toggle function which handles both widgets
+            self._toggle_debug_mode()
+        detached_debug_toggle = Checkbutton(
+            detached_log_frame,
+            text="Debug",
+            variable=detached_debug_var,
+            bg=log_frame_bg,
+            fg=colors.fg,
+            selectcolor=log_frame_bg,
+            activebackground=log_frame_bg,
+            activeforeground=colors.fg,
+            font=("Segoe UI", 8),
+            command=sync_debug_mode
+        )
+        detached_debug_toggle.grid(row=0, column=4, sticky=E, padx=6, pady=(0, 0))
+        self.detached_debug_toggle = detached_debug_toggle
+        self.detached_debug_var = detached_debug_var
+        
+        # Configure column weights
+        detached_log_frame.columnconfigure(0, weight=1)
+        for col in range(1, 6):  # Updated to 6 columns (Status, Link, Attach, Clear Log, Word Wrap, Debug)
+            detached_log_frame.columnconfigure(col, weight=0)
+        
+        # Log content frame
+        detached_log_content = Frame(detached_log_frame, bg=log_frame_bg)
+        detached_log_content.grid(row=1, column=0, columnspan=6, sticky=(W, E, N, S), padx=6, pady=(0, 6))
+        detached_log_frame.rowconfigure(1, weight=1)
+        detached_log_content.columnconfigure(0, weight=1)
+        detached_log_content.columnconfigure(1, weight=0)
+        detached_log_content.rowconfigure(0, weight=1)
+        
+        # Get current word wrap setting
+        wrap_mode = WORD if self.word_wrap_var.get() else 'none'
+        
+        # Create duplicate log text widget - this will share the same content via sync
+        detached_log_text = Text(
+            detached_log_content,
+            height=6,
+            width=55,
+            font=("Consolas", 8),
+            wrap=wrap_mode,
+            bg=log_bg,
+            fg=colors.fg,
+            insertbackground=colors.fg,
+            selectbackground='#264F78',
+            selectforeground='#FFFFFF',
+            borderwidth=0,
+            highlightthickness=0,
+            relief='flat',
+            state='disabled'
+        )
+        detached_log_text.grid(row=0, column=0, sticky=(W, E, N, S))
+        self.detached_log_text = detached_log_text
+        
+        # Copy all content from original log_text to detached
+        try:
+            if hasattr(self, 'log_text') and self.log_text and self.log_text.winfo_exists():
+                original_content = self.log_text.get(1.0, END)
+                if original_content and original_content.strip():
+                    detached_log_text.config(state='normal')
+                    detached_log_text.delete(1.0, END)  # Clear any existing content first
+                    detached_log_text.insert(1.0, original_content)
+                    detached_log_text.config(state='disabled')
+                    # Sync scroll position
+                    try:
+                        # Get scroll position from main log
+                        main_scroll = self.log_text.yview()
+                        detached_log_text.yview_moveto(main_scroll[0])
+                    except:
+                        pass
+        except Exception as e:
+            # If copying fails, at least ensure the widget is in a valid state
+            try:
+                detached_log_text.config(state='disabled')
+            except:
+                pass
+        
+        # Create duplicate scrollbar
+        scrollbar_style = 'TScrollbar' if self.current_theme == 'light' else 'Dark.Vertical.TScrollbar'
+        detached_scrollbar = ttk.Scrollbar(
+            detached_log_content,
+            orient='vertical',
+            style='TScrollbar',
+            command=detached_log_text.yview
+        )
+        detached_scrollbar.grid(row=0, column=1, sticky=(N, S))
+        detached_log_text.configure(yscrollcommand=detached_scrollbar.set)
+        self.detached_log_scrollbar = detached_scrollbar
+        
+        if scrollbar_style != 'TScrollbar':
+            self.detached_window.update_idletasks()
+            detached_scrollbar.configure(style=scrollbar_style)
+        
+        # Configure search tags (same as original)
+        detached_log_text.tag_config(self.search_tag_name, background='#FFD700', foreground='#000000')
+        detached_log_text.tag_config(self.current_match_tag_name, background='#00FF00', foreground='#000000')
+        detached_log_text.tag_config(self.debug_tag_name, foreground='#1E1E1E', background='#1E1E1E')
+        
+        # Bind events
+        detached_log_text.bind('<Button-1>', lambda e: self._on_log_Click(), add=True)
+        
+        # Bind Ctrl+F in detached window
+        self.detached_window.bind_all('<Control-f>', lambda e: self._show_search_bar())
+    
+    def _move_widgets_to_main_window(self):
+        """Move all status widgets back from detached window to main window."""
+        # Destroy detached log section
+        if hasattr(self, 'detached_log_frame'):
+            self.detached_log_frame.destroy()
+            delattr(self, 'detached_log_frame')
+        if hasattr(self, 'detached_log_text'):
+            delattr(self, 'detached_log_text')
+        if hasattr(self, 'detached_log_scrollbar'):
+            delattr(self, 'detached_log_scrollbar')
+        if hasattr(self, 'detached_clear_log_btn'):
+            delattr(self, 'detached_clear_log_btn')
+        if hasattr(self, 'detached_word_wrap_toggle'):
+            delattr(self, 'detached_word_wrap_toggle')
+        if hasattr(self, 'detached_debug_toggle'):
+            delattr(self, 'detached_debug_toggle')
+        if hasattr(self, 'attach_btn'):
+            self.attach_btn.destroy()
+            delattr(self, 'attach_btn')
+        if hasattr(self, 'detached_link_toggle'):
+            self.detached_link_toggle.destroy()
+            delattr(self, 'detached_link_toggle')
+        if hasattr(self, 'detached_link_var'):
+            delattr(self, 'detached_link_var')
+        # Clean up detached search bar
+        if hasattr(self, 'detached_search_frame'):
+            try:
+                self.detached_search_frame.destroy()
+            except:
+                pass
+            delattr(self, 'detached_search_frame')
+        if hasattr(self, 'detached_search_entry'):
+            delattr(self, 'detached_search_entry')
+        if hasattr(self, 'detached_search_count_label'):
+            delattr(self, 'detached_search_count_label')
+        if hasattr(self, 'detached_search_close_btn'):
+            delattr(self, 'detached_search_close_btn')
+        
+        # Restore log_frame to its original position in main window
+        # Use the same grid configuration as in _setup_log_section
+        if hasattr(self, 'main_frame') and self.main_frame:
+            self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(2, 4), padx=0)
+        else:
+            # Fallback: find main_frame
+            main_frame = None
+            for child in self.root.winfo_children():
+                if isinstance(child, (Frame, ttk.Frame)) and child != self.detached_window:
+                    # Check if this is main_frame by looking for URL widgets
+                    try:
+                        for widget in child.winfo_children():
+                            if hasattr(self, 'url_entry_widget') and widget == self.url_entry_widget:
+                                main_frame = child
+                                break
+                            if hasattr(widget, 'winfo_children'):
+                                for grandchild in widget.winfo_children():
+                                    if hasattr(self, 'url_entry_widget') and grandchild == self.url_entry_widget:
+                                        main_frame = child
+                                        break
+                                if main_frame:
+                                    break
+                        if main_frame:
+                            break
+                    except:
+                        pass
+            if main_frame:
+                self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(2, 4), padx=0)
+        
+        # Show detach button again (restore to original position)
+        self.detach_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
+        
+        # Restore expand/collapse button position
+        if hasattr(self, 'expand_collapse_btn'):
+            self.root.after(100, lambda: self._position_expand_button())
     
     def log(self, message):
         """Add message to log. Stores messages for debug toggle functionality."""
@@ -12010,6 +15610,17 @@ class BandcampDownloaderGUI:
             self.log_text.insert(END, message + "\n")
             self.log_text.see(END)
             self.log_text.config(state='disabled')
+            
+            # Also update detached log text if it exists
+            if hasattr(self, 'detached_log_text') and self.detached_log_text:
+                try:
+                    self.detached_log_text.config(state='normal')
+                    self.detached_log_text.insert(END, message + "\n")
+                    self.detached_log_text.see(END)
+                    self.detached_log_text.config(state='disabled')
+                except:
+                    pass
+            
             self.root.update_idletasks()
         
         # Update clear button state using the helper method
@@ -12036,20 +15647,41 @@ class BandcampDownloaderGUI:
     
     def _show_search_bar(self):
         """Show the search bar for finding text in the log. If already visible, hide it (toggle behavior)."""
-        if self.search_frame and self.search_frame.winfo_viewable():
-            # Already visible - call _hide_search_bar directly (same as close button)
-            self._hide_search_bar()
-            return
-        
-        # Create search frame if it doesn't exist
-        if not self.search_frame:
-            self._create_search_bar()
-        
-        # Show the search frame at the bottom (after log_content)
-        self.search_frame.grid(row=2, column=0, columnspan=2, sticky=(W, E), padx=6, pady=(4, 6))
-        if self.search_entry:
-            self.search_entry.focus_set()
-            self.search_entry.select_range(0, END)
+        # Determine which window should show the search bar
+        if self.status_detached and hasattr(self, 'detached_log_frame') and self.detached_log_frame:
+            # Detached window - show search bar in detached window
+            if hasattr(self, 'detached_search_frame') and self.detached_search_frame and self.detached_search_frame.winfo_viewable():
+                # Already visible - hide it
+                self._hide_search_bar()
+                return
+            
+            # Create detached search frame if it doesn't exist
+            if not hasattr(self, 'detached_search_frame') or not self.detached_search_frame:
+                self._create_detached_search_bar()
+            
+            # Show the search frame at the bottom (after log_content)
+            # Span all 6 columns to match detached_log_content width
+            self.detached_search_frame.grid(row=2, column=0, columnspan=6, sticky=(W, E), padx=6, pady=(4, 6))
+            if hasattr(self, 'detached_search_entry') and self.detached_search_entry:
+                self.detached_search_entry.focus_set()
+                self.detached_search_entry.select_range(0, END)
+        else:
+            # Main window - show search bar in main window
+            if self.search_frame and self.search_frame.winfo_viewable():
+                # Already visible - call _hide_search_bar directly (same as close button)
+                self._hide_search_bar()
+                return
+            
+            # Create search frame if it doesn't exist
+            if not self.search_frame:
+                self._create_search_bar()
+            
+            # Show the search frame at the bottom (after log_content)
+            # Span all 5 columns to match log_content width
+            self.search_frame.grid(row=2, column=0, columnspan=5, sticky=(W, E), padx=6, pady=(4, 6))
+            if self.search_entry:
+                self.search_entry.focus_set()
+                self.search_entry.select_range(0, END)
     
     def _create_search_bar(self):
         """Create the search bar UI."""
@@ -12092,7 +15724,7 @@ class BandcampDownloaderGUI:
         # Store close button reference and bind properly
         def on_close_Click(event):
             self._hide_search_bar()
-            return "break"  # Prevent event propagation
+            return "break"  # Prevent event propagation to global ESC handler
         
         self.search_close_btn.bind("<Button-1>", on_close_Click)
         self.search_close_btn.bind("<Enter>", lambda e: self.search_close_btn.config(fg=colors.hover_fg))
@@ -12124,7 +15756,8 @@ class BandcampDownloaderGUI:
         self.search_entry.bind('<Return>', on_enter)
         self.search_entry.bind('<Shift-Return>', lambda e: (self._find_previous() if self.search_matches else None) or "break")
         # ESC and Ctrl+F call the exact same handler as the close button
-        self.search_entry.bind('<Escape>', on_close_Click)
+        # Return "break" to prevent event propagation to global ESC handler
+        self.search_entry.bind('<Escape>', lambda e: (on_close_Click(e), "break")[1])
         self.search_entry.bind('<Control-f>', on_close_Click)
         
         # Make search frame and all its children Clickable/interactive
@@ -12141,21 +15774,104 @@ class BandcampDownloaderGUI:
             if child != self.search_close_btn:
                 child.bind('<Button-1>', lambda e: None)  # Allow Clicks
     
+    def _create_detached_search_bar(self):
+        """Create the search bar UI for the detached window."""
+        if not hasattr(self, 'detached_log_frame') or not self.detached_log_frame:
+            return
+        
+        colors = self.theme_colors
+        self.detached_search_frame = Frame(self.detached_log_frame, bg=colors.select_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
+        
+        # Search label
+        search_label = Label(self.detached_search_frame, text="Find:", bg=colors.select_bg, fg=colors.fg, font=("Segoe UI", 8))
+        search_label.grid(row=0, column=0, sticky=W, padx=(6, 4), pady=4)
+        
+        # Search entry - use the same search_var to sync with main window
+        if not hasattr(self, 'search_var'):
+            self.search_var = StringVar()
+        self.detached_search_entry = Entry(self.detached_search_frame, textvariable=self.search_var, width=25, 
+                                 font=("Segoe UI", 8), bg=colors.entry_bg, fg=colors.entry_fg, 
+                                 insertbackground=colors.fg, relief='flat', borderwidth=1, 
+                                 highlightthickness=1, highlightbackground=colors.border,
+                                 highlightcolor=colors.accent)
+        self.detached_search_entry.grid(row=0, column=1, sticky=(W, E), padx=(0, 4), pady=4)
+        
+        # Match count label
+        self.detached_search_count_label = Label(self.detached_search_frame, text="", bg=colors.select_bg, fg=colors.disabled_fg,
+                                       font=("Segoe UI", 8))
+        self.detached_search_count_label.grid(row=0, column=2, sticky=W, padx=(0, 4), pady=4)
+        
+        # Next button
+        next_btn = ttk.Button(self.detached_search_frame, text="Next", command=self._find_next,
+                              cursor='hand2', style='Small.TButton')
+        next_btn.grid(row=0, column=3, sticky=W, padx=(0, 2), pady=4)
+        
+        # Previous button
+        prev_btn = ttk.Button(self.detached_search_frame, text="Previous", command=self._find_previous,
+                             cursor='hand2', style='Small.TButton')
+        prev_btn.grid(row=0, column=4, sticky=W, padx=(0, 2), pady=4)
+        
+        # Close button (X)
+        detached_search_close_btn = Label(self.detached_search_frame, text="✕", bg=colors.select_bg, fg=colors.disabled_fg,
+                                     font=("Segoe UI", 9), cursor='hand2', width=1, height=1)
+        detached_search_close_btn.grid(row=0, column=5, sticky=E, padx=(4, 6), pady=4)
+        
+        # Store close button reference and bind properly
+        def on_close_Click(event):
+            self._hide_search_bar()
+            return "break"
+        
+        detached_search_close_btn.bind("<Button-1>", on_close_Click)
+        detached_search_close_btn.bind("<Enter>", lambda e: detached_search_close_btn.config(fg=colors.hover_fg))
+        detached_search_close_btn.bind("<Leave>", lambda e: detached_search_close_btn.config(fg=colors.disabled_fg))
+        self.detached_search_close_btn = detached_search_close_btn
+        
+        # Configure column weights
+        self.detached_search_frame.columnconfigure(1, weight=1)
+        
+        # Bind events - same as main search bar
+        def on_key_release(event):
+            if event.keysym != 'Return':
+                self._on_search_change()
+        
+        self.detached_search_entry.bind('<KeyRelease>', on_key_release)
+        
+        def on_enter(event):
+            search_text = self.search_var.get()
+            if search_text:
+                if not self.search_matches:
+                    self._perform_search(search_text, reset_index=True)
+                else:
+                    self._find_next()
+            return "break"
+        
+        self.detached_search_entry.bind('<Return>', on_enter)
+        self.detached_search_entry.bind('<Shift-Return>', lambda e: (self._find_previous() if self.search_matches else None) or "break")
+        # Return "break" to prevent event propagation to global ESC handler
+        self.detached_search_entry.bind('<Escape>', lambda e: (on_close_Click(e), "break")[1])
+        self.detached_search_entry.bind('<Control-f>', on_close_Click)
+    
     def _hide_search_bar(self):
-        """Hide the search bar and clear highlights."""
+        """Hide the search bar and clear highlights in both windows."""
         # Clear the search field first - this will trigger _on_search_change() which clears highlights
         if hasattr(self, 'search_var') and self.search_var:
             self.search_var.set("")
         
+        # Hide search frames in both windows
         if self.search_frame:
             self.search_frame.grid_remove()
+        if hasattr(self, 'detached_search_frame') and self.detached_search_frame:
+            self.detached_search_frame.grid_remove()
         
         # Also explicitly clear highlights as backup
         self._clear_search_highlights()
         
-        # Ensure root window can receive keyboard events (for Ctrl+F to work)
+        # Ensure windows can receive keyboard events (for Ctrl+F to work)
         # Use after_idle to ensure this happens after the search frame is removed
-        self.root.after_idle(lambda: self.root.focus_set())
+        if self.status_detached and self.detached_window:
+            self.detached_window.after_idle(lambda: self.detached_window.focus_set() if self.detached_window.winfo_exists() else None)
+        else:
+            self.root.after_idle(lambda: self.root.focus_set())
     
     def _toggle_window_height(self):
         """Toggle window height between default and expanded (default + 150px)."""
@@ -12264,6 +15980,8 @@ class BandcampDownloaderGUI:
     def _end_url_text_resize(self, event):
         """End resizing the URL text widget."""
         self.url_text_resizing = False
+        # Adjust window height if detached
+        self.root.after(50, self._adjust_window_height_for_url_field)
     
     def _auto_expand_url_text_height(self):
         """Auto-expand URL text widget height to fit content, up to maximum height."""
@@ -12277,6 +15995,8 @@ class BandcampDownloaderGUI:
                 # Empty content - collapse to minimum
                 self.url_text_widget.config(height=1)
                 self.url_text_height = 1
+                # Adjust window height if detached
+                self.root.after(50, self._adjust_window_height_for_url_field)
                 return
             
             # Calculate maximum allowed height in lines (do this first)
@@ -12362,6 +16082,8 @@ class BandcampDownloaderGUI:
             if new_height != current_height:
                 self.url_text_widget.config(height=new_height)
                 self.url_text_height = new_height
+                # Adjust window height if detached
+                self.root.after(50, self._adjust_window_height_for_url_field)
         except Exception:
             pass  # Silently fail if there's an issue
     
@@ -12402,6 +16124,9 @@ class BandcampDownloaderGUI:
                 # If taller than minimum, minimize it
                 self.url_text_widget.config(height=1)
                 self.url_text_height = 1
+            
+            # Adjust window height if detached
+            self.root.after(50, self._adjust_window_height_for_url_field)
         except Exception:
             pass  # Silently fail if there's an issue
     
@@ -12491,11 +16216,14 @@ class BandcampDownloaderGUI:
             end_index = f"{line_end}.{col_end}"
             self.search_matches.append((start_index, end_index))
         
-        # Highlight all matches
+        # Highlight all matches in both windows
         for start, end in self.search_matches:
             self.log_text.tag_add(self.search_tag_name, start, end)
+            # Also highlight in detached window if it exists
+            if hasattr(self, 'detached_log_text') and self.detached_log_text:
+                self.detached_log_text.tag_add(self.search_tag_name, start, end)
         
-        # Update match count display
+        # Update match count display in both windows
         self._update_search_count()
         
         # Go to first match (or preserve current if reset_index is False)
@@ -12505,28 +16233,41 @@ class BandcampDownloaderGUI:
             self._scroll_to_match(self.current_match_index)
     
     def _clear_search_highlights(self):
-        """Clear all search highlights."""
-        self.log_text.tag_remove(self.search_tag_name, 1.0, END)
-        self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
+        """Clear all search highlights in both windows."""
+        if hasattr(self, 'log_text') and self.log_text:
+            self.log_text.tag_remove(self.search_tag_name, 1.0, END)
+            self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
+        if hasattr(self, 'detached_log_text') and self.detached_log_text:
+            self.detached_log_text.tag_remove(self.search_tag_name, 1.0, END)
+            self.detached_log_text.tag_remove(self.current_match_tag_name, 1.0, END)
         self.search_matches = []
         self.current_match_index = -1
-        # Clear match count display
+        # Clear match count display in both windows
         if hasattr(self, 'search_count_label') and self.search_count_label:
             self.search_count_label.config(text="")
+        if hasattr(self, 'detached_search_count_label') and self.detached_search_count_label:
+            self.detached_search_count_label.config(text="")
     
     def _update_search_count(self):
-        """Update the match count display."""
-        if not hasattr(self, 'search_count_label') or not self.search_count_label:
-            return
-        
+        """Update the match count display in both windows."""
         match_count = len(self.search_matches)
-        if match_count == 0:
-            colors = self.theme_colors
-            self.search_count_label.config(text="No matches", fg=colors.disabled_fg)
-        else:
-            colors = self.theme_colors
-            current = self.current_match_index + 1 if self.current_match_index >= 0 else 1
-            self.search_count_label.config(text=f"{current} of {match_count}", fg=colors.fg)
+        colors = self.theme_colors
+        
+        # Update main window search count label
+        if hasattr(self, 'search_count_label') and self.search_count_label:
+            if match_count == 0:
+                self.search_count_label.config(text="No matches", fg=colors.disabled_fg)
+            else:
+                current = self.current_match_index + 1 if self.current_match_index >= 0 else 1
+                self.search_count_label.config(text=f"{current} of {match_count}", fg=colors.fg)
+        
+        # Update detached window search count label
+        if hasattr(self, 'detached_search_count_label') and self.detached_search_count_label:
+            if match_count == 0:
+                self.detached_search_count_label.config(text="No matches", fg=colors.disabled_fg)
+            else:
+                current = self.current_match_index + 1 if self.current_match_index >= 0 else 1
+                self.detached_search_count_label.config(text=f"{current} of {match_count}", fg=colors.fg)
     
     def _find_next(self):
         """Find next match."""
@@ -12561,26 +16302,31 @@ class BandcampDownloaderGUI:
         self._scroll_to_match(self.current_match_index)
     
     def _scroll_to_match(self, match_index):
-        """Scroll to the specified match and highlight it in green."""
+        """Scroll to the specified match and highlight it in green in both windows."""
         if not self.search_matches or match_index < 0 or match_index >= len(self.search_matches):
             return
         
-        # Remove green highlight from previous current match
-        self.log_text.tag_remove(self.current_match_tag_name, 1.0, END)
-        
         start_pos, end_pos = self.search_matches[match_index]
         
-        # Temporarily enable to scroll
-        self.log_text.config(state='normal')
-        # Remove previous selection
-        self.log_text.tag_remove("sel", 1.0, END)
-        # Add green highlight to current match (on top of yellow)
-        self.log_text.tag_add(self.current_match_tag_name, start_pos, end_pos)
-        # Select the current match (for text selection)
-        self.log_text.tag_add("sel", start_pos, end_pos)
-        # Scroll to make it visible
-        self.log_text.see(start_pos)
-        self.log_text.config(state='disabled')
+        # Update both windows
+        for text_widget in [self.log_text, getattr(self, 'detached_log_text', None)]:
+            if not text_widget:
+                continue
+            
+            # Remove green highlight from previous current match
+            text_widget.tag_remove(self.current_match_tag_name, 1.0, END)
+            
+            # Temporarily enable to scroll
+            text_widget.config(state='normal')
+            # Remove previous selection
+            text_widget.tag_remove("sel", 1.0, END)
+            # Add green highlight to current match (on top of yellow)
+            text_widget.tag_add(self.current_match_tag_name, start_pos, end_pos)
+            # Select the current match (for text selection)
+            text_widget.tag_add("sel", start_pos, end_pos)
+            # Scroll to make it visible
+            text_widget.see(start_pos)
+            text_widget.config(state='disabled')
     
     def get_outtmpl(self):
         """Get output template based on folder structure."""
@@ -14047,6 +17793,161 @@ class BandcampDownloaderGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"⚠ Error in final cover art cleanup: {str(e)}"))
     
+    def download_extras_files(self, download_path):
+        """Download extra artwork and bio pic images to album folders where audio files are located.
+        
+        Args:
+            download_path: Base download path where files should be saved
+        """
+        try:
+            import requests
+            from urllib.parse import urlparse
+            import re
+            
+            base_path = Path(download_path)
+            if not base_path.exists():
+                return
+            
+            # Find directories that contain downloaded audio files (same pattern as rename_cover_art_files)
+            directories_to_process = set()
+            if hasattr(self, 'downloaded_files') and self.downloaded_files:
+                for downloaded_file in self.downloaded_files:
+                    try:
+                        audio_path = Path(downloaded_file)
+                        if audio_path.exists():
+                            directories_to_process.add(audio_path.parent)
+                    except Exception:
+                        pass
+            
+            # If no downloaded files found, use timestamp-based fallback to find recently downloaded files
+            if not directories_to_process:
+                if hasattr(self, 'download_start_time') and self.download_start_time:
+                    time_threshold = self.download_start_time - 30
+                    audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                    try:
+                        for ext in audio_extensions:
+                            for audio_file in base_path.rglob(f"*{ext}"):
+                                if audio_file.name.startswith('.') or 'tmp' in audio_file.name.lower():
+                                    continue
+                                try:
+                                    file_mtime = audio_file.stat().st_mtime
+                                    if file_mtime >= time_threshold:
+                                        directories_to_process.add(audio_file.parent)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            
+            # If still no directories found, don't process anything
+            if not directories_to_process:
+                return
+            
+            # Get URLs to download
+            extra_artwork_urls = []
+            bio_pic_url = None
+            
+            # Get from current artwork data
+            if hasattr(self, 'extra_artwork_urls') and self.extra_artwork_urls:
+                extra_artwork_urls = list(self.extra_artwork_urls)
+            
+            if hasattr(self, 'current_bio_pic_url') and self.current_bio_pic_url:
+                bio_pic_url = self.current_bio_pic_url
+            
+            # Also try to get from metadata cache if not available
+            if not extra_artwork_urls or not bio_pic_url:
+                for url in self.url_tag_mapping.values():
+                    normalized_url = self._normalize_url(url)
+                    if normalized_url in self.url_tag_metadata_cache:
+                        metadata = self.url_tag_metadata_cache[normalized_url]
+                        if not extra_artwork_urls:
+                            extra_artwork_urls = metadata.get('extra_artwork_urls', [])
+                        if not bio_pic_url:
+                            bio_pic_url = metadata.get('bio_pic_url') or metadata.get('bio_pic')
+                        if extra_artwork_urls and bio_pic_url:
+                            break
+            
+            # Process each directory (album folder) separately
+            for album_dir in directories_to_process:
+                if not album_dir.exists():
+                    continue
+                
+                # Download extra artwork images to this album folder
+                extra_num = 1
+                for extra_url in extra_artwork_urls:
+                    if not extra_url:
+                        continue
+                    
+                    try:
+                        # Get file extension from URL
+                        parsed = urlparse(extra_url)
+                        path = parsed.path
+                        ext = Path(path).suffix
+                        if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
+                            ext = '.jpg'  # Default to jpg
+                        
+                        # Generate filename (simple: Extra 1, Extra 2, etc.)
+                        filename = f"Extra {extra_num}{ext}"
+                        file_path = album_dir / filename
+                        
+                        # Skip if already exists
+                        if file_path.exists():
+                            extra_num += 1
+                            continue
+                        
+                        # Download image
+                        response = requests.get(extra_url, timeout=30, stream=True)
+                        response.raise_for_status()
+                        
+                        # Save file to album folder
+                        with open(file_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        
+                        self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded: {f} (to {d})"))
+                        extra_num += 1
+                        
+                    except Exception as e:
+                        self.root.after(0, lambda u=extra_url[-30:]: 
+                                       self.log(f"⚠ Could not download extra artwork: ...{u}"))
+                
+                # Download bio pic to this album folder if available
+                if bio_pic_url:
+                    try:
+                        # Get file extension from URL
+                        parsed = urlparse(bio_pic_url)
+                        path = parsed.path
+                        ext = Path(path).suffix
+                        if not ext or ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
+                            ext = '.jpg'  # Default to jpg
+                        
+                        # Generate filename (simple: Bio Pic)
+                        filename = f"Bio Pic{ext}"
+                        file_path = album_dir / filename
+                        
+                        # Skip if already exists
+                        if file_path.exists():
+                            continue
+                        
+                        # Download image
+                        response = requests.get(bio_pic_url, timeout=30, stream=True)
+                        response.raise_for_status()
+                        
+                        # Save file to album folder
+                        with open(file_path, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        
+                        self.root.after(0, lambda f=filename, d=str(album_dir): self.log(f"✓ Downloaded: {f} (to {d})"))
+                        
+                    except Exception as e:
+                        self.root.after(0, lambda: 
+                                       self.log(f"⚠ Could not download bio pic: {str(e)}"))
+                    
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"⚠ Error downloading extras: {str(e)}"))
+    
     def process_downloaded_files(self, download_path):
         """Process all downloaded files to embed cover art for FLAC, OGG, and WAV."""
         
@@ -15184,6 +19085,8 @@ class BandcampDownloaderGUI:
                     "retries": 3,  # Fewer retries for faster failure
                 }
                 
+                # Ensure yt-dlp is loaded (lazy import)
+                yt_dlp = self._ensure_ytdlp_loaded()
                 with yt_dlp.YoutubeDL(quick_opts) as quick_ydl:
                     quick_info = quick_ydl.extract_info(album_url, download=False)
                     if quick_info:
@@ -15213,6 +19116,8 @@ class BandcampDownloaderGUI:
                 extract_opts["socket_timeout"] = 10  # Faster timeout detection
                 extract_opts["retries"] = 3  # Fewer retries for faster failure
                 
+                # Ensure yt-dlp is loaded (lazy import)
+                yt_dlp = self._ensure_ytdlp_loaded()
                 with yt_dlp.YoutubeDL(extract_opts) as extract_ydl:
                     info = extract_ydl.extract_info(album_url, download=False)
                     if info:
@@ -15325,6 +19230,8 @@ class BandcampDownloaderGUI:
                     retry_opts["socket_timeout"] = 15  # Longer timeout for retry
                     retry_opts["retries"] = 5  # More retries for retry
                     
+                    # Ensure yt-dlp is loaded (lazy import)
+                    yt_dlp = self._ensure_ytdlp_loaded()
                     with yt_dlp.YoutubeDL(retry_opts) as retry_ydl:
                         retry_info = retry_ydl.extract_info(album_url, download=False)
                         if retry_info:
@@ -15596,6 +19503,8 @@ class BandcampDownloaderGUI:
                     extract_opts["quiet"] = True
                     extract_opts["no_warnings"] = True
                     
+                    # Ensure yt-dlp is loaded (lazy import)
+                    yt_dlp = self._ensure_ytdlp_loaded()
                     with yt_dlp.YoutubeDL(extract_opts) as extract_ydl:
                         info = extract_ydl.extract_info(urls[0], download=False)
                         if info and "entries" in info:
@@ -15706,6 +19615,8 @@ class BandcampDownloaderGUI:
                         self.root.after(0, lambda num=idx+1, total=len(urls), u=url:
                                       self.log(f"Fetching metadata [{num}/{total}]: {u}"))
                         
+                        # Ensure yt-dlp is loaded (lazy import)
+                        yt_dlp = self._ensure_ytdlp_loaded()
                         with yt_dlp.YoutubeDL(extract_opts_quick) as extract_ydl:
                             info = extract_ydl.extract_info(url, download=False)
                             if info:
@@ -15956,6 +19867,8 @@ class BandcampDownloaderGUI:
         self.progress_hooks_called = False
         self.progress_hook_call_count = 0
         
+        # Ensure yt-dlp is loaded (lazy import)
+        yt_dlp = self._ensure_ytdlp_loaded()
         ydl = yt_dlp.YoutubeDL(ydl_opts)
         self.ydl_instance = ydl
         
@@ -15994,6 +19907,8 @@ class BandcampDownloaderGUI:
                     return False
                 
                 # Create new yt-dlp instance for retry
+                # Ensure yt-dlp is loaded (lazy import)
+                yt_dlp = self._ensure_ytdlp_loaded()
                 ydl = yt_dlp.YoutubeDL(ydl_opts)
                 self.ydl_instance = ydl
             
@@ -16209,6 +20124,11 @@ class BandcampDownloaderGUI:
                 
                 # Final cleanup: rename all cover art files to "artist - album" format
                 self.final_cover_art_cleanup(download_path)
+                
+                # Download extras (extra artwork and bio pic) if enabled - after final cleanup
+                download_extras = self.download_extras_var.get()
+                if download_extras:
+                    self.download_extras_files(download_path)
             except Exception as e:
                 self.root.after(0, lambda msg=str(e): self.log(f"⚠ Error during post-processing: {msg}"))
                 # Continue anyway - files were downloaded
@@ -16770,6 +20690,55 @@ class BandcampDownloaderGUI:
         
         return False
     
+    def _get_launcher_version(self):
+        """Get launcher version from environment variable or launcher.py file.
+        
+        Returns:
+            Version string if found, None otherwise
+        """
+        if not self.is_launcher_mode:
+            return None
+        
+        # Method 1: Check environment variable (set by launcher.exe or launcher.py)
+        # This is the most reliable method when running from launcher.exe
+        try:
+            launcher_version = os.environ.get('BANDCAMP_LAUNCHER_VERSION')
+            if launcher_version:
+                return launcher_version
+        except Exception:
+            pass
+        
+        # Method 2: Try to read version from launcher.py in script directory
+        # This works when running from launcher.py (not frozen exe)
+        try:
+            launcher_py = self.script_dir / "launcher.py"
+            if launcher_py.exists():
+                with open(launcher_py, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    for line in content.split('\n'):
+                        if '__version__' in line and '=' in line:
+                            # Extract version string
+                            version = line.split('=')[1].strip().strip('"').strip("'")
+                            return version
+        except Exception:
+            pass
+        
+        return None
+    
+    def _get_version_string(self):
+        """Get formatted version string for display.
+        
+        Returns:
+            "GUI vX.X.X" if standalone, "GUI vX.X.X (Launcher vX.X.X)" if launcher mode
+        """
+        gui_version = __version__
+        launcher_version = self._get_launcher_version()
+        
+        if launcher_version:
+            return f"GUI v{gui_version} (Launcher v{launcher_version})"
+        else:
+            return f"GUI v{gui_version}"
+    
     def _check_launcher_update_status(self):
         """Check for launcher update status file.
         
@@ -17254,6 +21223,8 @@ class BandcampDownloaderGUI:
             menu_fg = colors.fg
             
             # Create settings menu
+            # Use brighter blue for checkbox checkmark in dark mode for better contrast
+            checkbox_color = '#4FC3F7' if self.current_theme == 'dark' else colors.accent
             self.settings_menu = Menu(
                 self.root,
                 tearoff=0,
@@ -17261,10 +21232,44 @@ class BandcampDownloaderGUI:
                 fg=menu_fg,
                 activebackground=colors.accent,
                 activeforeground='#FFFFFF',
-                selectcolor=colors.accent,
+                selectcolor=checkbox_color,  # Brighter blue in dark mode, original in light mode
                 borderwidth=1,
                 relief='flat'
             )
+            
+            # Version info at top (non-clickable, looks normal)
+            version_string = self._get_version_string()
+            # Use a no-op command so it looks normal but clicking does nothing
+            # Note: Menu items with commands will highlight on hover (standard Tkinter behavior)
+            # but clicking this item does nothing
+            # Set foreground color - use brighter blue in dark mode for better contrast
+            if self.current_theme == 'dark':
+                # Brighter blue for better contrast in dark mode
+                version_color = '#4FC3F7'  # Bright cyan-blue for dark mode
+            else:
+                # Original accent color for light mode (perfect contrast already)
+                version_color = colors.accent  # #007ACC for light mode
+            self.settings_menu.add_command(
+                label=version_string,
+                command=lambda: None,  # No-op: does nothing when clicked
+                foreground=version_color
+            )
+            # Try to configure the active (hover) state colors for the version item
+            # Get the index of the version item (it's the first item, index 0)
+            try:
+                version_index = 0  # Version is the first item
+                # Set activeforeground to match the text color so hover doesn't change text color
+                self.settings_menu.entryconfig(version_index, activeforeground=version_color)
+                # Try to set a subtle highlight background to match menu background
+                # This makes the highlight less noticeable
+                self.settings_menu.entryconfig(version_index, activebackground=menu_bg)
+            except Exception:
+                # If per-item active colors aren't supported, that's okay
+                # The text color will still be set correctly
+                pass
+            
+            # Separator
+            self.settings_menu.add_separator()
             
             # Check for Updates
             self.settings_menu.add_command(
@@ -17377,15 +21382,18 @@ class BandcampDownloaderGUI:
             PhotoImage object showing scheme name and colored squares, or None if PIL unavailable
         """
         try:
-            # Import PIL modules - ensure all are available
+            # Ensure PIL is loaded (lazy import)
+            Image, ImageTk = self._ensure_pil_loaded()
+            if Image is None or ImageTk is None:
+                return None  # PIL not available
+            
+            # Import additional PIL modules
             try:
-                from PIL import Image, ImageDraw, ImageFont, ImageTk
+                from PIL import ImageDraw, ImageFont
             except ImportError:
                 # Fallback: try importing individually
-                import PIL.Image as Image
                 import PIL.ImageDraw as ImageDraw
                 import PIL.ImageFont as ImageFont
-                import PIL.ImageTk as ImageTk
             
             # Create display name
             if scheme_name == "default":
@@ -17837,9 +21845,8 @@ class BandcampDownloaderGUI:
         
         loading_dialog.update()
         
-        # Create main dialog (hidden initially)
-        dialog = self._create_dialog_base("Get More Themes", 650, 500)
-        dialog.withdraw()  # Hide until ready
+        # Create main dialog (hidden initially - will be shown with fade-in when ready)
+        dialog = self._create_dialog_base("Get More Themes", 650, 500, show_immediately=False)
         
         # Filter themes first (before fetching previews)
         # Get existing schemes and normalize to lowercase for comparison
@@ -17862,8 +21869,8 @@ class BandcampDownloaderGUI:
                 available_themes.append(theme)
         
         if not available_themes:
-            loading_dialog.destroy()
-            dialog.destroy()  # Also destroy the hidden main dialog
+            self._close_dialog_with_fade(loading_dialog)
+            self._close_dialog_with_fade(dialog)  # Also destroy the hidden main dialog
             messagebox.showinfo(
                 "All Themes Installed",
                 "All available themes are already installed!\n\n"
@@ -17872,8 +21879,11 @@ class BandcampDownloaderGUI:
             return
         
         # Show dialog immediately with placeholder colors (lazy loading)
-        loading_dialog.destroy()
-        dialog.deiconify()  # Show dialog immediately
+        self._close_dialog_with_fade(loading_dialog)
+        # Show dialog immediately (no fade-in) so loading overlay is visible right away
+        dialog.deiconify()
+        dialog.lift()
+        dialog.focus_set()
         
         # Placeholder colors for unloaded themes (neutral gray tones, not colorful)
         placeholder_colors = ['#404040', '#505050', '#606060', '#505050', '#404040', '#505050']
@@ -18075,6 +22085,105 @@ class BandcampDownloaderGUI:
             )
             cancel_btn.pack(side=RIGHT)
             
+            # Create loading overlay (centered over dialog)
+            overlay_frame = Frame(dialog, bg=main_bg, relief='flat', borderwidth=1, 
+                                 highlightbackground=colors.border, highlightthickness=1)
+            # Initially hidden, will be shown and positioned after dialog is visible
+            overlay_visible = False
+            
+            def reposition_overlay():
+                """Reposition the overlay to center of dialog."""
+                try:
+                    # Get dialog dimensions
+                    dialog.update_idletasks()
+                    dialog_width = dialog.winfo_width()
+                    dialog_height = dialog.winfo_height()
+                    
+                    # Overlay size
+                    overlay_width = 300
+                    overlay_height = 80
+                    
+                    # Center position
+                    x = (dialog_width - overlay_width) // 2
+                    y = (dialog_height - overlay_height) // 2
+                    
+                    overlay_frame.place(x=x, y=y, width=overlay_width, height=overlay_height)
+                except:
+                    pass
+            
+            def show_overlay():
+                """Show the loading overlay centered over the dialog."""
+                nonlocal overlay_visible
+                if overlay_visible:
+                    return
+                overlay_visible = True
+                reposition_overlay()
+            
+            def hide_overlay():
+                """Hide the loading overlay."""
+                nonlocal overlay_visible
+                if not overlay_visible:
+                    return
+                overlay_visible = False
+                try:
+                    overlay_frame.place_forget()
+                except:
+                    pass
+            
+            # Overlay content
+            overlay_label = Label(
+                overlay_frame,
+                text="Loading theme previews...",
+                font=("Segoe UI", 9),
+                bg=main_bg,
+                fg=colors.fg
+            )
+            overlay_label.pack(pady=(12, 4))
+            
+            overlay_progress = Label(
+                overlay_frame,
+                text="0 of 0",
+                font=("Segoe UI", 8),
+                bg=main_bg,
+                fg=colors.disabled_fg
+            )
+            overlay_progress.pack()
+            
+            def update_overlay_progress():
+                """Update the overlay progress text."""
+                try:
+                    total = len(available_themes)
+                    loaded = len(loaded_previews)
+                    
+                    if total == 0:
+                        hide_overlay()
+                        return
+                    
+                    # Calculate percentage
+                    percentage = int((loaded / total) * 100) if total > 0 else 0
+                    
+                    # Update progress text
+                    if loaded < total:
+                        overlay_progress.config(text=f"{loaded} of {total} ({percentage}%)")
+                        if not overlay_visible:
+                            show_overlay()
+                        else:
+                            # Reposition in case dialog was resized
+                            reposition_overlay()
+                    else:
+                        # All loaded - hide overlay after a brief delay
+                        overlay_progress.config(text=f"{loaded} of {total} (100%)")
+                        reposition_overlay()  # Update position one last time
+                        self.root.after(300, hide_overlay)  # Brief delay to show 100%
+                except:
+                    pass
+            
+            # Reposition overlay when dialog is resized
+            def on_dialog_configure(event):
+                if overlay_visible:
+                    reposition_overlay()
+            dialog.bind('<Configure>', on_dialog_configure)
+            
             # Function to update a single theme's preview colors
             def update_theme_preview(filename, colors):
                 """Update preview colors for a specific theme."""
@@ -18084,6 +22193,7 @@ class BandcampDownloaderGUI:
                 # If no colors were fetched, keep placeholder and mark as loaded
                 if not colors:
                     loaded_previews.add(filename)
+                    update_overlay_progress()  # Update progress
                     return  # Don't update - keep the placeholder
                 
                 preview_frame = preview_frames[filename]
@@ -18109,6 +22219,7 @@ class BandcampDownloaderGUI:
                         pass
                 
                 loaded_previews.add(filename)
+                update_overlay_progress()  # Update progress after each theme loads
             
             # Function to get visible theme indices based on scroll position
             def get_visible_themes():
@@ -18205,6 +22316,17 @@ class BandcampDownloaderGUI:
             
             # Load initial batch (first 8 visible themes)
             dialog.update()  # Ensure layout is complete
+            
+            # Show overlay initially if there are themes to load
+            if len(available_themes) > 0:
+                # Set initial progress text
+                overlay_progress.config(text=f"0 of {len(available_themes)} (0%)")
+                # Show overlay after dialog is fully rendered
+                self.root.after(150, show_overlay)
+                # Update progress after overlay is shown
+                self.root.after(200, update_overlay_progress)
+            
+            # Start loading previews
             self.root.after(100, lambda: load_preview_batch(get_visible_themes()))
             
             # Fallback: Load ALL themes after a delay to ensure nothing is missed
@@ -18271,12 +22393,12 @@ class BandcampDownloaderGUI:
         
         def choose_overwrite():
             conflict_dialog.resolution = "overwrite"
-            conflict_dialog.destroy()
+            self._close_dialog_with_fade(conflict_dialog)
             self._install_themes(parent_dialog, all_selected, conflict_resolution="overwrite")
         
         def choose_rename():
             conflict_dialog.resolution = "rename"
-            conflict_dialog.destroy()
+            self._close_dialog_with_fade(conflict_dialog)
             self._install_themes(parent_dialog, all_selected, conflict_resolution="rename")
         
         def choose_skip():
@@ -18848,7 +22970,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             dialog.initial_template = template_text.get('1.0', END).strip()
         
         # Close on ESC
-        dialog.bind('<Escape>', lambda e: dialog.destroy())
+        dialog.bind('<Escape>', lambda e: self._close_dialog_with_fade(dialog))
         
         # Focus template text
         template_text.focus_set()
@@ -20307,6 +24429,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             return
         
         dialog = Toplevel(self.root)
+        # Hide dialog initially to prevent flicker (will be shown with fade-in)
+        dialog.withdraw()
+        
         dialog.title(" Delete Custom Folder Structures")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -20325,6 +24450,12 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         # Configure dialog background
         dialog.configure(bg=main_bg)
+        
+        # Intercept close events - use destroy directly to avoid conflicts
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        
+        # Show dialog with fade-in effect
+        self._show_dialog_with_fade(dialog)
         
         # Title
         title_label = Label(
@@ -20396,7 +24527,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 )
                 delete_btn.pack(side=RIGHT, padx=5)
         
-        # Close button
+        # Close button - use destroy directly to avoid conflicts with protocol handler
         close_btn = ttk.Button(
             dialog,
             text="Close",
@@ -20404,7 +24535,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         )
         close_btn.pack(pady=10)
         
-        # Close on ESC
+        # Close on ESC - use destroy directly to avoid conflicts
         dialog.bind('<Escape>', lambda e: dialog.destroy())
     
     def _delete_custom_structure(self, dialog, structure):
@@ -20786,7 +24917,7 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             save_btn.pack(side=LEFT, padx=5)
             dialog.save_btn = save_btn  # Store reference for enabling/disabling
         
-        # Cancel button (always shown)
+        # Cancel button (always shown) - use destroy directly to avoid conflicts with protocol handler
         cancel_btn = ttk.Button(
             buttons_frame,
             text="Cancel",
@@ -20799,7 +24930,10 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         if dialog.editing_format_index is not None or getattr(dialog, 'editing_default_format', False):
             dialog.initial_template = template_text.get('1.0', END).strip()
         
-        # Close on ESC
+        # Override protocol handler to use destroy directly (avoid conflicts with fade-out)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        
+        # Close on ESC - use destroy directly to avoid conflicts
         dialog.bind('<Escape>', lambda e: dialog.destroy())
         
         # Focus template text
@@ -21721,6 +25855,9 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             return
         
         dialog = Toplevel(self.root)
+        # Hide dialog initially to prevent flicker (will be shown with fade-in)
+        dialog.withdraw()
+        
         dialog.title(" Delete Custom Filename Formats")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -21739,6 +25876,14 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         
         # Configure dialog background
         dialog.configure(bg=main_bg)
+        
+        # Intercept close events to use fade-out
+        def on_dialog_close():
+            self._close_dialog_with_fade(dialog)
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+        
+        # Show dialog with fade-in effect
+        self._show_dialog_with_fade(dialog)
         
         # Title
         title_label = Label(
@@ -21784,12 +25929,12 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         close_btn = ttk.Button(
             dialog,
             text="Close",
-            command=dialog.destroy
+            command=lambda: self._close_dialog_with_fade(dialog)
         )
         close_btn.pack(pady=10)
         
         # Close on ESC
-        dialog.bind('<Escape>', lambda e: dialog.destroy())
+        dialog.bind('<Escape>', lambda e: self._close_dialog_with_fade(dialog))
     
     def _delete_custom_filename(self, dialog, format_data):
         """Delete a custom filename format."""
@@ -21832,20 +25977,21 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             if numbering_style == "Original":
                 disabled_color = '#404040' if self.current_theme == 'dark' else '#A0A0A0'
                 self.filename_customize_btn.config(fg=disabled_color, cursor='arrow')
-                # Unbind events
+                # Only unbind Button-1 (don't unbind Enter/Leave to preserve tooltip)
                 try:
                     self.filename_customize_btn.unbind("<Button-1>")
-                    self.filename_customize_btn.unbind("<Enter>")
-                    self.filename_customize_btn.unbind("<Leave>")
                 except:
                     pass
             else:
                 # Enable edit button for other formats
                 self.filename_customize_btn.config(fg=colors.disabled_fg, cursor='hand2')
-                # Rebind events
-                self.filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog())
-                self.filename_customize_btn.bind("<Enter>", lambda e: self.filename_customize_btn.config(fg=colors.hover_fg))
-                self.filename_customize_btn.bind("<Leave>", lambda e: self.filename_customize_btn.config(fg=colors.disabled_fg))
+                # Rebind Button-1 - unbind first to avoid duplicate handlers, then rebind with add='+' to preserve tooltip
+                # Don't rebind Enter/Leave - they're already bound (tooltip + color change)
+                try:
+                    self.filename_customize_btn.unbind("<Button-1>")
+                except:
+                    pass
+                self.filename_customize_btn.bind("<Button-1>", lambda e: self._show_customize_filename_dialog(), add='+')
     
     def _update_filename_manage_button(self):
         """Update filename manage button state based on whether custom formats exist."""
@@ -21854,18 +26000,15 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             has_custom = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
             if has_custom:
                 self.filename_manage_btn.config(fg=colors.disabled_fg, cursor='hand2')
-                # Rebind events
-                self.filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog())
-                self.filename_manage_btn.bind("<Enter>", lambda e: self.filename_manage_btn.config(fg=colors.hover_fg))
-                self.filename_manage_btn.bind("<Leave>", lambda e: self.filename_manage_btn.config(fg=colors.disabled_fg))
+                # Rebind Button-1 with add='+' to preserve tooltip bindings
+                # Don't rebind Enter/Leave - they're already bound (tooltip + color change)
+                self.filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog(), add='+')
             else:
                 disabled_color = '#404040' if self.current_theme == 'dark' else '#A0A0A0'
                 self.filename_manage_btn.config(fg=disabled_color, cursor='arrow')
-                # Unbind events
+                # Only unbind Button-1 (don't unbind Enter/Leave to preserve tooltip)
                 try:
                     self.filename_manage_btn.unbind("<Button-1>")
-                    self.filename_manage_btn.unbind("<Enter>")
-                    self.filename_manage_btn.unbind("<Leave>")
                 except:
                     pass
     
