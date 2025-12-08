@@ -13,7 +13,7 @@ Features:
 
 Requirements:
 - Python 3.11+
-- yt-dlp (pip install -U yt-dlp)
+- yt-dlp (pip install -U yt-dlp) 
 - ffmpeg.exe in same folder as script
 """
 
