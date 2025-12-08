@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.7"
+__version__ = "1.3.8"
 
 import sys
 import subprocess
@@ -166,36 +166,75 @@ except ImportError:
 
 class ThinProgressBar:
     """Custom thin progress bar using Canvas for precise height control."""
-    def __init__(self, parent, height=3, bg_color='#1E1E1E', fg_color='#2dacd5'):
+    def __init__(self, parent, height=3, bg_color='#1E1E1E', fg_color='#2dacd5', border_color=None, fill_height_ratio=1.0):
         self.height = height
         self.bg_color = bg_color
         self.fg_color = fg_color
+        self.border_color = border_color  # None = no border, or color string for border
+        self.fill_height_ratio = fill_height_ratio  # Ratio of height to use for fill (1.0 = full, <1.0 = thinner)
         self.value = 0
         self.maximum = 100
         self.parent = parent
         
         # Create canvas with minimal height, no fixed width (will expand with grid)
-        self.canvas = Canvas(parent, height=height, bg=bg_color, 
-                            highlightthickness=0, borderwidth=0)
+        # Use highlightthickness for border if border_color is provided
+        # Match ttk.Progressbar borderwidth=2 for consistent appearance
+        if border_color:
+            self.canvas = Canvas(parent, height=height, bg=bg_color, 
+                                highlightthickness=1, highlightbackground=border_color, 
+                                highlightcolor=border_color, borderwidth=0)
+        else:
+            self.canvas = Canvas(parent, height=height, bg=bg_color, 
+                                highlightthickness=0, borderwidth=0)
         
         # Bind to configure event to update when canvas resizes
         self.canvas.bind('<Configure>', self._on_resize)
         self._width = 1  # Initial width, will be updated on resize
         
-        # Draw the background (trough) - will be updated on resize
-        self.trough = self.canvas.create_rectangle(0, 0, 1, height, 
-                                                   fill=bg_color, outline='')
+        # Calculate fill dimensions (thinner fill if fill_height_ratio < 1.0)
+        self.fill_height = height * fill_height_ratio
+        # Align fill to bottom to eliminate gap below (matches ttk.Progressbar appearance)
+        # Account for border: if border exists, align to bottom of trough (height - 1), otherwise to bottom of canvas
+        if border_color:
+            self.fill_offset_y = height - 1 - self.fill_height  # Align to bottom of trough (inside 1px border)
+        else:
+            self.fill_offset_y = height - self.fill_height  # Align to bottom of canvas
         
-        # Draw the progress bar (initially 0)
-        self.bar = self.canvas.create_rectangle(0, 0, 0, height, 
-                                                 fill=fg_color, outline='')
+        # Draw the background (trough) - will be updated on resize
+        # If border, it's handled by canvas highlightthickness, so trough starts at (0, 0)
+        # Otherwise, trough fills the canvas
+        if self.border_color:
+            # Trough is inside border (1px inset on all sides due to highlightthickness=1)
+            self.trough = self.canvas.create_rectangle(1, 1, 0, height-1, 
+                                                       fill=bg_color, outline='')
+            self.border_rect = True  # Flag to indicate border exists
+        else:
+            self.border_rect = None
+            self.trough = self.canvas.create_rectangle(0, 0, 1, height, 
+                                                       fill=bg_color, outline='')
+        
+        # Draw the progress bar (initially 0) - thinner fill centered vertically
+        bar_y1 = self.fill_offset_y
+        bar_y2 = self.fill_offset_y + self.fill_height
+        if self.border_color:
+            # Progress bar is inside border (1px inset from left/right)
+            self.bar = self.canvas.create_rectangle(1, bar_y1, 1, bar_y2, 
+                                                     fill=fg_color, outline='')
+        else:
+            self.bar = self.canvas.create_rectangle(0, bar_y1, 0, bar_y2, 
+                                                     fill=fg_color, outline='')
     
     def _on_resize(self, event=None):
         """Handle canvas resize to update width and redraw."""
         if event:
             self._width = event.width
-            # Update trough to fill new width
-            self.canvas.coords(self.trough, 0, 0, self._width, self.height)
+            # Update trough - border is handled by canvas highlightthickness
+            if self.border_rect:
+                # Trough is inside border (1px inset on all sides due to highlightthickness=1)
+                self.canvas.coords(self.trough, 1, 1, self._width-1, self.height-1)
+            else:
+                # Update trough to fill new width
+                self.canvas.coords(self.trough, 0, 0, self._width, self.height)
             # Update progress bar
             self._update()
     
@@ -223,12 +262,26 @@ class ThinProgressBar:
             pass
         
         if self.maximum > 0 and self._width > 0:
-            progress_width = int((self.value / self.maximum) * self._width)
+            # Calculate progress width
+            if self.border_color:
+                # Progress bar is inside border, so use width minus 2px (1px on each side due to highlightthickness=1)
+                available_width = self._width - 2
+                progress_width = int((self.value / self.maximum) * available_width) + 1  # +1 for left border offset
+            else:
+                progress_width = int((self.value / self.maximum) * self._width)
         else:
-            progress_width = 0
+            progress_width = 0 if not self.border_color else 1
+        
+        # Calculate fill dimensions
+        bar_y1 = self.fill_offset_y
+        bar_y2 = self.fill_offset_y + self.fill_height
         
         # Update the progress bar rectangle
-        self.canvas.coords(self.bar, 0, 0, progress_width, self.height)
+        if self.border_color:
+            # Progress bar is inside border (1px inset from left due to highlightthickness=1)
+            self.canvas.coords(self.bar, 1, bar_y1, progress_width, bar_y2)
+        else:
+            self.canvas.coords(self.bar, 0, bar_y1, progress_width, bar_y2)
     
     def grid(self, **kwargs):
         """Grid the canvas (compatible with ttk.Progressbar interface)."""
@@ -285,6 +338,109 @@ class ThemeColors:
             self.preview_link = '#005A9E'  # Darker blue for preview links (better contrast in light mode)
             self.preview_link_hover = '#007ACC'  # Lighter blue on hover (still readable)
 
+
+# ============================================================================
+# WINDOWS TASKBAR PROGRESS BAR HELPER
+# ============================================================================
+
+class WindowsTaskbarProgress:
+    """Helper class for Windows taskbar progress bar (Windows 7+).
+    
+    Uses Windows API via pywin32 (if available) or falls back gracefully.
+    """
+    
+    # Windows API constants for taskbar progress
+    TBPF_NOPROGRESS = 0
+    TBPF_INDETERMINATE = 1
+    TBPF_NORMAL = 2
+    TBPF_ERROR = 4
+    TBPF_PAUSED = 8
+    
+    def __init__(self, hwnd):
+        """Initialize taskbar progress for a window handle.
+        
+        Args:
+            hwnd: Window handle (from winfo_id())
+        """
+        self.hwnd = hwnd
+        self.taskbar_list = None
+        self._initialized = False
+        if sys.platform == 'win32':
+            self._init_taskbar()
+    
+    def _init_taskbar(self):
+        """Initialize Windows taskbar interface using pywin32 if available."""
+        if sys.platform != 'win32':
+            return
+        
+        try:
+            # Try to use pywin32 for COM interop (simpler than ctypes)
+            try:
+                import pythoncom
+                from win32com.shell import shell
+                from win32com.shell.shell import CLSID_TaskbarList, IID_ITaskbarList3
+                
+                # Create ITaskbarList3 interface
+                pythoncom.CoInitialize()
+                taskbar_list = pythoncom.CoCreateInstance(
+                    CLSID_TaskbarList,
+                    None,
+                    pythoncom.CLSCTX_INPROC_SERVER,
+                    IID_ITaskbarList3
+                )
+                taskbar_list.HrInit()
+                self.taskbar_list = taskbar_list
+                self._initialized = True
+            except ImportError:
+                # pywin32 not available - taskbar progress won't work, but title updates will
+                self._initialized = False
+            except Exception:
+                # Initialization failed - continue without taskbar progress
+                self._initialized = False
+        except Exception:
+            self._initialized = False
+    
+    def set_progress(self, value, maximum=100):
+        """Set progress bar value (0-100).
+        
+        Args:
+            value: Current progress value (0-maximum)
+            maximum: Maximum value (default 100)
+        """
+        if sys.platform != 'win32' or not self._initialized or not self.taskbar_list:
+            return
+        
+        try:
+            if hasattr(self.taskbar_list, 'SetProgressValue'):
+                # pywin32 interface
+                self.taskbar_list.SetProgressValue(self.hwnd, int(value), maximum)
+                self.taskbar_list.SetProgressState(self.hwnd, self.TBPF_NORMAL)
+        except Exception:
+            pass
+    
+    def set_state_indeterminate(self):
+        """Set progress bar to indeterminate (animated) state."""
+        if sys.platform != 'win32' or not self._initialized or not self.taskbar_list:
+            return
+        
+        try:
+            if hasattr(self.taskbar_list, 'SetProgressState'):
+                # pywin32 interface
+                self.taskbar_list.SetProgressState(self.hwnd, self.TBPF_INDETERMINATE)
+        except Exception:
+            pass
+    
+    def reset(self):
+        """Reset progress bar (hide it)."""
+        if sys.platform != 'win32' or not self._initialized or not self.taskbar_list:
+            return
+        
+        try:
+            if hasattr(self.taskbar_list, 'SetProgressState'):
+                # pywin32 interface
+                self.taskbar_list.SetProgressState(self.hwnd, self.TBPF_NOPROGRESS)
+        except Exception:
+            pass
 
 class BandcampDownloaderGUI:
     # ============================================================================
@@ -803,9 +959,79 @@ class BandcampDownloaderGUI:
                 except:
                     pass
     
+    def _update_window_title(self, state='idle', percent=None, album_num=None, total_albums=None):
+        """Update window title based on download state.
+        
+        Args:
+            state: 'idle', 'starting', or 'downloading'
+            percent: Overall progress percentage (0-100) when downloading
+            album_num: Current album number (1-based) when downloading multiple albums
+            total_albums: Total number of albums when downloading multiple albums
+        """
+        base_title = "Bandcamp Downloader"
+        
+        if state == 'idle':
+            title = base_title
+        elif state == 'starting':
+            title = f"Starting - {base_title}"
+        elif state == 'downloading':
+            if percent is not None:
+                # Format percentage: show whole numbers without decimal, decimals with one decimal place
+                if percent == int(percent):
+                    percent_str = f"{int(percent)}"
+                else:
+                    percent_str = f"{percent:.1f}"
+                
+                if album_num is not None and total_albums is not None and total_albums > 1:
+                    # Multiple albums: "45.2% (1/3) - Bandcamp Downloader" or "100% (1/3) - Bandcamp Downloader"
+                    title = f"{percent_str}% ({album_num}/{total_albums}) - {base_title}"
+                else:
+                    # Single album: "45.2% - Bandcamp Downloader" or "100% - Bandcamp Downloader"
+                    title = f"{percent_str}% - {base_title}"
+            else:
+                title = f"Downloading - {base_title}"
+        else:
+            title = base_title
+        
+        try:
+            self.root.title(f" {title}")
+        except Exception:
+            pass
+    
+    def _update_taskbar_progress(self, percent=None, state='normal'):
+        """Update Windows taskbar progress bar.
+        
+        Args:
+            percent: Progress percentage (0-100), None for indeterminate
+            state: 'normal', 'indeterminate', or 'none'
+        """
+        if sys.platform != 'win32' or not self.taskbar_progress:
+            return
+        
+        try:
+            if state == 'indeterminate':
+                self.taskbar_progress.set_state_indeterminate()
+            elif state == 'none':
+                self.taskbar_progress.reset()
+            elif percent is not None:
+                self.taskbar_progress.set_progress(int(percent), 100)
+            else:
+                self.taskbar_progress.reset()
+        except Exception:
+            pass
+    
     def __init__(self, root):
         self.root = root
         self.root.title(" Bandcamp Downloader")
+        
+        # Initialize Windows taskbar progress (if on Windows)
+        self.taskbar_progress = None
+        if sys.platform == 'win32':
+            try:
+                hwnd = self.root.winfo_id()
+                self.taskbar_progress = WindowsTaskbarProgress(hwnd)
+            except Exception:
+                self.taskbar_progress = None
         
         # Minimize console window immediately (before any other operations)
         self._minimize_console_immediately()
@@ -918,6 +1144,9 @@ class BandcampDownloaderGUI:
         # Prefer album artist for folders setting
         self.prefer_album_artist_for_folders_var = BooleanVar(value=self.load_saved_prefer_album_artist_for_folders())
         
+        # Show overall progress in large bar setting (default to False)
+        self.show_overall_in_large_bar_var = BooleanVar(value=self.load_saved_show_overall_in_large_bar())
+        
         # Color scheme for URL tags - defer loading until needed (optimization)
         # Load saved preference but don't load all schemes yet (saves file I/O on startup)
         self.current_tag_color_scheme = settings.get("tag_color_scheme", "default")
@@ -990,6 +1219,7 @@ class BandcampDownloaderGUI:
         self.download_thread = None
         self.is_cancelling = False
         self.ydl_instance = None  # Store yt-dlp instance for cancellation
+        
         
         # Search/find functionality for log
         self.search_frame = None  # Search bar frame
@@ -1182,7 +1412,7 @@ class BandcampDownloaderGUI:
         browse_bg = entry_bg if self.current_theme == 'light' else select_bg
         style.configure('Browse.TButton', background=browse_bg, foreground=fg_color,
                        borderwidth=0, bordercolor=browse_bg, relief='flat',
-                       padding=(8, 4))  # Compact padding
+                       padding=(5, 3))  # Compact padding
         style.map('Browse.TButton',
                  background=[('active', hover_bg), ('pressed', browse_bg)],
                  bordercolor=[('active', browse_bg), ('pressed', browse_bg)])  # Match background to hide borders
@@ -2175,6 +2405,7 @@ class BandcampDownloaderGUI:
                 "split_album_artist_display": self.split_album_artist_display_var.get() if hasattr(self, 'split_album_artist_display_var') else "bandcamp_default",
                 "skip_mp3_reencode": self.skip_mp3_reencode_var.get() if hasattr(self, 'skip_mp3_reencode_var') else True,
                 "prefer_album_artist_for_folders": self.prefer_album_artist_for_folders_var.get() if hasattr(self, 'prefer_album_artist_for_folders_var') else True,
+                "show_overall_in_large_bar": self.show_overall_in_large_bar_var.get() if hasattr(self, 'show_overall_in_large_bar_var') else False,
                 "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else []),
                 "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else []),
                 "theme": self.current_theme if hasattr(self, 'current_theme') else 'dark'
@@ -3361,7 +3592,7 @@ class BandcampDownloaderGUI:
     
     def _show_additional_settings(self):
         """Show Additional Settings dialog with split album artist display option."""
-        dialog = self._create_dialog_base("Additional Settings", 580, 370)
+        dialog = self._create_dialog_base("Additional Settings", 580, 445)
         
         # Use theme colors
         colors = self.theme_colors
@@ -3522,6 +3753,36 @@ class BandcampDownloaderGUI:
             justify='left'
         )
         album_artist_note_label.pack(anchor=W, pady=(4, 0))
+        
+        # Show overall progress in large bar checkbox (in MP3 panel)
+        show_overall_checkbox = Checkbutton(
+            mp3_content,
+            text="Show Overall Progress in Large Bar",
+            variable=self.show_overall_in_large_bar_var,
+            command=self._on_show_overall_in_large_bar_change,
+            font=("Segoe UI", 9),
+            bg=main_bg,
+            fg=colors.fg,
+            activebackground=main_bg,
+            activeforeground=colors.fg,
+            selectcolor=main_bg,
+            anchor='w',
+            justify='left',
+            wraplength=550
+        )
+        show_overall_checkbox.pack(anchor=W, pady=(8, 0))
+        
+        # Note explaining progress bar swap behavior
+        show_overall_note_label = Label(
+            mp3_content,
+            text="Note: When enabled, progress bars swap so overall progress is shown in the large bar and track progress is shown in the thin bar.",
+            font=("Segoe UI", 8),
+            bg=main_bg,
+            fg=colors.disabled_fg,
+            wraplength=550,
+            justify='left'
+        )
+        show_overall_note_label.pack(anchor=W, pady=(4, 0))
         
         def generate_split_album_preview():
             """Generate preview filename simulating a split album scenario."""
@@ -4039,7 +4300,8 @@ class BandcampDownloaderGUI:
         if hasattr(self, 'manage_btn'):
             has_custom = (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates) or (hasattr(self, 'custom_structures') and self.custom_structures)
             colors = self.theme_colors
-            disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'
+            # Use darker color when inactive to clearly show disabled state
+            disabled_color = '#404040' if self.current_theme == 'dark' else '#A0A0A0'
             if has_custom:
                 self.manage_btn.config(fg=colors.disabled_fg, cursor='hand2')
                 # Rebind Button-1 - unbind first to avoid duplicate handlers, then rebind with add='+' to preserve tooltip
@@ -4321,6 +4583,19 @@ class BandcampDownloaderGUI:
         """Handle prefer album artist for folders checkbox change."""
         self.save_prefer_album_artist_for_folders()
         self.update_preview()
+    
+    def load_saved_show_overall_in_large_bar(self):
+        """Load saved show overall progress in large bar preference, default to False if not found."""
+        settings = self._load_settings()
+        return settings.get("show_overall_in_large_bar", False)
+    
+    def save_show_overall_in_large_bar(self):
+        """Save show overall progress in large bar preference."""
+        self._save_settings()
+    
+    def _on_show_overall_in_large_bar_change(self):
+        """Handle show overall progress in large bar checkbox change."""
+        self.save_show_overall_in_large_bar()
     
     def _get_format_menu_options(self):
         """Get format menu options with dynamic MP3 label based on skip re-encode setting."""
@@ -4824,7 +5099,7 @@ class BandcampDownloaderGUI:
         placeholder_label = Label(
             url_text_frame,
             text="Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs",
-            font=("Segoe UI", 9),
+            font=("Tahoma", 9),
             bg=colors.entry_bg,
             fg=colors.disabled_fg,
             anchor='nw',
@@ -5456,7 +5731,7 @@ class BandcampDownloaderGUI:
         # Container frame for Browse button and Settings cog icon
         # Moved to row 2 to align with path field (row 2)
         browse_container = Frame(main_frame, bg=colors.bg)
-        browse_container.grid(row=2, column=2, sticky=(W, E), padx=(4, 0), pady=0)
+        browse_container.grid(row=2, column=2, sticky=(W, E), padx=(3, 2), pady=0)
         browse_container.columnconfigure(0, weight=1, minsize=80)  # Browse button expands with minimum width
         browse_container.columnconfigure(1, weight=0)  # Cog icon fixed width
         
@@ -5500,9 +5775,9 @@ class BandcampDownloaderGUI:
         # Settings frame: dark mode uses bg, light mode uses select_bg (white)
         settings_frame_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
         self.settings_frame = Frame(main_frame, bg=settings_frame_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
-        self.settings_frame.grid(row=3, column=0, columnspan=2, sticky=(W, E, N), pady=2, padx=0)
+        self.settings_frame.grid(row=3, column=0, columnspan=2, sticky=(W, E, N), pady=(0,2), padx=0)
         self.settings_frame.grid_propagate(False)
-        self.settings_frame.config(height=170)  # Reduced height with equal padding top and bottom
+        self.settings_frame.config(height=168)  # Reduced height with equal padding top and bottom
         
         # Inner frame for content
         self.settings_content = Frame(self.settings_frame, bg=settings_frame_bg)
@@ -5522,35 +5797,36 @@ class BandcampDownloaderGUI:
         album_art_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
         self.album_art_frame = Frame(main_frame, bg=album_art_bg, relief='flat', bd=0, highlightbackground=colors.border, highlightthickness=1)
         # Moved to row 3 to align with settings_frame (row 3)
-        self.album_art_frame.grid(row=3, column=2, sticky=(W, E, N), pady=2, padx=(6, 0))
+        self.album_art_frame.grid(row=3, column=2, sticky=(W, E, N), pady=(0,2), padx=(3, 0))
         self.album_art_frame.grid_propagate(False)
-        self.album_art_frame.config(width=170, height=170)  # Square panel matching settings height for equal padding
+        self.album_art_frame.config(width=168, height=168)  # Square panel matching settings height for equal padding
         # Center content in the frame
         self.album_art_frame.columnconfigure(0, weight=1)
         self.album_art_frame.rowconfigure(0, weight=1)
         
-        # Album art canvas - accounts for frame border (168x168 to maximize size)
-        # Frame is 170x170 with highlightthickness=1, so we use 168x168 with 1px padding
+        # Album art canvas - matches visible area exactly
+        # Frame is 168x168 with highlightthickness=1 (1px border) and padx=0, pady=0 (0px padding)
+        # Visible area = 168 - 1 - 1 - 1 - 1 = 164x164
         # Canvas background: dark mode uses bg, light mode uses select_bg (white)
         canvas_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
         self.album_art_canvas = Canvas(
             self.album_art_frame,
-            width=168,
-            height=168,
+            width=164,
+            height=164,
             bg=canvas_bg,
             highlightthickness=0,
             borderwidth=0,
             cursor='hand2'  # Show hand cursor to indicate it's Clickable
         )
         # Canvas centered in frame (1px padding on all sides to account for border)
-        self.album_art_canvas.grid(row=0, column=0, padx=1, pady=1, sticky=(N, S, E, W))
+        self.album_art_canvas.grid(row=0, column=0, padx=0, pady=0, sticky=(N, S, E, W))
         
         # Make canvas Clickable to cycle through artwork types (album_art ↔ bio_pic)
         self.album_art_canvas.bind("<Button-1>", lambda e: self.cycle_artwork_type())
         
-        # Placeholder text on canvas (centered at 84, 84 for 168x168 canvas)
+        # Placeholder text on canvas (centered at 83, 83 for 166x166 canvas)
         self.album_art_canvas.create_text(
-            84, 84,
+            83, 83,
             text="Album Art",
             fill=colors.disabled_fg,
             font=("Segoe UI", 8)
@@ -5637,6 +5913,54 @@ class BandcampDownloaderGUI:
         # Build the menu with standard formats, separator, and custom formats
         self._build_filename_menu(numbering_menu)
         
+        # Add quick-close functionality (click again to close menu) - matching structure menubutton
+        self.filename_menu_open = False
+        self.filename_item_just_selected = False
+        
+        def on_filename_menu_post(event=None):
+            self.filename_menu_open = True
+            self.filename_item_just_selected = False  # Reset when menu opens
+        
+        def on_filename_menu_unpost(event=None):
+            self.filename_menu_open = False
+        
+        numbering_menu.bind('<<MenuSelect>>', on_filename_menu_post)
+        numbering_menu.bind('<<MenuUnpost>>', on_filename_menu_unpost)
+        
+        # Check menu state on Click - if open, close it; otherwise let default behavior open it
+        def on_filename_button_Click(event=None):
+            if self.filename_item_just_selected:
+                # Menu was just closed via item selection - don't interfere, let default behavior open it
+                self.filename_item_just_selected = False
+                return None  # Let default behavior handle it
+            
+            # Only close if we're CERTAIN menu is open (both flag and actual state must agree)
+            flag_says_open = self.filename_menu_open
+            actual_state_open = False
+            
+            # Quick check of actual state
+            try:
+                numbering_menu.tk.call(numbering_menu, 'index', 'active')
+                actual_state_open = True
+            except:
+                pass
+            
+            # Only close if BOTH say open - if either is uncertain, allow opening
+            if flag_says_open and actual_state_open:
+                # Both confirm menu is open - close it and prevent default posting
+                self.root.focus_set()
+                numbering_menu.unpost()
+                self.filename_menu_open = False
+                return "break"  # Prevent default behavior (posting menu)
+            else:
+                # Not certain menu is open - always allow default behavior to open it
+                # Update flag if actual state says closed
+                if not actual_state_open:
+                    self.filename_menu_open = False
+                return None  # Allow default behavior
+        
+        numbering_menubutton.bind('<Button-1>', on_filename_button_Click, add=True)
+        
         # Update edit button state based on initial selection (after button is created)
         # Will be called after button creation below
                 
@@ -5665,7 +5989,8 @@ class BandcampDownloaderGUI:
         
         # Manage button (🗑️) - trash can icon for managing/deleting filename formats
         has_custom_filename = hasattr(self, 'custom_filename_formats') and self.custom_filename_formats
-        disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'  # Lighter disabled for light mode
+        # Use darker color when inactive to clearly show disabled state
+        disabled_color = '#404040' if self.current_theme == 'dark' else '#A0A0A0'  # Darker gray for inactive state
         filename_manage_btn = Label(
             filename_frame,
             text=self._get_icon('trash'),
@@ -5677,12 +6002,15 @@ class BandcampDownloaderGUI:
             padx=4
         )
         filename_manage_btn.pack(side=LEFT, padx=(2, 0))
-        if has_custom_filename:
-            filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog())
-            filename_manage_btn.bind("<Enter>", lambda e: filename_manage_btn.config(fg=colors.hover_fg) if has_custom_filename else None)
-            filename_manage_btn.bind("<Leave>", lambda e: filename_manage_btn.config(fg=colors.disabled_fg) if has_custom_filename else None)
-        self.filename_manage_btn = filename_manage_btn  # Store reference
-        # Always add tooltip (even if disabled, it's still helpful to know what it does)
+        # Store reference before adding tooltip (tooltip needs the widget reference)
+        self.filename_manage_btn = filename_manage_btn
+        # Bind button click
+        filename_manage_btn.bind("<Button-1>", lambda e: self._show_manage_filename_dialog() if has_custom_filename else None)
+        # Bind hover handlers FIRST (before tooltip) - this ensures they execute on Windows 10
+        # Use lambda to match pencil pattern exactly, check condition at execution time
+        filename_manage_btn.bind("<Enter>", lambda e: filename_manage_btn.config(fg=colors.hover_fg) if (hasattr(self, 'custom_filename_formats') and self.custom_filename_formats) else None)
+        filename_manage_btn.bind("<Leave>", lambda e: filename_manage_btn.config(fg=colors.disabled_fg) if (hasattr(self, 'custom_filename_formats') and self.custom_filename_formats) else None)
+        # Add tooltip AFTER hover handlers (tooltip uses add='+' so it won't interfere)
         self._create_tooltip(filename_manage_btn, "Delete custom filename formats")
         
         # Folder Structure (third, below Numbering)
@@ -5894,8 +6222,10 @@ class BandcampDownloaderGUI:
         customize_btn.bind("<Leave>", lambda e: customize_btn.config(fg=colors.disabled_fg), add='+')
         
         # Manage button (🗑️) - trash can icon for managing/deleting structures
-        has_custom = hasattr(self, 'custom_structures') and self.custom_structures
-        disabled_color = colors.disabled_fg if self.current_theme == 'dark' else '#A0A0A0'  # Lighter disabled for light mode
+        # Check both custom_structures (old format) and custom_structure_templates (new format)
+        has_custom = (hasattr(self, 'custom_structures') and self.custom_structures) or (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates)
+        # Use darker color when inactive to clearly show disabled state
+        disabled_color = '#404040' if self.current_theme == 'dark' else '#A0A0A0'  # Darker gray for inactive state
         manage_btn = Label(
             structure_frame,
             text=self._get_icon('trash'),
@@ -5907,14 +6237,27 @@ class BandcampDownloaderGUI:
             padx=4
         )
         manage_btn.pack(side=LEFT, padx=(2, 0))  # Left padding to prevent icon cutoff
-        # Store reference and add tooltip first (always add, even if disabled)
+        # Store reference
         self.manage_btn = manage_btn
+        # Bind button click
+        manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog() if has_custom else None)
+        # Bind hover handlers FIRST (before tooltip) - this ensures they execute on Windows 10
+        # Use named functions (not lambdas) to ensure proper execution on Windows 10
+        # Check both custom_structures and custom_structure_templates (like elsewhere in code)
+        def on_manage_enter(event):
+            # Stop event propagation to prevent interference from root-level handlers
+            if ((hasattr(self, 'custom_structures') and self.custom_structures) or 
+                (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates)):
+                manage_btn.config(fg=colors.hover_fg)
+        def on_manage_leave(event):
+            # Stop event propagation to prevent interference from root-level handlers
+            if ((hasattr(self, 'custom_structures') and self.custom_structures) or 
+                (hasattr(self, 'custom_structure_templates') and self.custom_structure_templates)):
+                manage_btn.config(fg=colors.disabled_fg)
+        manage_btn.bind("<Enter>", on_manage_enter)
+        manage_btn.bind("<Leave>", on_manage_leave)
+        # Add tooltip AFTER hover handlers (tooltip uses add='+' so it won't interfere)
         self._create_tooltip(manage_btn, "Delete custom folder structures")
-        # Add button and color handlers with add='+' so they don't interfere with tooltip
-        if has_custom:
-            manage_btn.bind("<Button-1>", lambda e: self._show_manage_dialog(), add='+')
-        manage_btn.bind("<Enter>", lambda e: manage_btn.config(fg=colors.hover_fg) if has_custom else None, add='+')
-        manage_btn.bind("<Leave>", lambda e: manage_btn.config(fg=colors.disabled_fg) if has_custom else None, add='+')
         
         # Update dropdown with custom structures and set initial display value
         self._update_structure_dropdown()
@@ -6250,6 +6593,33 @@ class BandcampDownloaderGUI:
         # Hide initially - will show when download starts
         self.overall_progress_bar.grid(row=9, column=0, columnspan=3, pady=(2, 2), sticky=(W, E))
         self.overall_progress_bar.grid_remove()
+        
+        # SWAPPED MODE: Create separate progress bars for swapped mode
+        # Large bar for overall progress (when swapped) - use ThinProgressBar styled to match ttk.Progressbar
+        # Match the visual appearance: border, thinner fill, same height
+        border_color_progress = colors.border  # Use theme border color
+        self.progress_bar_swapped_large = ThinProgressBar(
+            main_frame,
+            height=17,  # Match normal large bar height
+            bg_color=progress_bg,
+            fg_color=colors.success,
+            border_color=border_color_progress,  # Add border to match ttk.Progressbar
+            fill_height_ratio=0.75  # Thinner fill (75% of height) to match ttk.Progressbar appearance
+        )
+        self.progress_bar_swapped_large.config(mode='determinate', maximum=100, value=0)
+        self.progress_bar_swapped_large.grid(row=8, column=0, columnspan=3, pady=0, sticky=(W, E))
+        self.progress_bar_swapped_large.grid_remove()  # Hidden by default
+        
+        # Thin bar for track progress (when swapped)
+        self.progress_bar_swapped_thin = ThinProgressBar(
+            main_frame,
+            height=3,  # 3px thick
+            bg_color=progress_bg,
+            fg_color=colors.success
+        )
+        self.progress_bar_swapped_thin.config(mode='determinate', maximum=100, value=0)
+        self.progress_bar_swapped_thin.grid(row=9, column=0, columnspan=3, pady=(2, 1), sticky=(W, E))
+        self.progress_bar_swapped_thin.grid_remove()  # Hidden by default
     
     def _setup_log_section(self, main_frame):
         """Setup status log section with controls."""
@@ -6260,11 +6630,11 @@ class BandcampDownloaderGUI:
         # Log frame: dark mode uses bg, light mode uses entry_bg (#F5F5F5) to match URL field
         log_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
         self.log_frame = Frame(main_frame, bg=log_frame_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
-        self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(2, 4), padx=0)
+        self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(2, 0), padx=0)
         
         # Label for the frame and controls on same row
         log_label = Label(self.log_frame, text="Status", bg=log_frame_bg, fg=colors.fg, font=("Segoe UI", 9))
-        log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 2))
+        log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 0))
         self.log_label = log_label  # Store reference for theme updates
         
         # Create a custom style for the small button (based on TButton but with smaller padding and font)
@@ -6613,6 +6983,10 @@ class BandcampDownloaderGUI:
             self.log("Cancelling download...")
             self.cancel_btn.config(state='disabled', cursor='arrow')  # Regular cursor when disabled
             
+            # Reset window title and taskbar progress
+            self._update_window_title('idle')
+            self._update_taskbar_progress(state='none')
+            
             # Unlock URL field when cancelling (download_complete will also unlock, but this ensures it happens immediately)
             self._unlock_url_field()
             
@@ -6622,11 +6996,24 @@ class BandcampDownloaderGUI:
             except:
                 pass
             
-            # Hide and reset overall progress bar
+            # Hide and reset progress bars (both normal and swapped)
             if hasattr(self, 'overall_progress_bar') and self.overall_progress_bar:
                 try:
                     self.overall_progress_bar.config(mode='determinate', value=0)
                     self.overall_progress_bar.grid_remove()
+                except:
+                    pass
+            if hasattr(self, 'progress_bar_swapped_large'):
+                try:
+                    # ThinProgressBar doesn't have stop() method, just reset value
+                    self.progress_bar_swapped_large.config(mode='determinate', value=0)
+                    self.progress_bar_swapped_large.grid_remove()
+                except:
+                    pass
+            if hasattr(self, 'progress_bar_swapped_thin'):
+                try:
+                    self.progress_bar_swapped_thin.config(mode='determinate', value=0)
+                    self.progress_bar_swapped_thin.grid_remove()
                 except:
                     pass
             
@@ -8915,6 +9302,15 @@ class BandcampDownloaderGUI:
         overlay = Toplevel(self.root)
         overlay.overrideredirect(True)  # Remove window decorations
         overlay.attributes('-topmost', True)  # Keep on top
+        # Prevent overlay from appearing in taskbar (Windows)
+        try:
+            overlay.attributes('-toolwindow', True)  # Tool window doesn't appear in taskbar
+        except (TclError, AttributeError):
+            # Fallback: try wm_attributes if attributes doesn't support -toolwindow
+            try:
+                overlay.wm_attributes('-toolwindow', True)
+            except (TclError, AttributeError):
+                pass  # Not supported on this platform, continue anyway
         overlay.configure(bg=tag_bg, highlightthickness=0, bd=0)  # Match tag background, no border
         
         # Get theme colors for buttons
@@ -8945,6 +9341,14 @@ class BandcampDownloaderGUI:
                 tooltip = Toplevel(overlay)
                 tooltip.overrideredirect(True)
                 tooltip.attributes('-topmost', True)
+                # Prevent tooltip from appearing in taskbar (Windows)
+                try:
+                    tooltip.attributes('-toolwindow', True)
+                except (TclError, AttributeError):
+                    try:
+                        tooltip.wm_attributes('-toolwindow', True)
+                    except (TclError, AttributeError):
+                        pass
                 tooltip_label = Label(tooltip, text=text, bg=tag_bg, fg=tag_fg,
                                      font=("Segoe UI", 8), relief='flat', bd=0,
                                      padx=4, pady=2)
@@ -9458,9 +9862,8 @@ class BandcampDownloaderGUI:
                     if self.url_tag_overlay == overlay:
                         self.url_tag_overlay = None
                         self.url_tag_overlay_tag_id = None
-                        # Ensure URL checking can continue after overlay is hidden
-                        # Trigger a check to ensure preview updates if URL field has content
-                        self.root.after_idle(self._ensure_url_check_continues)
+                        # Don't trigger URL check when overlay closes - URL hasn't changed
+                        # This prevents unnecessary preview refresh/flicker
                     self._overlay_fade_timer = None
                     return
                 
@@ -9473,9 +9876,8 @@ class BandcampDownloaderGUI:
                     if self.url_tag_overlay == overlay:
                         self.url_tag_overlay = None
                         self.url_tag_overlay_tag_id = None
-                        # Ensure URL checking can continue after overlay is hidden
-                        # Trigger a check to ensure preview updates if URL field has content
-                        self.root.after_idle(self._ensure_url_check_continues)
+                        # Don't trigger URL check when overlay closes - URL hasn't changed
+                        # This prevents unnecessary preview refresh/flicker
                     self._overlay_fade_timer = None
             
             self._overlay_fade_timer = self.root.after(15, lambda: fade_out(0, 8))
@@ -9745,12 +10147,14 @@ class BandcampDownloaderGUI:
         artwork_frame.columnconfigure(0, weight=1)
         artwork_frame.rowconfigure(0, weight=1)
         
-        # Artwork canvas - same size as main interface (168x168)
+        # Artwork canvas - matches visible area exactly (same as main interface)
+        # Frame is 170x170 with highlightthickness=1 (1px border) and padx=1, pady=1 (1px padding)
+        # Visible area = 170 - 1 - 1 - 1 - 1 = 166x166
         canvas_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
         artwork_canvas = Canvas(
             artwork_frame,
-            width=168,
-            height=168,
+            width=166,
+            height=166,
             bg=canvas_bg,
             highlightthickness=0,
             borderwidth=0,
@@ -9758,9 +10162,9 @@ class BandcampDownloaderGUI:
         )
         artwork_canvas.grid(row=0, column=0, padx=1, pady=1, sticky=(N, S, E, W))
         
-        # Placeholder text on canvas (centered)
+        # Placeholder text on canvas (centered at 83, 83 for 166x166 canvas)
         artwork_canvas.create_text(
-            84, 84,
+            83, 83,
             text="Album Art",
             fill=colors.disabled_fg,
             font=("Segoe UI", 8)
@@ -10116,7 +10520,7 @@ class BandcampDownloaderGUI:
                     
                     # Open and resize image
                     img = Image.open(io.BytesIO(image_data))
-                    img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                    img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -10134,10 +10538,10 @@ class BandcampDownloaderGUI:
                     # Create blurred background if image doesn't fill the canvas
                     blurred_bg = self._create_blurred_background(img)
                     if blurred_bg:
-                        canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                        canvas.create_image(83, 83, image=blurred_bg, anchor='center')
                     
-                    # Display image centered
-                    canvas.create_image(84, 84, image=photo, anchor='center')
+                    # Display image centered (83, 83 for 166x166 canvas)
+                    canvas.create_image(83, 83, image=photo, anchor='center')
                     
                     # Keep reference to prevent garbage collection
                     if not hasattr(dialog, '_artwork_image_ref'):
@@ -10415,7 +10819,7 @@ class BandcampDownloaderGUI:
                     
                     # Open and resize image
                     img = Image.open(io.BytesIO(image_data))
-                    img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                    img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -10434,10 +10838,10 @@ class BandcampDownloaderGUI:
                     # Create blurred background if image doesn't fill the canvas
                     blurred_bg = self._create_blurred_background(img)
                     if blurred_bg:
-                        canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                        canvas.create_image(83, 83, image=blurred_bg, anchor='center')
                     
-                    # Display image centered
-                    canvas.create_image(84, 84, image=photo, anchor='center')
+                    # Display image centered (83, 83 for 166x166 canvas)
+                    canvas.create_image(83, 83, image=photo, anchor='center')
                     
                     # Keep reference to prevent garbage collection
                     if not hasattr(dialog, '_artwork_image_ref'):
@@ -10525,7 +10929,7 @@ class BandcampDownloaderGUI:
                         
                         # Process image (resize, etc.) and store in cache for quick access
                         img = Image.open(io.BytesIO(image_data))
-                        img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                        img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                         
                         # Store processed image in dialog cache for instant display when toggled
                         if not hasattr(dialog, '_preloaded_bio_pic'):
@@ -10703,7 +11107,7 @@ class BandcampDownloaderGUI:
                         
                         # Process image (resize, etc.) and store in cache for quick access
                         img = Image.open(io.BytesIO(image_data))
-                        img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                        img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                         
                         # Store processed image in dialog cache for instant display when toggled
                         if not hasattr(dialog, '_preloaded_album_art'):
@@ -13319,9 +13723,9 @@ class BandcampDownloaderGUI:
                     blurred_bg = self._create_blurred_background(self.preloaded_album_art_pil)
                 
                 if blurred_bg:
-                    self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                    self.album_art_canvas.create_image(83, 83, image=blurred_bg, anchor='center')
                 
-                self.album_art_canvas.create_image(84, 84, 
+                self.album_art_canvas.create_image(83, 83, 
                                                    image=self.preloaded_album_art_image, anchor='center')
                 
                 self.album_art_image = self.preloaded_album_art_image
@@ -13366,8 +13770,8 @@ class BandcampDownloaderGUI:
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
                 
-                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
-                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                # Resize to fit canvas (166x166 with 1px margin on all sides) while maintaining aspect ratio
+                img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -13388,10 +13792,10 @@ class BandcampDownloaderGUI:
                     # Create blurred background if image doesn't fill the canvas
                     blurred_bg = self._create_blurred_background(img)
                     if blurred_bg:
-                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                        self.album_art_canvas.create_image(83, 83, image=blurred_bg, anchor='center')
                     
                     # Display image centered
-                    self.album_art_canvas.create_image(84, 84, image=photo, anchor='center')
+                    self.album_art_canvas.create_image(83, 83, image=photo, anchor='center')
                     
                     # Store reference to prevent garbage collection
                     self.album_art_image = photo
@@ -13416,7 +13820,7 @@ class BandcampDownloaderGUI:
                     if not self._is_url_field_empty():
                         self.album_art_canvas.delete("all")
                         self.album_art_canvas.create_text(
-                            84, 84, text="Extra Artwork\n\nFailed to load",
+                            83, 83, text="Extra Artwork\n\nFailed to load",
                             fill='#808080', font=("Segoe UI", 8), justify='center'
                         )
                 self.root.after(0, show_error)
@@ -13980,9 +14384,9 @@ class BandcampDownloaderGUI:
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
                 
-                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
-                # Using 167x167 to maximize size while ensuring no cutoff
-                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                # Resize to fit canvas (166x166 with 1px margin on all sides) while maintaining aspect ratio
+                # Using 166x166 to ensure no cutoff (canvas is 168x168, so 166x166 leaves 1px margin on all sides)
+                img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -14005,11 +14409,11 @@ class BandcampDownloaderGUI:
                     blurred_bg = self._create_blurred_background(img)
                     if blurred_bg:
                         # Draw blurred background first (fills entire canvas)
-                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                        self.album_art_canvas.create_image(83, 83, image=blurred_bg, anchor='center')
                     
                     # Display original image centered (anchor='center' means x,y is the center point)
-                    # Canvas center is 84, 84 (half of 168x168) - this centers both horizontally and vertically
-                    self.album_art_canvas.create_image(84, 84, image=photo, anchor='center')
+                    # Canvas center is 83, 83 (half of 166x166) - this centers both horizontally and vertically
+                    self.album_art_canvas.create_image(83, 83, image=photo, anchor='center')
                     
                     # Keep references to prevent garbage collection
                     self.album_art_image = photo
@@ -14151,9 +14555,9 @@ class BandcampDownloaderGUI:
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
                 
-                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
-                # Using 167x167 to maximize size while ensuring no cutoff
-                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                # Resize to fit canvas (166x166 with 1px margin on all sides) while maintaining aspect ratio
+                # Using 166x166 to ensure no cutoff (canvas is 168x168, so 166x166 leaves 1px margin on all sides)
+                img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -14177,11 +14581,11 @@ class BandcampDownloaderGUI:
                     blurred_bg = self._create_blurred_background(img)
                     if blurred_bg:
                         # Draw blurred background first (fills entire canvas)
-                        self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                        self.album_art_canvas.create_image(83, 83, image=blurred_bg, anchor='center')
                     
                     # Display original image centered (anchor='center' means x,y is the center point)
-                    # Canvas center is 84, 84 (half of 168x168) - this centers both horizontally and vertically
-                    self.album_art_canvas.create_image(84, 84, image=photo, anchor='center')
+                    # Canvas center is 83, 83 (half of 166x166) - this centers both horizontally and vertically
+                    self.album_art_canvas.create_image(83, 83, image=photo, anchor='center')
                     
                     # Keep references to prevent garbage collection
                     self.album_art_image = photo
@@ -14260,9 +14664,9 @@ class BandcampDownloaderGUI:
                 # Open and resize image
                 img = Image.open(io.BytesIO(image_data))
                 
-                # Resize to fit canvas (167x167 with small margin) while maintaining aspect ratio
-                # Using 167x167 to maximize size while ensuring no cutoff
-                img.thumbnail((167, 167), Image.Resampling.LANCZOS)
+                # Resize to fit canvas (166x166 with 1px margin on all sides) while maintaining aspect ratio
+                # Using 166x166 to ensure no cutoff (canvas is 168x168, so 166x166 leaves 1px margin on all sides)
+                img.thumbnail((166, 166), Image.Resampling.LANCZOS)
                 
                 # Convert to PhotoImage
                 photo = ImageTk.PhotoImage(img)
@@ -14471,10 +14875,10 @@ class BandcampDownloaderGUI:
                 
                 if blurred_bg:
                     # Draw blurred background first (fills entire canvas)
-                    self.album_art_canvas.create_image(84, 84, image=blurred_bg, anchor='center')
+                    self.album_art_canvas.create_image(83, 83, image=blurred_bg, anchor='center')
                 
                 # Display original image centered
-                self.album_art_canvas.create_image(84, 84, 
+                self.album_art_canvas.create_image(83, 83, 
                                                    image=self.preloaded_album_art_image, anchor='center')
                 
                 # Use preloaded image as current image
@@ -16129,7 +16533,7 @@ class BandcampDownloaderGUI:
         # Header row
         detached_log_label = Label(detached_log_frame, text="Status", 
                                   bg=log_frame_bg, fg=colors.fg, font=("Segoe UI", 9))
-        detached_log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 2))
+        detached_log_label.grid(row=0, column=0, sticky=W, padx=6, pady=(0, 0))
         
         # Link checkbox - toggle linking between main and detached windows
         detached_link_var = BooleanVar(value=self.status_window_linked)
@@ -16159,6 +16563,8 @@ class BandcampDownloaderGUI:
         detached_link_toggle.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
         self.detached_link_toggle = detached_link_toggle
         self.detached_link_var = detached_link_var
+        # Add tooltip for Link checkbox
+        self._create_tooltip(detached_link_toggle, "When linked, the detached window moves with the main window.")
         
         # If linking is already enabled, initialize it immediately after window is ready
         # This ensures linking works even if the checkbox was already checked when detaching
@@ -16192,6 +16598,8 @@ class BandcampDownloaderGUI:
             style='Small.TButton',
             state='normal'
         )
+        # Add tooltip for Attach button
+        self._create_tooltip(self.attach_btn, "Reattach the status log to the main window.")
         self.attach_btn.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(0, 0))
         #self._create_tooltip(self.attach_btn, "Reattach status log to main window")
         
@@ -16382,7 +16790,7 @@ class BandcampDownloaderGUI:
         # Restore log_frame to its original position in main window
         # Use the same grid configuration as in _setup_log_section
         if hasattr(self, 'main_frame') and self.main_frame:
-            self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(2, 4), padx=0)
+            self.log_frame.grid(row=10, column=0, columnspan=3, sticky=(W, E, N, S), pady=(2, 0), padx=0)
         else:
             # Fallback: find main_frame
             main_frame = None
@@ -17451,6 +17859,10 @@ class BandcampDownloaderGUI:
         self.cancel_btn.grid()
         self.is_cancelling = False
         
+        # Update window title to "Starting"
+        self._update_window_title('starting')
+        self._update_taskbar_progress(state='indeterminate')
+        
         # Lock URL field during download
         self._lock_url_field()
         
@@ -17458,9 +17870,21 @@ class BandcampDownloaderGUI:
         # Update button state (will be disabled because is_downloading will be True)
         self._update_clear_button_state()
         
-        # Start with indeterminate mode (will switch to determinate when we get progress)
-        self.progress_bar.config(mode='indeterminate', maximum=100, value=0)
-        self.progress_bar.start(10)  # Animation speed (lower = faster)
+        # Track if bars have been swapped for download (reset each download)
+        self._bars_swapped_for_download = False
+        
+        # Always start with normal bars (for animation) - will swap when download progress starts if setting is enabled
+        # Hide swapped bars initially
+        if hasattr(self, 'progress_bar_swapped_large'):
+            self.progress_bar_swapped_large.grid_remove()
+        if hasattr(self, 'progress_bar_swapped_thin'):
+            self.progress_bar_swapped_thin.grid_remove()
+        
+        # Show normal bars and initialize them (for animation)
+        if hasattr(self, 'progress_bar'):
+            self.progress_bar.grid()
+            self.progress_bar.config(mode='indeterminate', maximum=100, value=0)
+            self.progress_bar.start(10)  # Animation speed (lower = faster)
         # Reset overall progress bar (but don't show it yet - will show when first file starts)
         if hasattr(self, 'overall_progress_bar') and self.overall_progress_bar:
             try:
@@ -21069,6 +21493,8 @@ class BandcampDownloaderGUI:
             self.download_start_time = None  # Track when download started
             self.total_tracks = 0  # Total number of tracks in current album
             self.current_track = 0  # Current track being downloaded (0-based, will be incremented as tracks finish)
+            self.actual_downloadable_tracks = 0  # Actual number of tracks that will be downloaded (may be less than total_tracks if some aren't available)
+            self.seen_playlist_indices = set()  # Track which playlist indices we've seen progress for
             
             # Discography tracking (for multi-album downloads) - only set if in discography mode
             self.is_discography_mode = (total_albums > 1)  # True if downloading multiple albums
@@ -21086,6 +21512,8 @@ class BandcampDownloaderGUI:
             self.last_playlist_index = None  # Track last playlist_index to detect album changes
             self.last_filename = None  # Track last filename to detect album changes via path
             self.seen_album_paths = set()  # Track which album paths we've already seen to prevent duplicate detections
+            self.actual_downloadable_tracks_all_albums = 0  # Actual downloadable tracks across all albums
+            self.seen_playlist_indices_all_albums = set()  # Track playlist indices seen across all albums
             
             # Get download start time
             self.download_start_time = time.time()
@@ -21521,6 +21949,8 @@ class BandcampDownloaderGUI:
             self.download_start_time = None  # Track when download started
             self.total_tracks = 0  # Total number of tracks in current album
             self.current_track = 0  # Current track being downloaded (0-based, will be incremented as tracks finish)
+            self.actual_downloadable_tracks = 0  # Actual number of tracks that will be downloaded (may be less than total_tracks if some aren't available)
+            self.seen_playlist_indices = set()  # Track which playlist indices we've seen progress for
             
             # Discography tracking (for multi-album downloads)
             # Check if discography mode is enabled (only for single URL)
@@ -21538,6 +21968,8 @@ class BandcampDownloaderGUI:
             self.last_playlist_index = None  # Track last playlist_index to detect album changes
             self.last_filename = None  # Track last filename to detect album changes via path
             self.seen_album_paths = set()  # Track which album paths we've already seen to prevent duplicate detections
+            self.actual_downloadable_tracks_all_albums = 0  # Actual downloadable tracks across all albums
+            self.seen_playlist_indices_all_albums = set()  # Track playlist indices seen across all albums
             
             # Get download start time
             self.download_start_time = time.time()
@@ -22730,16 +23162,36 @@ class BandcampDownloaderGUI:
                 # Note: playlist_index might only be present at the start of each track
                 # We'll use it if available, but rely on incrementing when tracks finish
                 playlist_index = d.get('playlist_index')
-                if playlist_index is not None and not self.is_discography_mode:
-                    # Store 0-based index (0-based internally for consistency)
-                    # Only update if it's different (new track started)
-                    # In discography mode, playlist_index might refer to albums, so we handle it differently above
-                    if playlist_index != self.current_track:
-                        self.current_track = playlist_index
+                if playlist_index is not None:
+                    # Track which playlist indices we've actually seen (for calculating actual downloadable tracks)
+                    if not hasattr(self, 'seen_playlist_indices'):
+                        self.seen_playlist_indices = set()
+                    self.seen_playlist_indices.add(playlist_index)
+                    # Update actual downloadable tracks count
+                    self.actual_downloadable_tracks = len(self.seen_playlist_indices)
+                    
+                    # For discography mode, also track across all albums
+                    if self.is_discography_mode:
+                        if not hasattr(self, 'seen_playlist_indices_all_albums'):
+                            self.seen_playlist_indices_all_albums = set()
+                        self.seen_playlist_indices_all_albums.add(playlist_index)
+                        self.actual_downloadable_tracks_all_albums = len(self.seen_playlist_indices_all_albums)
+                    
+                    if not self.is_discography_mode:
+                        # Store 0-based index (0-based internally for consistency)
+                        # Only update if it's different (new track started)
+                        # In discography mode, playlist_index might refer to albums, so we handle it differently above
+                        if playlist_index != self.current_track:
+                            self.current_track = playlist_index
                 
-                # Get raw values from yt-dlp progress dict
+                # Track that we've seen actual download progress (not just metadata)
+                # This helps us know when we have real downloadable tracks
+                if not hasattr(self, 'has_seen_download_progress'):
+                    self.has_seen_download_progress = False
                 downloaded = d.get('downloaded_bytes', 0) or 0
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                if downloaded > 0 or total > 0:
+                    self.has_seen_download_progress = True
                 speed = d.get('speed')
                 eta = d.get('eta')
                 
@@ -22803,57 +23255,165 @@ class BandcampDownloaderGUI:
                 
                 # Calculate overall progress
                 overall_percent = None
+                has_valid_total = False
                 if self.is_discography_mode and self.total_tracks_all_albums > 0:
                     # Discography mode: calculate progress across all albums and tracks
+                    # Use actual downloadable tracks if we've detected them, otherwise use total_tracks_all_albums
+                    tracks_for_calculation = self.total_tracks_all_albums
+                    if hasattr(self, 'actual_downloadable_tracks_all_albums') and self.actual_downloadable_tracks_all_albums > 0:
+                        tracks_for_calculation = self.actual_downloadable_tracks_all_albums
+                    
                     # completed_tracks_all_albums = tracks from completed albums
                     # current_track = current track in current album (0-based)
                     # current_track_progress = percent / 100.0 (0.0 to 1.0)
                     completed_tracks = self.completed_tracks_all_albums + self.current_track
                     current_track_progress = (percent / 100.0) if percent is not None else 0.0
-                    overall_progress = (completed_tracks + current_track_progress) / self.total_tracks_all_albums
+                    overall_progress = (completed_tracks + current_track_progress) / tracks_for_calculation
                     overall_percent = overall_progress * 100.0
+                    has_valid_total = True
                 elif self.total_tracks > 0:
                     # Single album mode
-                    # Overall progress = (completed tracks + current track progress) / total tracks
+                    # Use actual downloadable tracks if we've detected them, otherwise use total_tracks
+                    # This handles cases where not all tracks on the album are available for download
+                    tracks_for_calculation = self.total_tracks
+                    # Use actual downloadable tracks if we've seen at least one track with progress
+                    # This ensures we calculate percentage based on tracks that actually download
+                    # Only use this if we've actually seen download progress (not just metadata)
+                    if (hasattr(self, 'has_seen_download_progress') and self.has_seen_download_progress and
+                        hasattr(self, 'seen_playlist_indices') and len(self.seen_playlist_indices) > 0):
+                        # If we've only seen one unique playlist_index, assume there's only 1 track
+                        # This handles the case where only 1 track out of many is available
+                        if len(self.seen_playlist_indices) == 1:
+                            tracks_for_calculation = 1
+                        else:
+                            # Multiple tracks seen - use the count
+                            tracks_for_calculation = len(self.seen_playlist_indices)
+                    
+                    # Overall progress = (completed tracks + current track progress) / actual downloadable tracks
                     # completed_tracks = current_track (0-based, so track 0 means 0 completed)
                     # current_track_progress = percent / 100.0 (0.0 to 1.0)
                     completed_tracks = self.current_track  # 0-based: 0 = first track, 1 = second track, etc.
                     current_track_progress = (percent / 100.0) if percent is not None else 0.0
-                    overall_progress = (completed_tracks + current_track_progress) / self.total_tracks
+                    overall_progress = (completed_tracks + current_track_progress) / tracks_for_calculation
                     overall_percent = overall_progress * 100.0
+                    has_valid_total = True
+                
+                # Ensure overall_percent is a number (default to 0.0 if None, but only use if we have valid total)
+                if overall_percent is None:
+                    overall_percent = 0.0
                 
                 # Update UI - capture values in closure properly
-                def update_progress(text=progress_text, pct=percent, overall_pct=overall_percent):
+                def update_progress(text=progress_text, pct=percent, overall_pct=overall_percent, valid_total=has_valid_total, track_index=playlist_index):
                     
                     # Always update the progress text
                     self.progress_var.set(text)
                     
-                    # Update overall album progress bar (thin bar below)
-                    # Show it when we first get progress data (after first file starts downloading)
-                    if overall_pct is not None and hasattr(self, 'overall_progress_bar'):
-                        try:
-                            # Show the overall progress bar if it's not already visible
-                            if not self.overall_progress_bar.winfo_viewable():
-                                self.overall_progress_bar.grid()
-                            self.overall_progress_bar.config(mode='determinate', value=overall_pct)
-                        except:
-                            pass
-                    
-                    # Update track progress bar (main bar above)
-                    if pct is not None:
-                        # Stop indeterminate animation if running
-                        try:
-                            if self.progress_bar.cget('mode') == 'indeterminate':
-                                self.progress_bar.stop()
-                        except:
-                            pass
-                        # Switch to determinate mode and set value
-                        self.progress_bar.config(mode='determinate', maximum=100, value=pct)
+                    # Update window title with progress
+                    if valid_total and overall_pct is not None:
+                        # Determine if multiple albums
+                        album_num = None
+                        total_albums = None
+                        if self.is_discography_mode and hasattr(self, 'total_albums') and self.total_albums > 1:
+                            album_num = self.current_album + 1 if hasattr(self, 'current_album') and self.current_album >= 0 else 1
+                            total_albums = self.total_albums
+                        
+                        self._update_window_title('downloading', percent=overall_pct, album_num=album_num, total_albums=total_albums)
+                        self._update_taskbar_progress(percent=overall_pct, state='normal')
                     else:
-                        # Keep indeterminate mode if no percentage available
-                        if self.progress_bar.cget('mode') != 'indeterminate':
-                            self.progress_bar.config(mode='indeterminate')
-                            self.progress_bar.start(10)
+                        # Still downloading but no valid total yet
+                        self._update_window_title('downloading')
+                        self._update_taskbar_progress(state='indeterminate')
+                    
+                    # Check if progress bars should be swapped
+                    swap_bars = False
+                    if hasattr(self, 'show_overall_in_large_bar_var'):
+                        try:
+                            swap_bars = self.show_overall_in_large_bar_var.get()
+                        except:
+                            swap_bars = False
+                    
+                    # Swap bars when we get actual download progress (not during animation)
+                    # This is the first time we have real progress data, so swap if needed
+                    if swap_bars and hasattr(self, '_bars_swapped_for_download'):
+                        if not self._bars_swapped_for_download:
+                            # First time getting download progress - swap now
+                            # Hide normal bars
+                            if hasattr(self, 'progress_bar'):
+                                try:
+                                    self.progress_bar.stop()
+                                    self.progress_bar.grid_remove()
+                                except:
+                                    pass
+                            if hasattr(self, 'overall_progress_bar'):
+                                self.overall_progress_bar.grid_remove()
+                            
+                            # Show swapped bars
+                            if hasattr(self, 'progress_bar_swapped_large'):
+                                self.progress_bar_swapped_large.grid()
+                            # Don't show thin bar yet - will show when first file starts (like normal mode)
+                            # Keep it hidden initially
+                            
+                            self._bars_swapped_for_download = True
+                    
+                    if swap_bars and hasattr(self, '_bars_swapped_for_download') and self._bars_swapped_for_download:
+                        # Swapped mode: Use swapped progress bars
+                        # Large bar (swapped) = overall progress, Thin bar (swapped) = track progress
+                        
+                        # Update large swapped bar with overall progress
+                        # ThinProgressBar only supports determinate mode, so always use determinate
+                        if hasattr(self, 'progress_bar_swapped_large'):
+                            try:
+                                if valid_total and overall_pct is not None:
+                                    # Use overall_pct (gradually increases across all tracks, doesn't reset per track)
+                                    self.progress_bar_swapped_large.config(mode='determinate', maximum=100, value=overall_pct)
+                                else:
+                                    # Show 0% when no valid total yet (will update when total_tracks is known)
+                                    self.progress_bar_swapped_large.config(mode='determinate', maximum=100, value=0.0)
+                            except:
+                                pass
+                        
+                        # Update thin swapped bar with track progress
+                        if pct is not None and hasattr(self, 'progress_bar_swapped_thin'):
+                            try:
+                                # Show the thin swapped bar if it's not already visible
+                                if not self.progress_bar_swapped_thin.winfo_viewable():
+                                    self.progress_bar_swapped_thin.grid()
+                                
+                                # Use pct directly (track progress, 0-100% per track, resets each track)
+                                # Simple direct update - restore previous working behavior
+                                track_value = max(0.0, min(100.0, float(pct)))
+                                self.progress_bar_swapped_thin.config(mode='determinate', value=track_value)
+                            except:
+                                pass
+                    else:
+                        # Normal mode: Use normal progress bars
+                        # Large bar (normal) = track progress, Thin bar (normal) = overall progress
+                        
+                        # Update thin normal bar with overall progress
+                        if overall_pct is not None and hasattr(self, 'overall_progress_bar'):
+                            try:
+                                # Show the overall progress bar if it's not already visible
+                                if not self.overall_progress_bar.winfo_viewable():
+                                    self.overall_progress_bar.grid()
+                                self.overall_progress_bar.config(mode='determinate', value=overall_pct)
+                            except:
+                                pass
+                        
+                        # Update large normal bar with track progress
+                        if pct is not None:
+                            # Stop indeterminate animation if running
+                            try:
+                                if self.progress_bar.cget('mode') == 'indeterminate':
+                                    self.progress_bar.stop()
+                            except:
+                                pass
+                            # Switch to determinate mode and set value
+                            self.progress_bar.config(mode='determinate', maximum=100, value=pct)
+                        else:
+                            # Keep indeterminate mode if no percentage available
+                            if self.progress_bar.cget('mode') != 'indeterminate':
+                                self.progress_bar.config(mode='indeterminate')
+                                self.progress_bar.start(10)
                 
                 self.root.after(0, update_progress)
             
@@ -23221,7 +23781,7 @@ class BandcampDownloaderGUI:
                     # Update available - show popup
                     # Log update available (user-visible)
                     if hasattr(self, 'log'):
-                        self.root.after(0, lambda: self.log(f"Update available: v{current_version} → v{latest_version}"))
+                        self.root.after(0, lambda: self.log(f" Update available: v{current_version} → v{latest_version}"))
                     
                     # Try to fetch commit message from GitHub API
                     release_notes = self._fetch_commit_message(repo_owner, repo_name, latest_version)
@@ -24379,20 +24939,41 @@ class BandcampDownloaderGUI:
                 )
                 name_label.pack(anchor='w', fill=X)
                 
-                # Make entire row Clickable to toggle checkbox
-                def make_toggle_callback(checkbox_var):
+                # Make row clickable to toggle checkbox (except checkbox and color preview)
+                def make_toggle_callback(checkbox_var, checkbox_widget, preview_widget):
                     def toggle_checkbox(event):
+                        # Check if the click originated from the checkbox, preview, or their children
+                        # If so, don't toggle
+                        widget = event.widget
+                        # Check if widget is the checkbox/preview or any of their children
+                        try:
+                            # Get the widget hierarchy
+                            current = widget
+                            while current:
+                                if current == checkbox_widget or current == preview_widget:
+                                    # Click originated from checkbox or preview, don't toggle
+                                    return
+                                current = current.master
+                        except:
+                            pass
+                        
+                        # Click didn't come from checkbox or preview, toggle it
                         checkbox_var.set(not checkbox_var.get())
                     return toggle_checkbox
                 
-                toggle_callback = make_toggle_callback(var)
-                for widget in [theme_frame, preview_frame, info_frame]:
+                toggle_callback = make_toggle_callback(var, checkbox, preview_frame)
+                
+                # Bind to theme_frame and info_frame only (not preview_frame)
+                # The callback will check if the click came from checkbox/preview and skip toggling if so
+                for widget in [theme_frame, info_frame]:
                     widget.bind("<Button-1>", toggle_callback)
                     for child in widget.winfo_children():
                         try:
                             child.bind("<Button-1>", toggle_callback)
                         except:
                             pass
+                
+                # Don't bind to checkbox or preview_frame - let them work normally
                 
                 dialog.theme_data[theme["filename"]] = {"theme": theme, "conflict": False}
             
@@ -26853,14 +27434,21 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 )
                 structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
                 
-                # Delete button
-                delete_btn = ttk.Button(
+                # Delete button (garbage icon with hover state)
+                delete_btn = Label(
                     structure_frame,
-                    text="X",
+                    text=self._get_icon('trash'),
+                    font=("Segoe UI", 12),
+                    bg=main_bg,
+                    fg=colors.disabled_fg,
+                    cursor='hand2',
                     width=3,
-                    command=lambda s=structure: self._delete_custom_structure(dialog, s)
+                    padx=4
                 )
                 delete_btn.pack(side=RIGHT, padx=5)
+                delete_btn.bind("<Button-1>", lambda e, s=structure: self._delete_custom_structure(dialog, s))
+                delete_btn.bind("<Enter>", lambda e, w=delete_btn: w.config(fg=colors.hover_fg))
+                delete_btn.bind("<Leave>", lambda e, w=delete_btn: w.config(fg=colors.disabled_fg))
         
         # Then show template structures (new format) - newest at end
         if has_templates:
@@ -26880,14 +27468,21 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
                 )
                 structure_label.pack(side=LEFT, padx=10, fill=X, expand=True)
                 
-                # Delete button
-                delete_btn = ttk.Button(
+                # Delete button (garbage icon with hover state)
+                delete_btn = Label(
                     structure_frame,
-                    text="X",
+                    text=self._get_icon('trash'),
+                    font=("Segoe UI", 12),
+                    bg=main_bg,
+                    fg=colors.disabled_fg,
+                    cursor='hand2',
                     width=3,
-                    command=lambda t=template_data: self._delete_custom_folder_structure_template(dialog, t)
+                    padx=4
                 )
                 delete_btn.pack(side=RIGHT, padx=5)
+                delete_btn.bind("<Button-1>", lambda e, t=template_data: self._delete_custom_folder_structure_template(dialog, t))
+                delete_btn.bind("<Enter>", lambda e, w=delete_btn: w.config(fg=colors.hover_fg))
+                delete_btn.bind("<Leave>", lambda e, w=delete_btn: w.config(fg=colors.disabled_fg))
         
         # Close button - use destroy directly to avoid conflicts with protocol handler
         close_btn = ttk.Button(
@@ -28278,14 +28873,21 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             )
             format_label.pack(side=LEFT, padx=10, fill=X, expand=True)
             
-            # Delete button
-            delete_btn = ttk.Button(
+            # Delete button (garbage icon with hover state)
+            delete_btn = Label(
                 format_frame,
-                text="X",
+                text=self._get_icon('trash'),
+                font=("Segoe UI", 12),
+                bg=main_bg,
+                fg=colors.disabled_fg,
+                cursor='hand2',
                 width=3,
-                command=lambda f=format_data: self._delete_custom_filename(dialog, f)
+                padx=4
             )
             delete_btn.pack(side=RIGHT, padx=5)
+            delete_btn.bind("<Button-1>", lambda e, f=format_data: self._delete_custom_filename(dialog, f))
+            delete_btn.bind("<Enter>", lambda e, w=delete_btn: w.config(fg=colors.hover_fg))
+            delete_btn.bind("<Leave>", lambda e, w=delete_btn: w.config(fg=colors.disabled_fg))
         
         # Close button
         close_btn = ttk.Button(
@@ -28426,6 +29028,10 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         Args:
             choice: Either a string key ("Original", "01. Track", etc.) or a format dict
         """
+        # Set flag to track that item was just selected (for quick-close functionality)
+        if hasattr(self, 'filename_item_just_selected'):
+            self.filename_item_just_selected = True
+        
         if isinstance(choice, str):
             # Standard format (including "Original")
             self.numbering_var.set(choice)
@@ -28483,15 +29089,31 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
     
     def download_complete(self, success, message):
         """Handle download completion."""
-        # Stop progress bar animation immediately
+        # Reset window title and taskbar progress
+        self._update_window_title('idle')
+        self._update_taskbar_progress(state='none')
+        
+        # Check which mode we're in
+        swap_bars = False
+        if hasattr(self, 'show_overall_in_large_bar_var'):
+            try:
+                swap_bars = self.show_overall_in_large_bar_var.get()
+            except:
+                swap_bars = False
+        
+        # Stop progress bar animation immediately (both modes)
         try:
-            self.progress_bar.stop()
+            if hasattr(self, 'progress_bar'):
+                self.progress_bar.stop()
+            if hasattr(self, 'progress_bar_swapped_large'):
+                self.progress_bar_swapped_large.stop()
         except:
             pass
         
         # Restore UI state immediately - do this FIRST before any other operations
         self.is_cancelling = False
         self.ydl_instance = None
+        self._bars_swapped_for_download = False  # Reset swap tracking
         
         # Restore buttons
         try:
@@ -28508,26 +29130,101 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
         # Update clear log button state after download/cancel operations complete
         self._update_clear_button_state()
         
+        # Check if bars were swapped during download
+        bars_were_swapped = hasattr(self, '_bars_swapped_for_download') and self._bars_swapped_for_download
+        
         if success:
-            # Show 100% completion for main progress bar
-            self.progress_bar.config(mode='determinate', value=100)
-            # Hide overall progress bar after completion
-            if hasattr(self, 'overall_progress_bar') and self.overall_progress_bar:
+            # Show 100% completion for appropriate progress bar
+            if swap_bars and bars_were_swapped:
+                # Swapped mode: Update swapped large bar
+                if hasattr(self, 'progress_bar_swapped_large'):
+                    try:
+                        # ThinProgressBar doesn't have stop() method
+                        self.progress_bar_swapped_large.config(mode='determinate', value=100)
+                    except:
+                        pass
+                # Hide swapped bars and show normal bars again for next download
+                # Hide swapped thin bar (should already be hidden, but ensure it)
+                if hasattr(self, 'progress_bar_swapped_thin'):
+                    try:
+                        self.progress_bar_swapped_thin.grid_remove()
+                    except:
+                        pass
+                if hasattr(self, 'progress_bar_swapped_large'):
+                    try:
+                        self.progress_bar_swapped_large.grid_remove()
+                    except:
+                        pass
+                if hasattr(self, 'progress_bar'):
+                    self.progress_bar.grid()
+            else:
+                # Normal mode: Update normal large bar (or if swapped but not yet swapped)
+                if hasattr(self, 'progress_bar'):
+                    try:
+                        self.progress_bar.stop()
+                        self.progress_bar.config(mode='determinate', value=100)
+                    except:
+                        pass
+                # Hide normal thin bar
+                if hasattr(self, 'overall_progress_bar') and self.overall_progress_bar:
+                    try:
+                        self.overall_progress_bar.grid_remove()
+                    except:
+                        pass
+            
+            # Always hide swapped thin bar before showing dialog (for both swapped and normal modes)
+            if hasattr(self, 'progress_bar_swapped_thin'):
                 try:
-                    self.overall_progress_bar.grid_remove()
+                    self.progress_bar_swapped_thin.grid_remove()
                 except:
                     pass
+            
             self.progress_var.set("Download complete!")
             self.log("")
             self.log("[OK] Download complete!")
             messagebox.showinfo("Success", message)
         else:
-            # Reset progress bar for failed/cancelled downloads
-            self.progress_bar.config(mode='determinate', value=0)
-            # Hide overall progress bar after failure/cancellation
-            if hasattr(self, 'overall_progress_bar') and self.overall_progress_bar:
+            # Reset progress bars for failed/cancelled downloads
+            # Check if bars were swapped during download
+            bars_were_swapped = hasattr(self, '_bars_swapped_for_download') and self._bars_swapped_for_download
+            
+            if swap_bars and bars_were_swapped:
+                # Swapped mode: Reset swapped bars
+                if hasattr(self, 'progress_bar_swapped_large'):
+                    try:
+                        # ThinProgressBar doesn't have stop() method
+                        self.progress_bar_swapped_large.config(mode='determinate', value=0)
+                        self.progress_bar_swapped_large.grid_remove()
+                    except:
+                        pass
+                if hasattr(self, 'progress_bar_swapped_thin'):
+                    try:
+                        self.progress_bar_swapped_thin.config(mode='determinate', value=0)
+                        self.progress_bar_swapped_thin.grid_remove()
+                    except:
+                        pass
+                # Show normal bars again for next download
+                if hasattr(self, 'progress_bar'):
+                    self.progress_bar.grid()
+            else:
+                # Normal mode: Reset normal bars
+                if hasattr(self, 'progress_bar'):
+                    try:
+                        self.progress_bar.stop()
+                        self.progress_bar.config(mode='determinate', value=0)
+                    except:
+                        pass
+                if hasattr(self, 'overall_progress_bar') and self.overall_progress_bar:
+                    try:
+                        self.overall_progress_bar.config(mode='determinate', value=0)
+                        self.overall_progress_bar.grid_remove()
+                    except:
+                        pass
+            
+            # Always hide swapped thin bar before showing dialog
+            if hasattr(self, 'progress_bar_swapped_thin'):
                 try:
-                    self.overall_progress_bar.grid_remove()
+                    self.progress_bar_swapped_thin.grid_remove()
                 except:
                     pass
             
