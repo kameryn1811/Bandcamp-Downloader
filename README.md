@@ -10,7 +10,7 @@ A Python-based GUI application for downloading Bandcamp albums with full metadat
 
 ## Why This Exists
 
-This was created as an interim solution for users experiencing issues with [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader). While we wait for official updates and fixes to that excellent C# application, this Python-based alternative provides a working solution.
+This was created as an interim solution for users experiencing issues with [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader) (Now ). While we wait for official updates and fixes to that excellent C# application, this Python-based alternative provides a working solution.
 
 ## What It Does
 
@@ -22,20 +22,21 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 
 ## Key Features
 
-* **Executable** - Available in. exe format, simply download and run.
+* **Executable** - Available in .exe format, simply download and run.
 * **Automatic Updates** - Select automatic updates or check now to be notified when there is a new update and accept to install it automatically.
 * **Intuitive Interface** - No command-line knowledge required, easy to use.
-* **Drag and Drop Support** - Conventiently drag Bandcamp URLs into the app from bandcamp pages or your browers address bar. 
+* **Drag and Drop Support** - Conveniently drag Bandcamp URLs into the app from bandcamp pages or your browser address bar.
+* **URL Tags** - URLs are automatically converted to colored, interactive tags with hover overlays. Hover to access options: open in browser, view metadata, copy, paste, or delete.
 * **Batch Downloads** - Download multiple albums at once by pasting multiple URLs.
 * **Discography Support** - Download entire artist discographies with a single click.
-* **Organization** - Fully customizable folder structure (e.g. Artist/Album etc.) and filename format (e.g. 01. Artist - Track.mp3).
-* **Metadata** - Automatically tags files with artist, album, track number, and date.
-* **Cover Art** - Embeds artwork into files and optionally includes a copy in dowloaded files.
-* **Format Flexibility** - Download original files provided by Bandcamp (very fast) or re-encode files as: MP3, FLAC, OGG, or WAV (note: converted formats use 128 kbps source and do not improve quality).
+* **Organization** - Fully customizable folder structure (e.g. Artist/Album (Year) etc.) and filename format (e.g. 01. Artist - Track.mp3).
+* **Metadata** - Automatically tags files with artist, album, track number, date, genre, label, catalog number, and album artist.
+* **Cover Art** - Embeds artwork into files and optionally includes album art, bio pics, and extra artwork as separate files in the download.
+* **Format Flexibility** - Download original files provided by Bandcamp (very fast) or re-encode files as: MP3 or OGG (note: original formats can vary including .M4A, and MP3 Quality can vary depending on what is available).
 * **Playlist Generation** - Create .m3u playlists automatically.
-* **Preview Path Link** - previews path and file that will be created, and opens windows explorer to the closest existing folder and directly to the album folder after download.
-* **Status Log** - Searchable status log with Ctrl+F, word wrap toggle, and clear with undo.
-* **Debug Mode** - Toggle visibility of debug information to troubleshoot issues. 
+* **Preview Path Link** - Previews path and file that will be created, updates in real-time during batch downloads, and opens Windows Explorer to the closest existing folder and directly to the album folder after download.
+* **Status Log** - Searchable status log with Ctrl+F, word wrap toggle, clear with undo, and detachable window option.
+* **Debug Mode** - Toggle visibility of debug information to troubleshoot issues.
 * **Supported URLs:**
    * Album pages: `https://[artist].bandcamp.com/album/[album]`
    * Track pages: `https://[artist].bandcamp.com/track/[track]`
