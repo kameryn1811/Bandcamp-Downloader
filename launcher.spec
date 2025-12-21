@@ -44,6 +44,9 @@ a = Analysis(
         'PIL._tkinter_finder',
         'yt_dlp',
         'tkinterdnd2',  # Drag-and-drop support for URL field
+        'mutagen',  # MP3 artwork embedding (Windows Explorer compatible)
+        'mutagen.id3',
+        'mutagen.mp3',
     ],
     hookspath=[],
     hooksconfig={},
