@@ -25,8 +25,9 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 * **Executable** - Available in .exe format, simply download and run.
 * **Automatic Updates** - Select automatic updates or check now to be notified when there is a new update and accept to install it automatically.
 * **Intuitive Interface** - No command-line knowledge required, easy to use.
+* **Dark and Light Mode** - Switch between dark and light themes to match your preference.
 * **Drag and Drop Support** - Conveniently drag Bandcamp URLs into the app from bandcamp pages or your browser address bar (or use various options to paste URLs)
-* **URL Tags** - URLs are automatically converted to colored, interactive tags with hover overlays. Hover to access options: open in browser, view metadata, copy, paste, or delete.
+* **URL Tags** - URLs are automatically converted to colored, interactive tags with hover overlays. Hover to access options: open in browser, view metadata, copy, paste, or delete. Additional Color Schemes available or easily make your own by editing Color Scheme .css files. 
 * **Batch Downloads** - Download multiple albums at once by dragging or pasting multiple URLs into the queue.
 * **Discography Support** - Download entire artist discographies with a single click.
 * **Organization** - Fully customizable folder structure (e.g. Artist/Album (Year) etc.) and filename format (e.g. 01. Artist - Track.mp3).
