@@ -10,15 +10,15 @@ A Python-based GUI application for downloading Bandcamp albums with full metadat
 
 ## Why This Exists
 
-This was created as an interim solution for users experiencing issues with [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader) (Now ). While we wait for official updates and fixes to that excellent C# application, this Python-based alternative provides a working solution.
+This was created as an interim solution for users experiencing issues with [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader) (fixed and working as of Nov 30, 2025). 
 
 ## What It Does
 
-Bandcamp Downloader (Python Edition) provides a simple way to download the freely available 128 kbps MP3 streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
+Bandcamp Downloader (Python Edition) provides a simple way to download the freely available preview streams from Bandcamp albums, tracks, and artist pages. It automatically organizes files, embeds metadata, and handles cover art.
 
 <img width="600" alt="screenshot-main" src="images/screenshot-main-v1.3.9b.png" />
 
-*The main download interface with album art preview and settings panel*
+*The main download interface with URL Tags (Download Queue), Settings Panel, Album Art and Path Previews, and Status log.*
 
 ## Key Features
 
@@ -56,8 +56,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
    - Downloads the latest `bandcamp_dl_gui.py` script from GitHub and Launches it
    - Checks for updates on startup
    - Self-contained - No Python installation needed
-   - Comes with ffmpeg.exe bundled
-   - Single executable file
+   - Comes with ffmpeg.exe bundled and automatically installs any dependencies
 
 ### Option 2: Standalone Script (Advanced)
 
@@ -131,13 +130,11 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 
 **⚠️ About Quality**
 
-This tool downloads the free **128 kbps MP3 streams** that Bandcamp makes available for previewing music. These are the same quality files you hear when streaming on the website.
-
-**Converting to FLAC, OGG, or WAV does NOT improve quality** - it only changes the file format. The source remains 128 kbps.
+This tool downloads the **free streams** that Bandcamp makes available for previewing music. The quality is typically low (128kbps) but may vary. 
 
 **🎵 Support the Artists**
 
-For high-quality audio (FLAC, 320 kbps MP3, etc.), **please purchase albums directly from Bandcamp**. 
+For high-quality audio (Lossless FLAC, WAV, 320 kbps MP3, etc.), **please purchase albums directly from Bandcamp**. 
 
 Bandcamp is one of the best platforms for independent artists:
 * Artists receive a larger share of revenue than other platforms
@@ -149,9 +146,7 @@ Bandcamp is one of the best platforms for independent artists:
 
 ## Credits & Inspiration
 
-This project exists thanks to [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader). This Python version was created to provide a working alternative while we await updates to the original project.
-
-**Thank you, Otiel, for the inspiration and for building such a useful tool!**
+This project exists thanks to [Otiel's BandcampDownloader](https://github.com/Otiel/BandcampDownloader). **Thank you, Otiel, for the inspiration and for building such a useful tool!**
 
 
 ## Legal & Ethical Use
