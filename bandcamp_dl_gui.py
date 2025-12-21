@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.3.9"
+__version__ = "1.4.0"
 
 import sys
 import subprocess
@@ -11799,9 +11799,16 @@ class BandcampDownloaderGUI:
                     self.root.focus_set()
             # Use after_idle plus a small delay to ensure overlay is fully hidden and tag processing is done
             self.root.after_idle(lambda: self.root.after(100, unfocus_after_processing))
-        
-        # Reprocess tags - this will restore the remaining tags using our saved data
-        self.root.after(10, self._process_url_tags_with_restore)
+        else:
+            # There are remaining URLs - update preview to show the new last URL
+            # Reprocess tags first, then check URL to update preview
+            def update_preview_after_restore():
+                # Check URL to update preview with the new last URL
+                self._check_url()
+            # Reprocess tags - this will restore the remaining tags using our saved data
+            self.root.after(10, self._process_url_tags_with_restore)
+            # Update preview after tag processing completes (with a small delay to ensure tags are processed)
+            self.root.after(50, update_preview_after_restore)
         
         # Update download button text to reflect new URL count
         self.root.after(50, self._update_url_count_and_button)
@@ -21910,10 +21917,27 @@ class BandcampDownloaderGUI:
                             "catalog_number": info.get("catalog_number") or info.get("catalognumber"),
                         }
                         
-                        # Also update self.album_info with album_artist so get_outtmpl() can use it
+                        # Also update self.album_info with metadata so preview can use it immediately
                         if not hasattr(self, 'album_info') or not self.album_info:
                             self.album_info = {}
                         self.album_info["album_artist"] = album_artist_from_info
+                        # Extract year from date and update album_info for preview
+                        date = self.album_info_stored.get("date")
+                        if date:
+                            try:
+                                if len(date) >= 4:
+                                    self.album_info["year"] = date[:4]  # Extract year from date
+                            except:
+                                pass
+                        # Update other metadata fields in album_info for preview
+                        if self.album_info_stored.get("genre"):
+                            self.album_info["genre"] = self.album_info_stored["genre"]
+                        if self.album_info_stored.get("label"):
+                            self.album_info["label"] = self.album_info_stored["label"]
+                        if self.album_info_stored.get("catalog_number"):
+                            self.album_info["catalog_number"] = self.album_info_stored["catalog_number"]
+                        # Update preview with new metadata (especially important for batch downloads)
+                        self.root.after(0, self.update_preview)
                         
                         # Handle track URLs: if no entries, treat info itself as the track
                         entries = []
@@ -22642,6 +22666,9 @@ class BandcampDownloaderGUI:
                     self.root.after(0, lambda u=album_url: self.log(f"  URL: {u}"))
                     
                     # Update preview and artwork for current album
+                    # Set current_url_being_processed so fetch_album_metadata can update album_info
+                    self.current_url_being_processed = album_url
+                    
                     # Update album_info with metadata we already have
                     # Extract album_artist from metadata (for prefer_album_artist_for_folders setting)
                     album_artist_name = meta.get("album_artist") or artist_name or "Artist"
@@ -22649,6 +22676,12 @@ class BandcampDownloaderGUI:
                     # Try to extract first track title from batch metadata if available
                     first_track_title = None
                     first_track_number = None
+                    year = None
+                    genre = None
+                    label = None
+                    catalog_number = None
+                    track_titles = []
+                    
                     if meta.get("info"):
                         info = meta["info"]
                         entries = info.get("entries", [])
@@ -22657,6 +22690,24 @@ class BandcampDownloaderGUI:
                             # In flat mode, title might be available
                             first_track_title = first_entry.get("title")
                             first_track_number = first_entry.get("track_number") or first_entry.get("track")
+                            # Collect all track titles for split album detection
+                            track_titles = [e.get("title") for e in entries if e.get("title")]
+                        
+                        # Extract year from release_date or upload_date
+                        # Note: Flat extraction may not include dates, so this might be None
+                        date = info.get("release_date") or info.get("upload_date")
+                        if date:
+                            try:
+                                # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
+                                if len(date) >= 4:
+                                    year = date[:4]  # First 4 characters are the year
+                            except:
+                                pass
+                        
+                        # Extract other metadata fields if available
+                        genre = info.get("genre")
+                        label = info.get("label") or info.get("publisher")
+                        catalog_number = info.get("catalog_number") or info.get("catalognumber")
                     
                     self.album_info = {
                         "artist": artist_name or "Artist",
@@ -22665,7 +22716,12 @@ class BandcampDownloaderGUI:
                         "thumbnail_url": None,
                         "album_artist": album_artist_name,  # Set album_artist so get_outtmpl() can use it
                         "first_track_title": first_track_title,  # Add first track title if available
-                        "first_track_number": first_track_number  # Add first track number if available
+                        "first_track_number": first_track_number,  # Add first track number if available
+                        "year": year,  # Add year if available from batch metadata (may be None if flat extraction)
+                        "genre": genre,  # Add genre if available
+                        "label": label,  # Add label if available
+                        "catalog_number": catalog_number,  # Add catalog number if available
+                        "track_titles": track_titles  # Add track titles for split album detection
                     }
                     self.root.after(0, self.update_preview)
                     
@@ -22693,12 +22749,12 @@ class BandcampDownloaderGUI:
                         self.album_info["thumbnail_url"] = thumbnail_url
                         self.current_thumbnail_url = thumbnail_url
                         self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
-                        # Even if we have thumbnail, fetch metadata to get first track title if not already extracted
-                        # (flat mode might not have full track info)
-                        if not first_track_title:
-                            self.fetch_album_metadata(album_url)
+                        # Even if we have thumbnail, fetch metadata to get year and other metadata
+                        # (flat extraction doesn't include dates, so we need HTML extraction)
+                        self.fetch_album_metadata(album_url)
                     else:
                         # Fetch metadata and artwork (will update preview and artwork)
+                        # This will extract year from HTML and update album_info
                         self.fetch_album_metadata(album_url)
                     
                     # Reset download_start_time for this album to ensure timestamp filtering works correctly
