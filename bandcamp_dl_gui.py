@@ -26087,10 +26087,13 @@ class BandcampDownloaderGUI:
                     shutil.copy2(current_script_path, backup_path)
                 
                 # Write new version
-                # Use a temporary file first, then rename to ensure atomic write
+                # Use a temporary file first, then rename to ensure atomic write.
+                # Normalize to LF first: Windows text mode turns CRLF into \r\r\n
+                # (breaks "\\\n" continuations → SyntaxError).
                 temp_file = current_script_path.with_suffix('.py.tmp')
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    f.write(new_script_content)
+                normalized = new_script_content.replace('\r\n', '\n').replace('\r', '\n')
+                with open(temp_file, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(normalized)
                 
                 # Verify the temp file has the correct version before replacing
                 with open(temp_file, 'r', encoding='utf-8') as f:
