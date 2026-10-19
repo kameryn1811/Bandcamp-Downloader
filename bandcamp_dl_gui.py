@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import sys
 import subprocess
@@ -39,6 +39,491 @@ import time
 import json
 import html
 from pathlib import Path
+
+# Player-style Bandcamp tralbum/API fetch + shared request pacing (sibling module)
+try:
+    import bandcamp_fetch as _bandcamp_fetch
+except ImportError:
+    _bandcamp_fetch = None
+
+# ============================================================================
+# COVER-ART PALETTE (inlined so auto-update stays a single .py)
+# Shared idea with Beni's Bandcamp Player. Pure RGB → {bg_main, text_primary, accent}.
+# ============================================================================
+
+def _hex_luminance(hex_str):
+    if not hex_str or len(hex_str) < 6:
+        return 0.0
+    hex_str = hex_str.lstrip("#")[:6]
+    try:
+        r = int(hex_str[0:2], 16) / 255.0
+        g = int(hex_str[2:4], 16) / 255.0
+        b = int(hex_str[4:6], 16) / 255.0
+    except ValueError:
+        return 0.0
+    r = r / 12.92 if r <= 0.03928 else ((r + 0.055) / 1.055) ** 2.4
+    g = g / 12.92 if g <= 0.03928 else ((g + 0.055) / 1.055) ** 2.4
+    b = b / 12.92 if b <= 0.03928 else ((b + 0.055) / 1.055) ** 2.4
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def album_palette_is_usable(palette):
+    if not isinstance(palette, dict) or not palette:
+        return False
+    bg = (palette.get("bg_main") or "").strip().upper()
+    text = (palette.get("text_primary") or "").strip().upper()
+    accent = (palette.get("accent") or "").strip().upper()
+    if not bg:
+        return False
+    fg_candidates = [c for c in (text, accent) if c and c != bg]
+    if not fg_candidates:
+        return False
+    vals = [v for v in (bg, text, accent) if v]
+    if len(vals) >= 2 and len(set(vals)) == 1:
+        return False
+    if text and text == bg:
+        return False
+    for fg in fg_candidates:
+        if abs(_hex_luminance(bg) - _hex_luminance(fg)) >= 0.18:
+            return True
+    return False
+
+
+def _rgb_to_hsl(r, g, b):
+    rf, gf, bf = r / 255.0, g / 255.0, b / 255.0
+    mx, mn = max(rf, gf, bf), min(rf, gf, bf)
+    l = (mx + mn) / 2.0
+    if mx - mn < 1e-9:
+        return 0.0, 0.0, l
+    d = mx - mn
+    s = d / (2.0 - mx - mn) if l > 0.5 else d / (mx + mn)
+    if mx == rf:
+        h = ((gf - bf) / d) + (6.0 if gf < bf else 0.0)
+    elif mx == gf:
+        h = ((bf - rf) / d) + 2.0
+    else:
+        h = ((rf - gf) / d) + 4.0
+    return (h / 6.0) * 360.0, s, l
+
+
+def _hsl_to_rgb(h, s, l):
+    h = h % 360.0
+    s = max(0.0, min(1.0, s))
+    l = max(0.0, min(1.0, l))
+    if s < 1e-9:
+        v = int(round(l * 255.0))
+        return v, v, v
+
+    def _hue2rgb(p, q, t):
+        if t < 0.0:
+            t += 1.0
+        if t > 1.0:
+            t -= 1.0
+        if t < 1.0 / 6.0:
+            return p + (q - p) * 6.0 * t
+        if t < 0.5:
+            return q
+        if t < 2.0 / 3.0:
+            return p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        return p
+
+    q = l * (1.0 + s) if l < 0.5 else l + s - l * s
+    p = 2.0 * l - q
+    hk = h / 360.0
+    r = _hue2rgb(p, q, hk + 1.0 / 3.0)
+    g = _hue2rgb(p, q, hk)
+    b = _hue2rgb(p, q, hk - 1.0 / 3.0)
+    return (
+        int(max(0, min(255, round(r * 255.0)))),
+        int(max(0, min(255, round(g * 255.0)))),
+        int(max(0, min(255, round(b * 255.0)))),
+    )
+
+
+def _hsl_to_hex(h, s, l):
+    r, g, b = _hsl_to_rgb(h, s, l)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _hue_distance_deg(a, b):
+    d = abs((a % 360.0) - (b % 360.0))
+    return d if d <= 180.0 else 360.0 - d
+
+
+def _contrast_ratio_hex(a, b):
+    la, lb = _hex_luminance(a), _hex_luminance(b)
+    lighter, darker = max(la, lb), min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def rgb_samples_from_pil(img, size=48):
+    """Downsample a PIL Image to size×size and return RGB tuples."""
+    if img is None:
+        return []
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+    try:
+        im = img.convert("RGB")
+        if hasattr(Image, "Resampling"):
+            resample = Image.Resampling.BILINEAR
+        else:
+            resample = Image.BILINEAR
+        im = im.resize((max(8, int(size)), max(8, int(size))), resample)
+        return list(im.getdata())
+    except Exception:
+        return []
+
+
+def palette_from_rgb_samples(samples, mode="dark"):
+    """Design a Bandcamp-like album palette from cover-art RGB samples.
+
+    ``mode`` is ``\"dark\"`` or ``\"light\"``.
+    """
+    mode_l = (mode or "dark").strip().lower()
+    light = mode_l == "light"
+    if not samples:
+        return None
+    try:
+        pts = []
+        for item in samples:
+            if not item or len(item) < 3:
+                continue
+            r, g, b = int(item[0]), int(item[1]), int(item[2])
+            pts.append(
+                (
+                    max(0, min(255, r)),
+                    max(0, min(255, g)),
+                    max(0, min(255, b)),
+                )
+            )
+    except (TypeError, ValueError):
+        return None
+    if len(pts) < 16:
+        return None
+
+    bins = {}
+    for r, g, b in pts:
+        h, s, l = _rgb_to_hsl(r, g, b)
+        if l < 0.05 or l > 0.93 or s < 0.08:
+            continue
+        w = (0.35 + s) * (0.55 + (1.0 - abs(l - 0.42)))
+        bi = int(h / 15.0) % 24
+        acc = bins.get(bi)
+        if acc is None:
+            bins[bi] = [w, h * w, s * w, l * w, 1]
+        else:
+            acc[0] += w
+            acc[1] += h * w
+            acc[2] += s * w
+            acc[3] += l * w
+            acc[4] += 1
+
+    clusters = []
+    for bi, (w_sum, h_sum, s_sum, l_sum, count) in bins.items():
+        if w_sum <= 0 or count < 2:
+            continue
+        clusters.append(
+            {
+                "h": (h_sum / w_sum) % 360.0,
+                "s": max(0.0, min(1.0, s_sum / w_sum)),
+                "l": max(0.0, min(1.0, l_sum / w_sum)),
+                "w": w_sum,
+                "n": count,
+            }
+        )
+    if not clusters:
+        if light:
+            out = {
+                "bg_main": "#F0F4F6",
+                "text_primary": "#1E1E1E",
+                "icon_default": "#1E1E1E",
+                "accent": "#0077BE",
+            }
+        else:
+            out = {
+                "bg_main": "#1A1A1A",
+                "text_primary": "#D0D0D0",
+                "icon_default": "#D0D0D0",
+                "accent": "#6A9FD8",
+            }
+        return out if album_palette_is_usable(out) else None
+
+    def _accent_score(c, bg_h_ref):
+        dist = _hue_distance_deg(c["h"], bg_h_ref)
+        hue_bonus = 0.35 if dist >= 28.0 else (0.1 if dist >= 14.0 else -0.25)
+        mid = 1.0 - abs(c["l"] - 0.52)
+        return c["w"] * (0.4 + c["s"]) * (0.55 + mid) + hue_bonus * c["w"]
+
+    if light:
+        bg_src = max(clusters, key=lambda c: c["w"] * (0.45 + c["s"]))
+        bg_h = bg_src["h"]
+        bg_s = max(0.12, min(0.48, 0.14 + bg_src["s"] * 0.42))
+        bg_l = max(0.87, min(0.96, 0.945 - min(0.06, bg_src["s"] * 0.08)))
+        bg_hex = _hsl_to_hex(bg_h, bg_s, bg_l)
+
+        accent_candidates = sorted(
+            clusters, key=lambda c: _accent_score(c, bg_h), reverse=True
+        )
+        accent_src = accent_candidates[0]
+        for c in accent_candidates:
+            if _hue_distance_deg(c["h"], bg_h) >= 18.0 or c["s"] >= max(0.40, bg_src["s"]):
+                accent_src = c
+                break
+        accent_h = accent_src["h"]
+        accent_s = max(0.48, min(0.82, max(accent_src["s"], 0.50)))
+        accent_l = max(
+            0.30,
+            min(0.48, accent_src["l"] if 0.28 <= accent_src["l"] <= 0.50 else 0.40),
+        )
+        if accent_s > 0.70:
+            accent_l = min(accent_l, 0.40)
+        accent_hex = _hsl_to_hex(accent_h, accent_s, accent_l)
+
+        text_h = bg_h
+        text_s = max(0.04, min(0.18, bg_s * 0.45))
+        text_l = 0.12
+        text_hex = _hsl_to_hex(text_h, text_s, text_l)
+
+        guard = 0
+        while _contrast_ratio_hex(text_hex, bg_hex) < 4.5 and guard < 12:
+            text_l = max(0.06, text_l - 0.02)
+            text_hex = _hsl_to_hex(text_h, text_s, text_l)
+            guard += 1
+        guard = 0
+        while _contrast_ratio_hex(accent_hex, bg_hex) < 3.0 and guard < 12:
+            accent_l = max(0.22, accent_l - 0.03)
+            accent_hex = _hsl_to_hex(accent_h, accent_s, accent_l)
+            guard += 1
+        if _hue_distance_deg(accent_h, bg_h) < 20.0 and abs(accent_l - bg_l) < 0.35:
+            accent_l = max(0.28, min(0.42, accent_l - 0.06))
+            accent_s = min(0.88, accent_s + 0.06)
+            accent_hex = _hsl_to_hex(accent_h, accent_s, accent_l)
+    else:
+        darkish = [c for c in clusters if c["l"] < 0.48]
+        if darkish:
+            bg_src = max(darkish, key=lambda c: c["w"] * (1.15 - c["l"]))
+        else:
+            bg_src = min(clusters, key=lambda c: c["l"])
+        bg_h = bg_src["h"]
+        bg_s = max(0.14, min(0.42, bg_src["s"] * 0.42))
+        bg_l = max(
+            0.10,
+            min(
+                0.18,
+                bg_src["l"] * 0.45 if bg_src["l"] > 0.22 else max(0.10, bg_src["l"] * 0.85),
+            ),
+        )
+        bg_hex = _hsl_to_hex(bg_h, bg_s, bg_l)
+
+        accent_candidates = sorted(
+            clusters, key=lambda c: _accent_score(c, bg_h), reverse=True
+        )
+        accent_src = accent_candidates[0]
+        for c in accent_candidates:
+            if _hue_distance_deg(c["h"], bg_h) >= 18.0 or c["s"] >= bg_src["s"] + 0.12:
+                accent_src = c
+                break
+        accent_h = accent_src["h"]
+        accent_s = max(0.55, min(0.92, max(accent_src["s"], 0.55) * 1.05))
+        accent_l = max(
+            0.48,
+            min(0.68, accent_src["l"] if 0.35 <= accent_src["l"] <= 0.75 else 0.58),
+        )
+        accent_hex = _hsl_to_hex(accent_h, accent_s, accent_l)
+
+        text_src = None
+        for c in accent_candidates[1:6]:
+            if _hue_distance_deg(c["h"], accent_h) >= 22.0 and c["s"] >= 0.18:
+                text_src = c
+                break
+        if text_src is not None:
+            text_h = text_src["h"]
+            text_s = max(0.18, min(0.55, text_src["s"] * 0.55))
+            text_l = max(0.72, min(0.88, 0.78 + (0.08 if text_src["l"] < 0.5 else 0.0)))
+        else:
+            text_h = accent_h
+            text_s = max(0.16, min(0.42, accent_s * 0.38))
+            text_l = 0.80
+        text_hex = _hsl_to_hex(text_h, text_s, text_l)
+
+        guard = 0
+        while _contrast_ratio_hex(text_hex, bg_hex) < 4.5 and guard < 12:
+            text_l = min(0.92, text_l + 0.03)
+            text_s = max(0.08, text_s * 0.92)
+            text_hex = _hsl_to_hex(text_h, text_s, text_l)
+            guard += 1
+        guard = 0
+        while _contrast_ratio_hex(accent_hex, bg_hex) < 3.0 and guard < 12:
+            accent_l = min(0.78, accent_l + 0.03)
+            accent_hex = _hsl_to_hex(accent_h, accent_s, accent_l)
+            guard += 1
+        if _hue_distance_deg(accent_h, text_h) < 12.0 and abs(accent_l - text_l) < 0.12:
+            accent_l = max(0.45, min(0.62, accent_l - 0.08))
+            accent_s = min(0.95, accent_s + 0.08)
+            accent_hex = _hsl_to_hex(accent_h, accent_s, accent_l)
+
+    out = {
+        "bg_main": bg_hex,
+        "text_primary": text_hex,
+        "icon_default": text_hex,
+        "accent": accent_hex,
+    }
+    return out if album_palette_is_usable(out) else None
+
+
+def mix_hex(a, b, t):
+    """Blend two #RRGGBB colors; *t* is weight toward *b* (0..1)."""
+    t = max(0.0, min(1.0, float(t)))
+    try:
+        ah = a.lstrip("#")[:6]
+        bh = b.lstrip("#")[:6]
+        ar, ag, ab = int(ah[0:2], 16), int(ah[2:4], 16), int(ah[4:6], 16)
+        br, bg, bb = int(bh[0:2], 16), int(bh[2:4], 16), int(bh[4:6], 16)
+        r = int(round(ar + (br - ar) * t))
+        g = int(round(ag + (bg - ag) * t))
+        b_ = int(round(ab + (bb - ab) * t))
+        return f"#{r:02X}{g:02X}{b_:02X}"
+    except (TypeError, ValueError):
+        return a if a else (b or "#808080")
+
+
+def palette_from_pil(img, mode="dark"):
+    """Convenience: sample a PIL image and design a palette for *mode*."""
+    return palette_from_rgb_samples(rgb_samples_from_pil(img), mode=mode)
+
+
+# Namespace so existing ThemeColors / apply_theme call sites stay `_cover_palette.*`
+class _CoverPaletteNS:
+    _hex_luminance = staticmethod(_hex_luminance)
+    album_palette_is_usable = staticmethod(album_palette_is_usable)
+    mix_hex = staticmethod(mix_hex)
+    palette_from_pil = staticmethod(palette_from_pil)
+
+
+_cover_palette = _CoverPaletteNS
+
+# ============================================================================
+# DEPENDENCY CHECK AND INSTALLATION (BEFORE GUI IMPORTS)
+# ============================================================================
+
+def check_and_install_dependencies():
+    """Check if dependencies are installed, install if missing.
+    
+    This runs BEFORE the GUI is created to avoid issues with missing dependencies.
+    Only runs when not bundled (PyInstaller bundles everything).
+    """
+    # Skip if running as bundled executable (dependencies are already included)
+    if hasattr(sys, 'frozen'):
+        return True
+    
+    missing_deps = []
+    
+    # Check yt-dlp (required)
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        missing_deps.append("yt-dlp")
+    
+    # Check mutagen (optional but recommended)
+    try:
+        import mutagen  # noqa: F401
+    except ImportError:
+        # mutagen is optional, we'll install it but won't fail if it doesn't work
+        pass
+    
+    # Check Pillow/PIL (optional but recommended for album art)
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        # PIL is optional, we'll install it but won't fail if it doesn't work
+        pass
+    
+    # If core dependencies are missing, install them
+    if missing_deps:
+        print(f"\nMissing dependencies: {', '.join(missing_deps)}")
+        print("Attempting to install automatically...\n")
+        
+        # Install missing dependencies
+        for dep in missing_deps:
+            try:
+                print(f"Installing {dep}...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", dep,
+                     "--disable-pip-version-check"],
+                    check=False,
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    print(f"{dep} installed successfully!\n")
+                    # Clear import cache to allow newly installed packages to be imported
+                    import importlib
+                    importlib.invalidate_caches()
+                else:
+                    print(f"Failed to install {dep} automatically.")
+                    print(f"Please run: pip install -U {dep}\n")
+                    return False
+            except Exception as e:
+                print(f"Error installing {dep}: {e}")
+                print(f"Please install manually: pip install -U {dep}\n")
+                return False
+        
+        # Verify yt-dlp can now be imported
+        if "yt-dlp" in missing_deps:
+            try:
+                import yt_dlp  # noqa: F401
+                print("yt-dlp verified successfully!\n")
+            except ImportError:
+                print("Warning: yt-dlp was installed but import still fails.")
+                print("You may need to restart the application.\n")
+                return False
+    
+    # Try to install optional dependencies (mutagen, Pillow) if missing
+    # These are optional so we don't fail if they can't be installed
+    optional_deps = []
+    try:
+        import mutagen  # noqa: F401
+    except ImportError:
+        optional_deps.append("mutagen")
+    
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        optional_deps.append("Pillow")
+    
+    if optional_deps:
+        print(f"Installing optional dependencies: {', '.join(optional_deps)}...")
+        for dep in optional_deps:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet", dep,
+                     "--disable-pip-version-check"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                if result.returncode == 0:
+                    print(f"{dep} installed successfully.")
+                    import importlib
+                    importlib.invalidate_caches()
+            except Exception:
+                pass  # Optional deps - don't fail if installation fails
+    
+    return True
+
+# Check and install dependencies BEFORE importing GUI libraries
+# Only check if not running from bundled executable
+if not hasattr(sys, 'frozen'):
+    if not check_and_install_dependencies():
+        print("\nFailed to install required dependencies.")
+        print("Please install them manually and try again.")
+        input("Press Enter to exit...")
+        sys.exit(1)
+
+# Now safe to import GUI libraries
 from tkinter import (
     Tk, Toplevel, ttk, StringVar, BooleanVar, messagebox, scrolledtext, filedialog, W, E, N, S, LEFT, RIGHT, X, Y, END, WORD, BOTH,
     Frame, Label, Canvas, Checkbutton, Menu, Entry, Button, Listbox, EXTENDED, INSERT, Text, TclError
@@ -313,13 +798,15 @@ class ThemeColors:
             self.entry_fg = '#CCCCCC'  # Light input text
             self.border = '#3E3E42'  # Subtle borders
             self.accent = '#007ACC'  # Blue accent (more modern than green)
-            self.success = '#2dacd5'  # Bandcamp blue for success/preview
+            self.success = '#2dacd5'  # Bandcamp blue for download btn / progress
             self.hover_bg = '#3E3E42'  # Hover state
             self.hover_fg = '#D4D4D4'  # Hover text
             self.disabled_fg = '#808080'  # Disabled text
             self.warning = '#FFA500'  # Orange for warnings
-            self.preview_link = '#2dacd5'  # Preview link color
-            self.preview_link_hover = '#4FC3F7'  # Preview link hover
+            self.preview_link = '#2dacd5'  # Preview path text
+            self.preview_link_hover = '#4FC3F7'  # Preview path hover
+            self.preview_bg = '#1E1E1E'  # Preview strip background (matches bg)
+            self.preview_prefix_fg = '#D4D4D4'  # "Preview:" label
         elif mode == 'light':
             # Light mode - modern Windows light mode aesthetic
             self.bg = '#F0F0F0'  # Light gray app background
@@ -337,6 +824,74 @@ class ThemeColors:
             self.warning = '#FF8C00'  # Slightly darker orange for light mode
             self.preview_link = '#005A9E'  # Darker blue for preview links (better contrast in light mode)
             self.preview_link_hover = '#007ACC'  # Lighter blue on hover (still readable)
+            self.preview_bg = '#F5F5F5'  # Preview strip background (matches select_bg / entry_bg)
+            self.preview_prefix_fg = '#1E1E1E'  # "Preview:" label
+
+    @staticmethod
+    def _contrast_fg_for_bg(bg_hex, preferred_fg, *, light_fg='#E8E8E8', dark_fg='#1A1A1A'):
+        """Pick preferred_fg if it contrasts with bg; else light/dark fallback."""
+        try:
+            bl = _cover_palette._hex_luminance(bg_hex or '#000000')
+            fl = _cover_palette._hex_luminance(preferred_fg or '#808080')
+            if abs(bl - fl) >= 0.32:
+                return preferred_fg
+            return light_fg if bl < 0.5 else dark_fg
+        except Exception:
+            return preferred_fg or light_fg
+
+    @classmethod
+    def from_cover_palette(cls, mode, cover_palette):
+        """Light/Dark structure tinted by cover: app bg + panels, plus download/progress/preview accents.
+
+        Falls back to stock ``ThemeColors(mode)`` if the palette is unusable.
+        """
+        mode = mode if mode in ('dark', 'light') else 'dark'
+        base = cls(mode)
+        if not cover_palette or not isinstance(cover_palette, dict):
+            return base
+        if not _cover_palette.album_palette_is_usable(cover_palette):
+            return base
+        bg = (cover_palette.get('bg_main') or base.bg).strip()
+        fg = (cover_palette.get('text_primary') or base.fg).strip()
+        accent = (cover_palette.get('accent') or base.success or base.accent).strip()
+        if not accent:
+            return base
+        mix = _cover_palette.mix_hex
+        t = cls(mode)
+        t.bg = bg
+        t.fg = fg
+        t.success = accent
+        t.disabled_fg = base.disabled_fg
+        t.warning = base.warning
+        t.accent = base.accent  # keep focus-ring blue; success drives download/progress
+        if mode == 'light':
+            t.select_bg = mix(bg, '#000000', 0.04)
+            t.entry_bg = t.select_bg
+            t.entry_fg = fg
+            t.select_fg = fg
+            t.border = mix(bg, fg, 0.22)
+            t.hover_bg = mix(bg, '#000000', 0.10)
+            t.hover_fg = fg
+            t.preview_link = accent
+            t.preview_link_hover = mix(accent, '#000000', 0.18)
+            # Soft strip: mostly app bg, light accent wash (not a heavy block)
+            t.preview_bg = mix(bg, accent, 0.08)
+        else:
+            t.select_bg = mix(bg, '#FFFFFF', 0.07)
+            t.entry_bg = t.select_bg
+            t.entry_fg = mix(fg, '#FFFFFF', 0.12)
+            t.select_fg = '#FFFFFF'
+            t.border = mix(bg, fg, 0.28)
+            t.hover_bg = mix(bg, '#FFFFFF', 0.14)
+            t.hover_fg = fg
+            t.preview_link = mix(accent, '#FFFFFF', 0.12)
+            t.preview_link_hover = mix(accent, '#FFFFFF', 0.32)
+            t.preview_bg = mix(bg, accent, 0.10)
+        # "Preview:" + path text must stay readable on the tinted strip
+        t.preview_prefix_fg = cls._contrast_fg_for_bg(t.preview_bg, fg)
+        t.preview_link = cls._contrast_fg_for_bg(t.preview_bg, t.preview_link)
+        t.preview_link_hover = cls._contrast_fg_for_bg(t.preview_bg, t.preview_link_hover)
+        return t
 
 
 # ============================================================================
@@ -837,33 +1392,78 @@ class BandcampDownloaderGUI:
     
     def _clean_title(self, title, artist=None):
         """
-        Clean title to remove artist prefix if present.
-        Handles formats like "artist - song" or "artist: song" and returns just "song".
+        Remove a leading artist prefix when it matches *artist*.
+
+        Only strips when the left side of " - " / ": " equals the artist — never blindly
+        cut on the first dash (soundtrack titles like "Chrono Trigger - Brink of Time"
+        must stay intact).
         """
         if not title:
             return title
-        
-        # If title contains " - " (space-dash-space), split and take the part after
-        if " - " in title:
-            parts = title.split(" - ", 1)
-            if len(parts) == 2:
-                # Check if first part matches artist (if provided)
-                if artist and parts[0].strip().lower() == artist.lower():
-                    return parts[1].strip()
-                # Even if artist doesn't match, take the part after " - " as it's likely the song title
-                return parts[1].strip()
-        
-        # If title contains ": " (colon-space), split and take the part after
-        if ": " in title:
-            parts = title.split(": ", 1)
-            if len(parts) == 2:
-                if artist and parts[0].strip().lower() == artist.lower():
-                    return parts[1].strip()
-                # Take the part after ": " as it's likely the song title
-                return parts[1].strip()
-        
-        # Return title as-is if no pattern matches
-        return title.strip()
+        title = title.strip()
+        if not artist or not str(artist).strip():
+            return title
+        artist_norm = str(artist).strip().lower()
+        for sep in (" - ", ": "):
+            if sep not in title:
+                continue
+            left, right = title.split(sep, 1)
+            if left.strip().lower() == artist_norm and right.strip():
+                return right.strip()
+        return title
+
+    def _match_download_info_for_file(self, filename_stem):
+        """Best-match a downloaded file stem against download_info (no loose substring hijacks)."""
+        if not hasattr(self, "download_info") or not self.download_info or not filename_stem:
+            return None
+        import re
+        file_title = str(filename_stem)
+        normalized_file = re.sub(r"^\d+[.\-\s]*", "", file_title.lower()).strip()
+        cleaned_file = normalized_file
+        artist_match = re.match(r"^([^-]+)\s*-\s*(.+)$", normalized_file)
+        if artist_match:
+            cleaned_file = artist_match.group(2).strip()
+        stem_only = " ".join(re.sub(r"[^\w\s]", " ", file_title.lower()).split())
+
+        best = None
+        best_score = 0
+        for title_key, info in self.download_info.items():
+            if not title_key or not isinstance(info, dict):
+                continue
+            normalized_key = title_key.lower().strip()
+            cleaned_key = normalized_key
+            key_artist = re.match(r"^([^-]+)\s*-\s*(.+)$", normalized_key)
+            if key_artist:
+                cleaned_key = key_artist.group(2).strip()
+            # Prefer explicit title field when present
+            info_title = (info.get("title") or "").strip().lower()
+            if info_title:
+                info_cleaned = info_title
+                info_am = re.match(r"^([^-]+)\s*-\s*(.+)$", info_title)
+                if info_am:
+                    info_cleaned = info_am.group(2).strip()
+            else:
+                info_cleaned = cleaned_key
+
+            score = 0
+            if cleaned_file == cleaned_key or (info_cleaned and cleaned_file == info_cleaned):
+                score = 100
+            elif normalized_file == normalized_key:
+                score = 95
+            elif stem_only and stem_only == " ".join(re.sub(r"[^\w\s]", " ", normalized_key).split()):
+                score = 90
+            elif cleaned_file and info_cleaned and (
+                cleaned_file == info_cleaned
+                or (len(cleaned_file) >= 6 and cleaned_file in info_cleaned)
+                or (len(info_cleaned) >= 6 and info_cleaned in cleaned_file)
+            ):
+                shorter = min(len(cleaned_file), len(info_cleaned))
+                longer = max(len(cleaned_file), len(info_cleaned))
+                score = (shorter / longer) * 80 if longer else 0
+            if score > best_score and score >= 70:
+                best_score = score
+                best = info
+        return best
     
     # ============================================================================
     # LAZY IMPORT HELPERS - For yt-dlp and PIL
@@ -1102,6 +1702,16 @@ class BandcampDownloaderGUI:
         # URL tag metadata cache: stores only HTML extraction (stage 1) metadata for tags (url -> {artist, album, etc.})
         # This is separate from url_metadata_cache to prevent yt-dlp (stage 2) updates from affecting tags
         self.url_tag_metadata_cache = {}  # {url: {artist, album, title, ...}}
+        # Tralbum ID cache (band_id / tralbum_id) for API-first metadata — same idea as the Player
+        self._tralbum_ids_cache_path = Path(__file__).resolve().parent / "tralbum_ids_cache.json"
+        self._tralbum_ids_cache = {}
+        if _bandcamp_fetch is not None:
+            try:
+                self._tralbum_ids_cache = _bandcamp_fetch.load_tralbum_ids_cache(self._tralbum_ids_cache_path)
+            except Exception:
+                self._tralbum_ids_cache = {}
+        # After urllib HTML is challenge-walled once, prefer yt-dlp-first for the rest of the session
+        self._prefer_ytdlp_metadata = False
         
         # Variables
         self.url_var = StringVar()
@@ -1158,6 +1768,13 @@ class BandcampDownloaderGUI:
         # Theme system - load saved theme preference (default to 'dark' for backward compatibility)
         saved_theme = settings.get("theme", "dark")
         self.current_theme = saved_theme if saved_theme in ['dark', 'light'] else 'dark'
+        # Cover-art palette overlay (augments Light/Dark; same idea as player Album cover mode)
+        # Default on so the feature is front-and-center; users can toggle off in Settings
+        self.apply_cover_palette = bool(settings.get("apply_palette_from_cover_art", True))
+        self.apply_cover_palette_var = BooleanVar(value=self.apply_cover_palette)
+        self._focused_cover_pil = None  # cover for focused URL (not bio/extra carousel frames)
+        self._cover_palette_fp = None
+        self._cover_palette_refresh_after_id = None
         self.theme_colors = ThemeColors(self.current_theme)
         
         # Batch URL mode tracking
@@ -1276,7 +1893,8 @@ class BandcampDownloaderGUI:
         # Linking state is already loaded in __init__ from settings
         self.load_saved_path()
         # Defer update_preview until after UI is shown (optimization - no URL/metadata yet anyway)
-        self.root.after_idle(self.update_preview)
+        # Use after(0) instead of after_idle for faster startup (doesn't wait for all events)
+        self.root.after(0, self.update_preview)
         # Initialize UI elements in a single batch (reduces timer overhead)
         def initialize_ui_elements():
             self._update_url_count_and_button()
@@ -1328,8 +1946,10 @@ class BandcampDownloaderGUI:
             else:
                 self._log_debug("mutagen is not available - will use FFmpeg for MP3 artwork (may not show thumbnails in Windows Explorer)")
         
-        # Show window with smooth fade-in effect after all UI is loaded
-        self.root.after_idle(self._show_window_with_fade)
+        # Show window immediately with fade-in effect (don't wait for all events - faster startup)
+        # Use after(0) instead of after_idle to avoid waiting for all pending events
+        # This significantly improves startup time in PyInstaller bundles
+        self.root.after(0, self._show_window_with_fade)
     
     def apply_theme(self):
         """Apply current theme (dark or light) to all UI elements."""
@@ -1386,14 +2006,16 @@ class BandcampDownloaderGUI:
                  background=[('active', hover_bg), ('pressed', bg_color)],
                  bordercolor=[('active', border_color), ('pressed', border_color)])
         
-        # Special style for download button with Bandcamp blue accent
-        # Default is darker, hover is brighter/more prominent
-        style.configure('Download.TButton', background='#2599b8', foreground='#FFFFFF',
-                       borderwidth=0, bordercolor='#2599b8', relief='flat',
+        # Download button — theme success (Bandcamp blue, or cover accent when overlay is on)
+        dl_bg = success_color
+        dl_hover = _cover_palette.mix_hex(dl_bg, '#FFFFFF', 0.14)
+        dl_pressed = _cover_palette.mix_hex(dl_bg, '#000000', 0.22)
+        style.configure('Download.TButton', background=dl_bg, foreground='#FFFFFF',
+                       borderwidth=0, bordercolor=dl_bg, relief='flat',
                        padding=(12, 6), font=("Segoe UI", 10, "bold"), width=25)
         style.map('Download.TButton',
-                 background=[('active', success_color), ('pressed', '#1d7a95')],
-                 bordercolor=[('active', success_color), ('pressed', '#1d7a95')])
+                 background=[('active', dl_hover), ('pressed', dl_pressed)],
+                 bordercolor=[('active', dl_hover), ('pressed', dl_pressed)])
         
         # Cancel button style - matches download button size but keeps muted default colors
         # Slightly wider to match visual size of download button
@@ -1571,7 +2193,7 @@ class BandcampDownloaderGUI:
         # Switch theme
         new_theme = 'light' if self.current_theme == 'dark' else 'dark'
         self.current_theme = new_theme
-        self.theme_colors = ThemeColors(new_theme)
+        self._rebuild_theme_colors()
         
         # Freeze window updates during theme transition to prevent widget shaking
         # This ensures all changes are applied atomically
@@ -1620,11 +2242,121 @@ class BandcampDownloaderGUI:
         
         # Save preference
         self._save_theme_preference()
+
+    def _rebuild_theme_colors(self):
+        """Rebuild ``theme_colors`` from Light/Dark base, optionally tinted by focused cover art."""
+        mode = self.current_theme if self.current_theme in ('dark', 'light') else 'dark'
+        cover_pal = None
+        if getattr(self, 'apply_cover_palette', False):
+            pil = getattr(self, '_focused_cover_pil', None)
+            if pil is not None:
+                try:
+                    cover_pal = _cover_palette.palette_from_pil(pil, mode=mode)
+                except Exception:
+                    cover_pal = None
+        if cover_pal:
+            self.theme_colors = ThemeColors.from_cover_palette(mode, cover_pal)
+        else:
+            self.theme_colors = ThemeColors(mode)
+        c = self.theme_colors
+        self._cover_palette_fp = (
+            mode,
+            getattr(c, 'bg', None),
+            getattr(c, 'success', None),
+            getattr(c, 'preview_link', None),
+            getattr(c, 'preview_bg', None),
+            getattr(c, 'preview_prefix_fg', None),
+        )
+
+    def _schedule_cover_palette_refresh(self, delay_ms=80):
+        """Debounce chrome refresh when focused cover art changes."""
+        if not hasattr(self, 'root') or self.root is None:
+            return
+        aid = getattr(self, '_cover_palette_refresh_after_id', None)
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+        self._cover_palette_refresh_after_id = self.root.after(
+            delay_ms, self._apply_cover_palette_refresh
+        )
+
+    def _apply_cover_palette_refresh(self):
+        """Apply cover-tinted (or stock) theme if the effective palette changed."""
+        self._cover_palette_refresh_after_id = None
+        if not getattr(self, 'apply_cover_palette', False):
+            # Toggle off path uses force via on_apply_cover_palette_change
+            return
+        prev = getattr(self, '_cover_palette_fp', None)
+        self._rebuild_theme_colors()
+        if getattr(self, '_cover_palette_fp', None) == prev:
+            return
+        try:
+            self.apply_theme()
+            self._refresh_all_widgets()
+            if getattr(self, 'status_detached', False):
+                self._apply_theme_to_detached_window()
+            if hasattr(self, '_update_filename_manage_button'):
+                self._update_filename_manage_button()
+            if hasattr(self, '_update_structure_dropdown'):
+                self._update_structure_dropdown()
+        except Exception:
+            pass
+
+    def _set_focused_cover_pil(self, img, thumbnail_url=None):
+        """Store focused-release cover for palette sampling (ignore bio/extra carousel frames)."""
+        if img is None:
+            return
+        # Only accept art that matches the focused release cover URL when known
+        cover_url = getattr(self, 'current_thumbnail_url', None)
+        if thumbnail_url and cover_url:
+            try:
+                if self._normalize_image_url_for_comparison(thumbnail_url) != self._normalize_image_url_for_comparison(cover_url):
+                    return
+            except Exception:
+                pass
+        try:
+            self._focused_cover_pil = img.copy() if hasattr(img, 'copy') else img
+        except Exception:
+            self._focused_cover_pil = img
+        if getattr(self, 'apply_cover_palette', False):
+            self._schedule_cover_palette_refresh()
+
+    def _clear_focused_cover_pil(self):
+        self._focused_cover_pil = None
+        if getattr(self, 'apply_cover_palette', False):
+            self._schedule_cover_palette_refresh()
+
+    def on_apply_cover_palette_change(self):
+        """Settings: toggle cover-art palette overlay on/off."""
+        enabled = bool(self.apply_cover_palette_var.get())
+        self.apply_cover_palette = enabled
+        settings = self._load_settings()
+        settings["apply_palette_from_cover_art"] = enabled
+        self._save_settings(settings)
+        prev = getattr(self, '_cover_palette_fp', None)
+        self._rebuild_theme_colors()
+        if getattr(self, '_cover_palette_fp', None) == prev and enabled:
+            # No cover yet — still refresh so UI matches stock when toggling off→on with no art
+            pass
+        try:
+            self.apply_theme()
+            self._refresh_all_widgets()
+            if getattr(self, 'status_detached', False):
+                self._apply_theme_to_detached_window()
+            if hasattr(self, '_update_filename_manage_button'):
+                self._update_filename_manage_button()
+            if hasattr(self, '_update_structure_dropdown'):
+                self._update_structure_dropdown()
+        except Exception:
+            pass
     
     def _save_theme_preference(self):
         """Save current theme preference to settings."""
         settings = self._load_settings()
         settings["theme"] = self.current_theme
+        settings["apply_palette_from_cover_art"] = bool(getattr(self, 'apply_cover_palette', False))
         self._save_settings(settings)
     
     def _refresh_all_widgets(self):
@@ -1820,11 +2552,14 @@ class BandcampDownloaderGUI:
         # Preview frame: use entry_bg in light mode (#F5F5F5), bg in dark mode
         if hasattr(self, 'preview_frame') and self.preview_frame:
             try:
-                preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                preview_frame_bg = getattr(colors, 'preview_bg', None) or (
+                    colors.entry_bg if self.current_theme == 'light' else colors.bg
+                )
                 self.preview_frame.configure(bg=preview_frame_bg, highlightbackground=colors.border)
-                # Update preview label prefix background
+                prefix_fg = getattr(colors, 'preview_prefix_fg', None) or colors.fg
+                # Update preview label prefix (bg + readable fg)
                 if hasattr(self, 'preview_label_prefix') and self.preview_label_prefix:
-                    self.preview_label_prefix.configure(bg=preview_frame_bg)
+                    self.preview_label_prefix.configure(bg=preview_frame_bg, fg=prefix_fg)
                 # Update preview label path background
                 if hasattr(self, 'preview_label_path') and self.preview_label_path:
                     self.preview_label_path.configure(bg=preview_frame_bg)
@@ -2082,7 +2817,12 @@ class BandcampDownloaderGUI:
         
         if hasattr(self, 'preview_label_path') and self.preview_label_path:
             try:
-                preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+                preview_frame_bg = getattr(colors, 'preview_bg', None) or (
+                    colors.entry_bg if self.current_theme == 'light' else colors.bg
+                )
+                prefix_fg = getattr(colors, 'preview_prefix_fg', None) or colors.fg
+                if hasattr(self, 'preview_label_prefix') and self.preview_label_prefix:
+                    self.preview_label_prefix.configure(bg=preview_frame_bg, fg=prefix_fg)
                 self.preview_label_path.configure(bg=preview_frame_bg, fg=colors.preview_link)
                 # Update hover handlers to use current theme colors
                 # Unbind old handlers first
@@ -2212,12 +2952,13 @@ class BandcampDownloaderGUI:
         # Update preview frame and labels
         if hasattr(self, 'preview_label_path') and self.preview_label_path:
             try:
+                preview_frame_bg = getattr(colors, 'preview_bg', None) or (
+                    colors.entry_bg if self.current_theme == 'light' else colors.bg
+                )
                 # Find parent preview frame
                 parent = self.preview_label_path.master
                 if parent:
-                    preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
                     parent.configure(bg=preview_frame_bg, highlightbackground=colors.border)
-                preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
                 self.preview_label_path.configure(bg=preview_frame_bg, fg=colors.preview_link)
                 # Update hover handlers to use current theme colors
                 self.preview_label_path.unbind('<Enter>')
@@ -2522,7 +3263,8 @@ class BandcampDownloaderGUI:
                 "show_overall_in_large_bar": self.show_overall_in_large_bar_var.get() if hasattr(self, 'show_overall_in_large_bar_var') else False,
                 "custom_structures": (self.custom_structures if hasattr(self, 'custom_structures') and self.custom_structures else []),
                 "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else []),
-                "theme": self.current_theme if hasattr(self, 'current_theme') else 'dark'
+                "theme": self.current_theme if hasattr(self, 'current_theme') else 'dark',
+                "apply_palette_from_cover_art": bool(getattr(self, 'apply_cover_palette', False)),
             }
         
         settings_file = self._get_settings_file()
@@ -3668,10 +4410,11 @@ class BandcampDownloaderGUI:
             Tuple of (preview_frame, preview_text_label)
         """
         colors = self.theme_colors
-        # Use provided bg, or default to theme-appropriate background
+        # Use provided bg, or theme preview_bg (cover overlay may tint this strip only)
         if bg is None:
-            # Default: use select_bg for light mode, bg for dark mode (matches dialog pattern)
-            preview_bg = colors.select_bg if self.current_theme == 'light' else colors.bg
+            preview_bg = getattr(colors, 'preview_bg', None) or (
+                colors.select_bg if self.current_theme == 'light' else colors.bg
+            )
         else:
             preview_bg = bg
         
@@ -3685,7 +4428,7 @@ class BandcampDownloaderGUI:
             text="Preview:",
             font=("Consolas", 8),
             bg=preview_bg,
-            fg=colors.fg,
+            fg=getattr(colors, 'preview_prefix_fg', None) or colors.fg,
             justify='left'
         )
         preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=4)
@@ -4943,27 +5686,75 @@ class BandcampDownloaderGUI:
             webbrowser.open("https://www.python.org/downloads/")
             return False
         
-        # Check yt-dlp (lazy import - just verify it can be imported, don't import yet)
+        # Check yt-dlp (actually try importing it - more reliable than find_spec)
         try:
-            import importlib.util
-            spec = importlib.util.find_spec("yt_dlp")
-            if spec is None:
-                raise ImportError("yt-dlp module not found")
+            import yt_dlp  # noqa: F401
+            # yt-dlp is available - no need to prompt
         except ImportError:
-            response = messagebox.askyesno(
-                "yt-dlp Not Found",
-                "yt-dlp is not installed!\n\nWould you like to install it automatically?"
-            )
-            if response:
-                self.install_ytdlp()
-            else:
-                messagebox.showinfo(
-                    "Installation Required",
-                    "Please install yt-dlp manually:\n\n"
-                    "python -m pip install -U yt-dlp\n\n"
-                    "Then restart this application."
+            # yt-dlp is not available - try to install automatically first
+            print("yt-dlp not found, attempting automatic installation...")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=120
                 )
-                webbrowser.open("https://github.com/yt-dlp/yt-dlp#installation")
+                if result.returncode == 0:
+                    # Clear import cache and try importing again
+                    import importlib
+                    importlib.invalidate_caches()
+                    try:
+                        import yt_dlp  # noqa: F401
+                        print("yt-dlp installed and verified successfully!")
+                        # Success - no need to show dialog
+                    except ImportError:
+                        # Still can't import after installation - need restart
+                        messagebox.showinfo(
+                            "Restart Required",
+                            "yt-dlp was installed successfully!\n\n"
+                            "Please restart this application for it to take effect."
+                        )
+                        return False
+                else:
+                    # Installation failed - ask user
+                    response = messagebox.askyesno(
+                        "yt-dlp Not Found",
+                        "yt-dlp is not installed and automatic installation failed!\n\n"
+                        "Would you like to try installing it again?\n\n"
+                        "(If this keeps failing, you may need to install it manually.)"
+                    )
+                    if response:
+                        self.install_ytdlp()
+                        return False
+                    else:
+                        messagebox.showinfo(
+                            "Installation Required",
+                            "Please install yt-dlp manually:\n\n"
+                            "python -m pip install -U yt-dlp\n\n"
+                            "Then restart this application."
+                        )
+                        webbrowser.open("https://github.com/yt-dlp/yt-dlp#installation")
+                        return False
+            except Exception as e:
+                # Installation attempt failed - ask user
+                response = messagebox.askyesno(
+                    "yt-dlp Not Found",
+                    f"yt-dlp is not installed!\n\n"
+                    f"Automatic installation failed: {str(e)}\n\n"
+                    "Would you like to try installing it manually?"
+                )
+                if response:
+                    self.install_ytdlp()
+                else:
+                    messagebox.showinfo(
+                        "Installation Required",
+                        "Please install yt-dlp manually:\n\n"
+                        "python -m pip install -U yt-dlp\n\n"
+                        "Then restart this application."
+                    )
+                    webbrowser.open("https://github.com/yt-dlp/yt-dlp#installation")
                 return False
         
         # Check ffmpeg
@@ -5099,19 +5890,17 @@ class BandcampDownloaderGUI:
         
         # Calculate minimum width for column 0 based on the widest label ("Path:")
         # This prevents the URL field from shifting when Path section loads
-        temp_label = ttk.Label(main_frame, text="Path:", font=("Segoe UI", 9))
-        temp_label.grid(row=999, column=0)  # Place off-screen temporarily
-        self.root.update_idletasks()  # Force layout to measure
-        path_label_width = temp_label.winfo_reqwidth()
-        temp_label.destroy()  # Clean up temporary label
+        # Use a reasonable estimate instead of measuring (avoids slow update_idletasks in bundles)
+        # "Path:" with Segoe UI 9pt is approximately 40-45 pixels
+        path_label_width = 45  # Fixed estimate - avoids blocking update_idletasks() call
         
         main_frame.columnconfigure(0, weight=0, minsize=path_label_width)  # Column 0 sized for Path label
         main_frame.columnconfigure(1, weight=1)
         main_frame.columnconfigure(2, weight=0)  # Album art column doesn't expand
         main_frame.rowconfigure(10, weight=1)  # Status log row expands
         
-        # Force layout update so all widgets can calculate their sizes immediately
-        self.root.update_idletasks()
+        # Don't call update_idletasks() here - it's very slow in PyInstaller bundles
+        # Layout will be calculated naturally as widgets are added
         
         # Setup UI sections in order
         self._setup_url_section(main_frame)
@@ -6651,19 +7440,21 @@ class BandcampDownloaderGUI:
         
         # Preview container (below both settings and album art panels)
         # Moved to row 4 to avoid conflict with settings_frame and album_art_frame (row 3)
-        # Preview frame: dark mode uses bg, light mode uses entry_bg (#F5F5F5) to match URL field
-        preview_frame_bg = colors.entry_bg if self.current_theme == 'light' else colors.bg
+        # preview_bg may be cover-tinted when "Apply Palette from Cover Art" is on
+        preview_frame_bg = getattr(colors, 'preview_bg', None) or (
+            colors.entry_bg if self.current_theme == 'light' else colors.bg
+        )
         preview_frame = Frame(main_frame, bg=preview_frame_bg, relief='flat', bd=1, highlightbackground=colors.border, highlightthickness=1)
         preview_frame.grid(row=4, column=0, columnspan=3, sticky=(W, E), pady=(0, 6), padx=0)
         self.preview_frame = preview_frame  # Store reference for theme updates
         
-        # Preview display with "Preview: " in white and path in blue
+        # Preview display with "Preview: " label + accent path
         preview_label_prefix = Label(
             preview_frame,
             text="Preview: ",
             font=("Consolas", 8),
             bg=preview_frame_bg,
-            fg=colors.fg,
+            fg=getattr(colors, 'preview_prefix_fg', None) or colors.fg,
             justify='left'
         )
         preview_label_prefix.grid(row=0, column=0, sticky=W, padx=(6, 0), pady=0)
@@ -7155,8 +7946,8 @@ class BandcampDownloaderGUI:
             if alpha_supported:
                 # Show the window while still transparent (no flicker)
                 self.root.deiconify()
-                # Small delay to ensure window is fully ready before starting fade
-                self.root.update_idletasks()
+                # Don't call update_idletasks() here - it's slow in PyInstaller bundles
+                # The window will be ready enough for the fade animation
                 
                 # Fade in over 400ms with ease-in curve (slow start, faster end)
                 # Ease-in uses quadratic function: opacity = (progress)^2
@@ -7179,7 +7970,7 @@ class BandcampDownloaderGUI:
                         if step >= fade_steps:
                             # Final step - ensure fully opaque
                             self.root.attributes('-alpha', 1.0)
-                            self.root.update_idletasks()
+                            # Don't call update_idletasks() here - defer to after fade completes
                             # Bring to front after fade completes
                             self._bring_to_front()
                             # Pre-import libraries after fade-in completes (non-blocking)
@@ -7196,23 +7987,26 @@ class BandcampDownloaderGUI:
                         except Exception:
                             pass
                 
-                # Start fade-in after ensuring window is ready
+                # Start fade-in immediately (window is ready enough)
                 self.root.after(10, fade_step)
             else:
                 # Alpha not supported - just show and bring to front
                 self.root.deiconify()
-                self.root.update_idletasks()
-                self._bring_to_front()
-                # Pre-import libraries after window is shown (non-blocking)
-                self._start_preimports()
+                # Don't call update_idletasks() - it's slow in PyInstaller bundles
+                # Use a small delay instead to let window initialize
+                def show_and_init():
+                    self._bring_to_front()
+                    self._start_preimports()
+                self.root.after(10, show_and_init)
         except Exception:
             # Fallback: just show the window normally
             try:
                 self.root.deiconify()
-                self.root.update_idletasks()
-                self._bring_to_front()
-                # Pre-import libraries after window is shown (non-blocking)
-                self._start_preimports()
+                # Don't call update_idletasks() - use small delay instead
+                def show_and_init():
+                    self._bring_to_front()
+                    self._start_preimports()
+                self.root.after(10, show_and_init)
             except Exception:
                 pass
     
@@ -7370,6 +8164,20 @@ class BandcampDownloaderGUI:
     
     def on_closing(self):
         """Handle window closing - save state, fade out then close console and destroy."""
+        # Stop shared Bandcamp request pacing waits so worker threads unwind promptly
+        if _bandcamp_fetch is not None:
+            try:
+                _bandcamp_fetch.bandcamp_begin_network_shutdown()
+            except Exception:
+                pass
+        # Persist tralbum ID cache for API-first fetches next launch
+        if _bandcamp_fetch is not None and getattr(self, "_tralbum_ids_cache", None) is not None:
+            try:
+                _bandcamp_fetch.save_tralbum_ids_cache(
+                    self._tralbum_ids_cache_path, self._tralbum_ids_cache
+                )
+            except Exception:
+                pass
         # Save window linking state and geometry before closing (immediately, not debounced)
         # This ensures settings are saved before application closes
         try:
@@ -8845,7 +9653,14 @@ class BandcampDownloaderGUI:
             metadata = self.url_tag_metadata_cache[normalized_url]
             artist = metadata.get('artist')
             album = metadata.get('album')
-            title = metadata.get('title')
+            # Prefer explicit title; fall back to first_track_title (tralbum path)
+            title = metadata.get('title') or metadata.get('first_track_title')
+            # Never show bot-challenge interstitial titles in the queue
+            if _bandcamp_fetch is not None:
+                if _bandcamp_fetch.is_challenge_title(album):
+                    album = None
+                if _bandcamp_fetch.is_challenge_title(title):
+                    title = None
             
             # Determine URL type from metadata or URL structure
             parsed = self._parse_bandcamp_url(url)
@@ -10613,123 +11428,174 @@ class BandcampDownloaderGUI:
         
         # Extract All Metadata button
         def extract_all_metadata():
-            """Extract comprehensive metadata using yt-dlp."""
-            if yt_dlp is None:
-                messagebox.showwarning("Metadata Extraction", "yt-dlp is not installed. Please install it to extract comprehensive metadata.")
-                return
-            
+            """Extract comprehensive metadata (Player-style page HTML first, yt-dlp fallback)."""
             # Disable button during extraction
             extract_btn.config(state='disabled', text="Extracting...")
             metadata_text.config(state='normal')
             metadata_text.delete('1.0', END)
-            metadata_text.insert('1.0', "Extracting comprehensive metadata...\n\nThis may take a few seconds.")
+            metadata_text.insert(
+                '1.0',
+                "Extracting metadata…\n\nTrying release page (fast), then yt-dlp if needed.",
+            )
             metadata_text.config(state='disabled')
             dialog.update()
             
             def do_extraction():
                 try:
-                    # Use yt-dlp to extract comprehensive metadata
-                    ydl_opts = {
-                        "quiet": True,
-                        "no_warnings": True,
-                        "extract_flat": False,  # Get full metadata, not just flat
-                        "socket_timeout": 30,
-                        "retries": 3,
-                        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "referer": "https://bandcamp.com/",
-                    }
-                    
-                    # Ensure yt-dlp is loaded (lazy import)
-                    yt_dlp = self._ensure_ytdlp_loaded()
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                    
-                    if not info:
-                        self.root.after(0, lambda: self._update_metadata_dialog(dialog, metadata_text, extract_btn, url, colors, "Failed to extract metadata."))
-                        return
-                    
-                    # Extract all available fields
                     all_metadata = {}
-                    
-                    # Basic info - check top-level first, then entries
-                    entries = info.get("entries", [])
-                    first_entry = entries[0] if entries else None
-                    
-                    # Artist: try top-level, then first entry, then uploader/channel/creator
-                    all_metadata['artist'] = (info.get("artist") or 
-                                            (first_entry.get("artist") if first_entry else None) or
-                                            info.get("uploader") or 
-                                            info.get("channel") or 
-                                            info.get("creator"))
-                    
-                    # Album: try top-level, then first entry
-                    all_metadata['album'] = (info.get("album") or 
-                                           (first_entry.get("album") if first_entry else None) or
-                                           info.get("title"))
-                    all_metadata['title'] = info.get("title")
-                    
-                    # Album Artist: try top-level, then first entry, then fallback to artist
-                    all_metadata['album_artist'] = (info.get("album_artist") or 
-                                                  info.get("albumartist") or
-                                                  (first_entry.get("album_artist") if first_entry else None) or
-                                                  (first_entry.get("albumartist") if first_entry else None) or
-                                                  all_metadata.get('artist'))
-                    
-                    # Dates - check top-level and first entry
-                    release_date = (info.get("release_date") or 
-                                  info.get("upload_date") or
-                                  (first_entry.get("release_date") if first_entry else None) or
-                                  (first_entry.get("upload_date") if first_entry else None))
-                    if release_date:
-                        all_metadata['date'] = release_date
-                        if len(release_date) >= 4:
-                            all_metadata['year'] = release_date[:4]
-                    
-                    # Classification
-                    all_metadata['genre'] = info.get("genre")
-                    all_metadata['label'] = info.get("label") or info.get("publisher")
-                    all_metadata['catalog_number'] = info.get("catalog_number") or info.get("catalognumber")
-                    
-                    # Track info
-                    entries = info.get("entries", [])
-                    if entries:
-                        all_metadata['track_count'] = len(entries)
+                    source = None
+
+                    # 1) Session / disk cache (instant)
+                    cached, _ = self._release_cache_entry(url)
+                    if cached.get("artist") or cached.get("album"):
+                        all_metadata = {
+                            "artist": cached.get("artist"),
+                            "album": cached.get("album"),
+                            "album_artist": cached.get("album_artist") or cached.get("artist"),
+                            "year": cached.get("year"),
+                            "first_track_title": cached.get("first_track_title"),
+                            "first_track_number": cached.get("first_track_number"),
+                            "track_titles": cached.get("track_titles") or [],
+                            "thumbnail_url": cached.get("thumbnail_url"),
+                        }
+                        if cached.get("art_id") and _bandcamp_fetch is not None:
+                            try:
+                                all_metadata["thumbnail_url"] = _bandcamp_fetch.bandcamp_bcbits_url_from_art_id(
+                                    int(cached["art_id"]),
+                                    fmt=getattr(_bandcamp_fetch, "BCBITS_PREVIEW_FMT", 2),
+                                )
+                            except (TypeError, ValueError):
+                                pass
+                        if cached.get("track_titles"):
+                            all_metadata["track_count"] = len(cached["track_titles"])
+                        source = "cache"
+
+                    # 2) Player-style: one page HTML fetch via yt-dlp session → data-tralbum
+                    if _bandcamp_fetch is not None and not (all_metadata.get("artist") and all_metadata.get("album") and all_metadata.get("track_titles")):
+                        ydl_mod = self._ensure_ytdlp_loaded()
+                        html = _bandcamp_fetch.fetch_release_html_via_ytdlp(url, ydl_mod, timeout=15.0) if ydl_mod else None
+                        if html:
+                            parsed = _bandcamp_fetch.metadata_and_cover_from_release_html(html, url)
+                            meta = parsed.get("metadata") or {}
+                            if meta:
+                                all_metadata.update({k: v for k, v in meta.items() if v not in (None, "", [])})
+                                if parsed.get("thumbnail_url"):
+                                    all_metadata["thumbnail_url"] = parsed["thumbnail_url"]
+                                if parsed.get("ids"):
+                                    try:
+                                        self._remember_tralbum_ids(
+                                            url,
+                                            parsed["ids"],
+                                            extras={
+                                                "art_id": _bandcamp_fetch.art_id_from_bcbits_url(
+                                                    all_metadata.get("thumbnail_url")
+                                                ),
+                                                "artist": all_metadata.get("artist"),
+                                                "album": all_metadata.get("album"),
+                                                "year": all_metadata.get("year"),
+                                                "first_track_title": all_metadata.get("first_track_title"),
+                                                "album_artist": all_metadata.get("album_artist"),
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+                                source = "page"
+                                # Enrich track list from tralbum when present
+                                tralbum = parsed.get("tralbum")
+                                if tralbum and _bandcamp_fetch is not None:
+                                    trackinfo = _bandcamp_fetch._trackinfo_array(tralbum) or []
+                                    titles = []
+                                    for i, item in enumerate(trackinfo):
+                                        if isinstance(item, dict):
+                                            t = item.get("title") or item.get("track_title")
+                                            if t:
+                                                titles.append(str(t))
+                                    if titles:
+                                        all_metadata["track_titles"] = titles
+                                        all_metadata["track_count"] = len(titles)
+
+                    # 3) Fallback: full yt-dlp extract (slower; needed if page path empty)
+                    if not (all_metadata.get("artist") or all_metadata.get("album")):
+                        ydl_mod = self._ensure_ytdlp_loaded()
+                        if ydl_mod is None:
+                            self.root.after(
+                                0,
+                                lambda: self._update_metadata_dialog(
+                                    dialog, metadata_text, extract_btn, url, colors,
+                                    "yt-dlp is not available and page metadata was empty.",
+                                ),
+                            )
+                            return
+                        ydl_opts = {
+                            "quiet": True,
+                            "no_warnings": True,
+                            "extract_flat": True,
+                            "socket_timeout": 30,
+                            "retries": 2,
+                            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "referer": "https://bandcamp.com/",
+                        }
+                        with ydl_mod.YoutubeDL(ydl_opts) as ydl:
+                            info = ydl.extract_info(url, download=False)
+                        if not info:
+                            self.root.after(
+                                0,
+                                lambda: self._update_metadata_dialog(
+                                    dialog, metadata_text, extract_btn, url, colors,
+                                    "Failed to extract metadata.",
+                                ),
+                            )
+                            return
+                        entries = [e for e in (info.get("entries") or []) if e]
+                        first_entry = entries[0] if entries else None
+                        all_metadata['artist'] = (
+                            info.get("artist")
+                            or (first_entry.get("artist") if first_entry else None)
+                            or info.get("uploader")
+                            or info.get("channel")
+                            or info.get("creator")
+                        )
+                        all_metadata['album'] = (
+                            info.get("album")
+                            or (first_entry.get("album") if first_entry else None)
+                            or info.get("title")
+                        )
+                        all_metadata['title'] = info.get("title")
+                        all_metadata['album_artist'] = (
+                            info.get("album_artist")
+                            or info.get("albumartist")
+                            or all_metadata.get('artist')
+                        )
+                        release_date = (
+                            info.get("release_date")
+                            or info.get("upload_date")
+                            or (first_entry.get("release_date") if first_entry else None)
+                            or (first_entry.get("upload_date") if first_entry else None)
+                        )
+                        if release_date:
+                            all_metadata['date'] = release_date
+                            if len(str(release_date)) >= 4:
+                                all_metadata['year'] = str(release_date)[:4]
                         if entries:
-                            first_entry = entries[0]
-                            all_metadata['first_track_title'] = first_entry.get("title")
-                            all_metadata['first_track_number'] = first_entry.get("track_number") or first_entry.get("track")
-                            # Get all track titles
-                            track_titles = [e.get("title", "") for e in entries if e.get("title")]
-                            all_metadata['track_titles'] = track_titles
-                    
-                    # Additional fields
-                    all_metadata['description'] = info.get("description")
-                    all_metadata['thumbnail_url'] = (info.get("thumbnail") or 
-                                                    info.get("thumbnail_url") or 
-                                                    info.get("artwork_url") or
-                                                    info.get("cover"))
-                    all_metadata['detected_format'] = info.get("format") or info.get("ext")
-                    
-                    # Duration
-                    duration = info.get("duration")
-                    if duration:
-                        minutes = int(duration // 60)
-                        seconds = int(duration % 60)
-                        all_metadata['duration'] = f"{minutes}:{seconds:02d}"
-                    
-                    # Tags/categories
-                    tags = info.get("tags") or info.get("categories")
-                    if tags:
-                        if isinstance(tags, list):
-                            all_metadata['tags'] = ", ".join(str(t) for t in tags[:10])  # First 10 tags
-                        else:
-                            all_metadata['tags'] = str(tags)
-                    
-                    # License
-                    all_metadata['license'] = info.get("license")
-                    
-                    # Update dialog with comprehensive metadata
-                    self.root.after(0, lambda: self._update_metadata_dialog(dialog, metadata_text, extract_btn, url, colors, None, all_metadata))
+                            all_metadata['track_count'] = len(entries)
+                            all_metadata['track_titles'] = [
+                                e.get("title", "") for e in entries if e.get("title")
+                            ]
+                            if entries[0].get("title"):
+                                all_metadata['first_track_title'] = entries[0].get("title")
+                        all_metadata['description'] = info.get("description")
+                        all_metadata['thumbnail_url'] = self._thumbnail_from_ytdlp_info(info)
+                        source = "yt-dlp"
+
+                    if source:
+                        all_metadata["_source"] = source
+
+                    self.root.after(
+                        0,
+                        lambda: self._update_metadata_dialog(
+                            dialog, metadata_text, extract_btn, url, colors, None, all_metadata
+                        ),
+                    )
                     
                 except Exception as e:
                     error_msg = f"Error extracting metadata: {str(e)}"
@@ -11432,6 +12298,8 @@ class BandcampDownloaderGUI:
             lines = []
             
             # Basic information
+            if all_metadata.get('_source'):
+                lines.append(f"Source: {all_metadata['_source']}")
             if all_metadata.get('artist'):
                 lines.append(f"Artist: {all_metadata['artist']}")
             if all_metadata.get('album'):
@@ -12082,9 +12950,11 @@ class BandcampDownloaderGUI:
             self._check_url()
             # Unfocus URL field so placeholder text can be seen (same as Clear button)
             self.root.focus_set()
-        
-        # Reprocess tags to update styling and find any new URLs
-        self.root.after(50, self._process_url_tags)
+            self.root.after(50, self._process_url_tags)
+        else:
+            # Remaining URLs: reprocess then refresh preview to the new last tag
+            self.root.after(50, self._process_url_tags)
+            self.root.after(80, self._check_url)
         
         # Update URL count
         self._update_url_count_and_button()
@@ -12119,6 +12989,19 @@ class BandcampDownloaderGUI:
         # Backspace still works for tag deletion via _handle_url_tag_backspace
         return "break"
     
+    @staticmethod
+    def _tk_text_index_sort_key(idx):
+        """Sort key for Tk text indices (\"line.col\") — numeric, not lexicographic.
+
+        String sort puts \"1.100\" before \"1.25\" and \"10.0\" before \"2.0\", which
+        breaks \"last URL in the queue\" when many tags sit on one line.
+        """
+        try:
+            line_s, col_s = str(idx).split(".", 1)
+            return (int(line_s), int(float(col_s)))
+        except (TypeError, ValueError, AttributeError):
+            return (0, 0)
+
     def _extract_urls_from_content(self, content):
         """Extract URLs from content string, handling both single and multi-line input.
         Also handles concatenated URLs (no separator) on the same line.
@@ -12142,8 +13025,8 @@ class BandcampDownloaderGUI:
                 if tag_id in self.url_tag_mapping:
                     tag_positions_list.append((start_pos, tag_id))
             
-            # Sort by position (start position in text)
-            tag_positions_list.sort(key=lambda x: x[0])
+            # Numeric (line, col) order — not string sort of "1.10" vs "1.2"
+            tag_positions_list.sort(key=lambda x: self._tk_text_index_sort_key(x[0]))
             
             # Add URLs in order of appearance (preserve duplicates for correct last-URL selection)
             for start_pos, tag_id in tag_positions_list:
@@ -12732,6 +13615,44 @@ class BandcampDownloaderGUI:
         # Always update current_url_being_processed to ensure preview updates for duplicates
         # This allows preview to refresh even when the same URL is pasted again
         self.current_url_being_processed = url
+
+        # Provisional preview from URL slugs so the path isn't stuck on placeholders
+        # while tralbum/yt-dlp metadata is still loading (tags already use this).
+        if url_changed:
+            parsed = self._parse_bandcamp_url(url)
+            if parsed:
+                p_artist, p_name, p_type = parsed
+                if p_type == "track":
+                    self.album_info = {
+                        "artist": p_artist or "Artist",
+                        "album": "Album",
+                        "title": p_name or "Track",
+                        "first_track_title": p_name,
+                        "year": None,
+                        "thumbnail_url": None,
+                        "album_artist": p_artist or "Artist",
+                    }
+                elif p_type == "album":
+                    self.album_info = {
+                        "artist": p_artist or "Artist",
+                        "album": p_name or "Album",
+                        "title": "Track",
+                        "first_track_title": None,
+                        "year": None,
+                        "thumbnail_url": None,
+                        "album_artist": p_artist or "Artist",
+                    }
+                else:
+                    self.album_info = {
+                        "artist": p_artist or "Artist",
+                        "album": "Album",
+                        "title": "Track",
+                        "first_track_title": None,
+                        "year": None,
+                        "thumbnail_url": None,
+                        "album_artist": p_artist or "Artist",
+                    }
+                self.root.after(0, self.update_preview)
         
         # For duplicate URLs, immediately update preview from cache if available
         # This provides instant feedback while fresh metadata fetches in background
@@ -12827,11 +13748,498 @@ class BandcampDownloaderGUI:
                 if normalized_other_url not in self.url_metadata_cache and "bandcamp.com" in other_url.lower():
                     threading.Thread(target=self.fetch_album_metadata, args=(other_url,), daemon=True).start()
     
+    def _normalize_release_url_key(self, url):
+        """Normalize a Bandcamp URL for cache keys (matches bandcamp_fetch when available)."""
+        if _bandcamp_fetch is not None:
+            return _bandcamp_fetch.normalize_release_url(url)
+        u = (url or "").strip().rstrip(" \t,;")
+        if not u:
+            return ""
+        if not u.startswith(("http://", "https://")):
+            u = "https://" + u
+        return u.rstrip("/").lower()
+
+    def _remember_tralbum_ids(self, url, ids, *, extras=None):
+        """Persist band/tralbum IDs (+ optional art_id/titles) for snappy revisits (Player-style)."""
+        key = self._normalize_release_url_key(url)
+        if not key:
+            return
+        if not hasattr(self, "_tralbum_ids_cache") or self._tralbum_ids_cache is None:
+            self._tralbum_ids_cache = {}
+        prev = self._tralbum_ids_cache.get(key)
+        entry = dict(prev) if isinstance(prev, dict) else {}
+        if isinstance(ids, dict):
+            for k in ("band_id", "tralbum_id", "tralbum_type"):
+                if ids.get(k) is not None:
+                    entry[k] = ids.get(k)
+        if isinstance(extras, dict):
+            for k, v in extras.items():
+                if v is None or v == "":
+                    continue
+                entry[k] = v
+        if not entry:
+            return
+        self._tralbum_ids_cache[key] = entry
+        if _bandcamp_fetch is not None:
+            try:
+                _bandcamp_fetch.save_tralbum_ids_cache(
+                    self._tralbum_ids_cache_path, self._tralbum_ids_cache
+                )
+            except Exception:
+                pass
+
+    def _release_cache_entry(self, url):
+        """Merged disk + session cache for a release URL."""
+        key = self._normalize_release_url_key(url)
+        if not key:
+            return {}, ""
+        disk = {}
+        if getattr(self, "_tralbum_ids_cache", None):
+            raw = self._tralbum_ids_cache.get(key)
+            if isinstance(raw, dict):
+                disk = dict(raw)
+        mem = {}
+        if getattr(self, "url_metadata_cache", None):
+            raw = self.url_metadata_cache.get(key)
+            if isinstance(raw, dict):
+                mem = dict(raw)
+        merged = dict(disk)
+        merged.update({k: v for k, v in mem.items() if v is not None and v != ""})
+        # Prefer explicit art_id; else derive from thumbnail URL
+        art_id = merged.get("art_id")
+        if not art_id and merged.get("thumbnail_url") and _bandcamp_fetch is not None:
+            art_id = _bandcamp_fetch.art_id_from_bcbits_url(merged.get("thumbnail_url"))
+            if art_id:
+                merged["art_id"] = art_id
+        return merged, key
+
+    def _paint_cached_release_preview(self, url):
+        """Player-style: paint titles/cover from cached art_id with CDN only (no Bandcamp RTT)."""
+        if not self._is_focused_release_url(url):
+            return False
+        cached, key = self._release_cache_entry(url)
+        if not cached:
+            return False
+        artist = cached.get("artist")
+        album = cached.get("album")
+        year = cached.get("year")
+        first_track_title = cached.get("first_track_title")
+        first_track_number = cached.get("first_track_number")
+        track_titles = cached.get("track_titles") or []
+        album_artist = cached.get("album_artist") or artist
+        art_id = cached.get("art_id")
+        painted = False
+
+        if artist or album:
+            existing = self.album_info if isinstance(getattr(self, "album_info", None), dict) else {}
+            self.album_info = {
+                "artist": artist or existing.get("artist") or "Artist",
+                "album": album or existing.get("album") or "Album",
+                "title": existing.get("title") or "Track",
+                "thumbnail_url": existing.get("thumbnail_url"),
+                "year": year or existing.get("year"),
+                "first_track_title": first_track_title or existing.get("first_track_title"),
+                "first_track_number": first_track_number if first_track_number is not None else existing.get("first_track_number"),
+                "track_titles": track_titles or existing.get("track_titles") or [],
+                "album_artist": album_artist or existing.get("album_artist") or "Artist",
+            }
+            self.root.after(0, self.update_preview)
+            painted = True
+            self._meta_trace(f"cache: titles ready (artist={artist!r}, album={album!r})")
+
+        if art_id and _bandcamp_fetch is not None:
+            try:
+                aid = int(art_id)
+            except (TypeError, ValueError):
+                aid = None
+            if aid:
+                fmt = getattr(_bandcamp_fetch, "BCBITS_PREVIEW_FMT", 2)
+                cover = _bandcamp_fetch.bandcamp_bcbits_url_from_art_id(aid, fmt=fmt)
+                self._meta_trace(f"cache: cover from art_id (CDN only) → {cover}")
+                self._display_preview_artwork(url, cover)
+                painted = True
+                # Keep session cache warm
+                if key:
+                    self.url_metadata_cache.setdefault(key, {})["art_id"] = aid
+                    self.url_metadata_cache[key]["thumbnail_url"] = cover
+        return painted
+
+    def _bandcamp_should_stop(self):
+        return bool(getattr(self, "is_cancelling", False))
+
+    def _meta_trace(self, message, *, also_status=True, user_visible=False):
+        """Print metadata/art pipeline traces to the console.
+
+        By default Status-log mirrors are debug-only (``DEBUG: [Meta] …``) so normal
+        users aren't flooded. Pass ``user_visible=True`` for real failures users should see.
+        Challenge/rate-limit warnings use ``log("⚠ …")`` separately and stay visible.
+        """
+        text = f"[Meta] {message}"
+        try:
+            print(text, flush=True)
+        except Exception:
+            pass
+        if also_status:
+            try:
+                status_text = text if user_visible else f"DEBUG: {text}"
+                self.root.after(0, lambda m=status_text: self.log(m))
+            except Exception:
+                pass
+
+    def _urls_match_for_preview(self, url_a, url_b):
+        """True when two Bandcamp URLs refer to the same release (normalized)."""
+        if not url_a or not url_b:
+            return False
+        if url_a == url_b:
+            return True
+        return self._normalize_release_url_key(url_a) == self._normalize_release_url_key(url_b)
+
+    def _wait_for_bandcamp_budget(self, *, log_status=True, max_wait=45.0):
+        """Honor shared 429 cooldown + token bucket before a Bandcamp request.
+
+        Caps wait at *max_wait* so inflated cooldowns cannot stall downloads for minutes.
+        Client-challenge soft pauses are not waited here (yt-dlp often still works).
+        """
+        if _bandcamp_fetch is None:
+            return True
+        if _bandcamp_fetch.bandcamp_rate_limited():
+            remaining = _bandcamp_fetch.bandcamp_rate_limit_remaining_sec()
+            wait_for = min(remaining, max_wait)
+            if log_status and wait_for > 0.5:
+                self.root.after(
+                    0,
+                    lambda w=int(wait_for) + 1, r=int(remaining) + 1: self.log(
+                        f"⏸ Bandcamp rate limit — waiting up to {w}s"
+                        + (f" (cooldown {r}s remaining)" if r > w else "")
+                        + "…"
+                    ),
+                )
+            _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                max_wait=max_wait,
+                should_stop=self._bandcamp_should_stop,
+            )
+        if self._bandcamp_should_stop():
+            return False
+        return _bandcamp_fetch.bandcamp_acquire_request_slot(
+            should_stop=self._bandcamp_should_stop
+        )
+
+    def _is_focused_release_url(self, url):
+        """True if *url* is the release currently driving preview/art."""
+        current = getattr(self, "current_url_being_processed", None)
+        return self._urls_match_for_preview(current, url)
+
+    def _apply_tralbum_metadata_result(self, url, meta):
+        """Apply successful tralbum/API metadata to caches, preview, tags, and art."""
+        if not meta:
+            return
+        normalized_url = self._normalize_release_url_key(url)
+        artist = meta.get("artist")
+        album = meta.get("album")
+        year = meta.get("year")
+        first_track_title = meta.get("first_track_title")
+        first_track_number = meta.get("first_track_number")
+        track_titles = meta.get("track_titles") or []
+        thumbnail_url = meta.get("thumbnail_url")
+        album_artist = meta.get("album_artist") or artist
+        title = meta.get("title") or (
+            first_track_title if meta.get("page_kind") == "track" else None
+        )
+
+        metadata = {
+            "artist": artist,
+            "album": album,
+            "title": title,
+            "thumbnail_url": thumbnail_url,
+            "year": year,
+            "first_track_title": first_track_title,
+            "first_track_number": first_track_number,
+            "album_artist": album_artist,
+            "track_titles": track_titles,
+        }
+        self.url_metadata_cache[normalized_url] = metadata
+        self.url_tag_metadata_cache[normalized_url] = dict(metadata)
+
+        if self._is_focused_release_url(url):
+            self.album_info = {
+                "artist": artist or "Artist",
+                "album": album or "Album",
+                "title": title or "Track",
+                "thumbnail_url": thumbnail_url,
+                "year": year,
+                "first_track_title": first_track_title,
+                "first_track_number": first_track_number,
+                "track_titles": track_titles,
+                "album_artist": album_artist or artist or "Artist",
+            }
+            self.root.after(0, self.update_preview)
+            if thumbnail_url:
+                self._display_preview_artwork(url, thumbnail_url)
+
+        # Persist art_id + titles for zero-RTT revisits (Player pattern)
+        art_id = None
+        if _bandcamp_fetch is not None and thumbnail_url:
+            art_id = _bandcamp_fetch.art_id_from_bcbits_url(thumbnail_url)
+        if art_id and normalized_url:
+            self.url_metadata_cache.setdefault(normalized_url, {})["art_id"] = art_id
+        self._remember_tralbum_ids(
+            url,
+            {},
+            extras={
+                "art_id": art_id,
+                "artist": artist,
+                "album": album,
+                "year": year,
+                "first_track_title": first_track_title,
+                "album_artist": album_artist,
+            },
+        )
+
+        if hasattr(self, "_additional_settings_dialogs"):
+            for dialog_ref in self._additional_settings_dialogs:
+                try:
+                    if dialog_ref["dialog"].winfo_exists():
+                        dialog_ref["update_func"]()
+                except Exception:
+                    pass
+
+        self.root.after(100, self._process_url_tags)
+        # Art URL from art_id/bcbits is preferred; only HTML-scrape when missing and not challenged
+        if not thumbnail_url and self._is_focused_release_url(url):
+            challenged = (
+                _bandcamp_fetch is not None
+                and _bandcamp_fetch.bandcamp_challenge_remaining_sec() > 0
+            )
+            if not challenged:
+                self.root.after(50, lambda: self.fetch_thumbnail_from_html(url))
+
+    def _schedule_tralbum_metadata_retry(self, url, *, delay_sec=12.0, reason="retry"):
+        """Schedule at most one deferred metadata retry per URL (no spam)."""
+        if not hasattr(self, "_tralbum_retry_pending"):
+            self._tralbum_retry_pending = set()
+        key = self._normalize_release_url_key(url)
+        if not key or key in self._tralbum_retry_pending:
+            return
+        self._tralbum_retry_pending.add(key)
+        delay_ms = int(max(3.0, delay_sec) * 1000)
+        if self.debug_mode:
+            self.root.after(
+                0,
+                lambda r=reason, s=int(delay_sec): self.log(
+                    f"DEBUG: Scheduled metadata {r} in ~{s}s"
+                ),
+            )
+
+        def _retry():
+            try:
+                self._tralbum_retry_pending.discard(key)
+            except Exception:
+                pass
+            if self._bandcamp_should_stop():
+                return
+            self.fetch_album_metadata(url)
+
+        self.root.after(delay_ms, _retry)
+
+    def _try_tralbum_metadata_fetch(self, url):
+        """Player-style API / data-tralbum metadata.
+
+        Returns:
+            'ok' — metadata applied
+            'miss' — no usable tralbum data; caller should fall back to yt-dlp
+        """
+        if _bandcamp_fetch is None:
+            return "miss"
+        key = self._normalize_release_url_key(url)
+        cached_ids = None
+        if key and getattr(self, "_tralbum_ids_cache", None):
+            cached_ids = self._tralbum_ids_cache.get(key)
+
+        # Don't sleep on challenge here — yt-dlp is raced in parallel for responsiveness
+        skip_html = bool(getattr(self, "_prefer_ytdlp_metadata", False))
+        try:
+            result = _bandcamp_fetch.fetch_release_metadata(
+                url,
+                cached_ids=cached_ids,
+                timeout=8.0,
+                html_timeout=5.0,
+                skip_html=skip_html,
+                should_stop=self._bandcamp_should_stop,
+            )
+        except Exception as e:
+            if self.debug_mode:
+                self.root.after(0, lambda err=str(e): self.log(f"DEBUG: tralbum fetch error: {err}"))
+            return "miss"
+
+        if result.get("ids"):
+            self._remember_tralbum_ids(url, result["ids"])
+
+        status = result.get("status")
+        if status == "ok":
+            self._apply_tralbum_metadata_result(url, result.get("metadata") or {})
+            self._meta_trace(f"tralbum/{result.get('source') or '?'} OK (fast path)")
+            return "ok"
+
+        if status == "challenge":
+            self._prefer_ytdlp_metadata = True
+            if not hasattr(self, "_challenge_logged_urls"):
+                self._challenge_logged_urls = set()
+            if key not in self._challenge_logged_urls:
+                self._challenge_logged_urls.add(key)
+                msg = result.get("message") or "client challenge"
+                self.root.after(0, lambda m=msg: self.log(f"⚠ {m}"))
+                self._meta_trace("HTML challenged — session will prefer yt-dlp-first next time")
+            return "miss"
+
+        if status == "rate_limited":
+            # Don't block preview forever — yt-dlp often still works
+            remaining = int(_bandcamp_fetch.bandcamp_rate_limit_remaining_sec()) + 1
+            self.root.after(
+                0,
+                lambda r=remaining: self.log(
+                    f"⚠ Bandcamp rate limited for metadata (cooldown ~{r}s) — "
+                    f"trying yt-dlp for preview/art…"
+                ),
+            )
+            self._schedule_tralbum_metadata_retry(
+                url, delay_sec=min(60.0, float(remaining)), reason="rate-limit retry"
+            )
+            return "miss"
+
+        return "miss"
+
+    def _thumbnail_from_ytdlp_info(self, info):
+        """Pull a cover URL from yt-dlp info (prefer bcbits; upgrade size like the Player)."""
+        if not info or not isinstance(info, dict):
+            return None
+
+        def _pick_from_thumbnails(thumbnails_list):
+            if not thumbnails_list:
+                return None
+            # Prefer highest preference / largest known bcbits tier
+            best = None
+            best_score = -1
+            for thumb in thumbnails_list:
+                if isinstance(thumb, dict):
+                    u = thumb.get("url")
+                    pref = thumb.get("preference")
+                    try:
+                        score = int(pref) if pref is not None else 0
+                    except (TypeError, ValueError):
+                        score = 0
+                    w = thumb.get("width") or 0
+                    try:
+                        score = max(score, int(w) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                elif isinstance(thumb, str):
+                    u = thumb
+                    score = 0
+                else:
+                    continue
+                if not u:
+                    continue
+                if "bcbits.com" in u.lower():
+                    score += 1000
+                if score >= best_score:
+                    best_score = score
+                    best = u
+            if best:
+                return best
+            first = thumbnails_list[0]
+            return first.get("url") if isinstance(first, dict) else first
+
+        thumbnail_url = None
+        if info.get("entries"):
+            for entry in info.get("entries") or []:
+                if not entry:
+                    continue
+                if entry.get("thumbnails"):
+                    thumbnail_url = _pick_from_thumbnails(entry.get("thumbnails"))
+                if not thumbnail_url:
+                    thumbnail_url = (
+                        entry.get("thumbnail")
+                        or entry.get("thumbnail_url")
+                        or entry.get("artwork_url")
+                        or entry.get("cover")
+                    )
+                if thumbnail_url:
+                    break
+        if not thumbnail_url and info.get("thumbnails"):
+            thumbnail_url = _pick_from_thumbnails(info.get("thumbnails"))
+        if not thumbnail_url:
+            thumbnail_url = (
+                info.get("thumbnail")
+                or info.get("thumbnail_url")
+                or info.get("artwork_url")
+                or info.get("cover")
+            )
+        return thumbnail_url
+
+    def _display_preview_artwork(self, url, thumbnail_url):
+        """Show album art in the preview panel (bcbits CDN — same path the Player uses)."""
+        if not thumbnail_url:
+            self._meta_trace("cover display skipped: empty URL")
+            return
+        if not self._is_focused_release_url(url):
+            self._meta_trace("cover display skipped: URL no longer focused")
+            return
+        if _bandcamp_fetch is not None:
+            # Preview canvas is ~166px — use _2 (~350px) instead of _10 (~1200px / hundreds of KB)
+            preview_fmt = getattr(_bandcamp_fetch, "BCBITS_PREVIEW_FMT", 2)
+            thumbnail_url = (
+                _bandcamp_fetch.upgrade_bcbits_art_url(thumbnail_url, prefer_fmt=preview_fmt)
+                or thumbnail_url
+            )
+        self.current_thumbnail_url = thumbnail_url
+        if hasattr(self, "album_info") and isinstance(self.album_info, dict):
+            self.album_info["thumbnail_url"] = thumbnail_url
+        # Reset carousel so the new cover becomes index 0
+        self.artwork_list = []
+        self.artwork_index = 0
+        # Clear stuck fetch gate so a prior failed attempt cannot block the new cover
+        self.album_art_fetching = False
+        try:
+            self._build_artwork_list()
+        except Exception as e:
+            self._meta_trace(f"artwork list build warning: {e}")
+        self._meta_trace(f"requesting cover download: {thumbnail_url}")
+        self.root.after(0, lambda u=thumbnail_url: self.fetch_and_display_album_art(u))
+
     def fetch_album_metadata(self, url):
         """Fetch album metadata from URL without downloading."""
-        # Try fast HTML extraction first, then fall back to yt-dlp
+        # Deduplicate concurrent fetches (paste + retry + multi-URL warm) that double-log challenges
+        if not hasattr(self, "_metadata_fetch_inflight"):
+            self._metadata_fetch_inflight = set()
+        fetch_key = self._normalize_release_url_key(url)
+        if fetch_key and fetch_key in self._metadata_fetch_inflight:
+            return
+        if fetch_key:
+            self._metadata_fetch_inflight.add(fetch_key)
+
+        # Instant paint from disk/session cache (art_id → bcbits CDN) before any network
+        try:
+            self._paint_cached_release_preview(url)
+        except Exception:
+            pass
+
+        # Prefer tralbum API / data-tralbum (Player pattern), then legacy HTML, then yt-dlp
         def fetch_from_html():
             try:
+                outcome = self._try_tralbum_metadata_fetch(url)
+                if outcome == "ok":
+                    # Optional richer yt-dlp pass later is skipped here to avoid double-hitting Bandcamp
+                    return
+                # challenge / rate_limit / empty → yt-dlp for preview + art
+                # (yt-dlp often succeeds when plain urllib hits a client challenge).
+                # Skip a second urllib HTML scrape when we already know the wall is up.
+                if _bandcamp_fetch is not None and (
+                    _bandcamp_fetch.bandcamp_challenge_remaining_sec() > 0
+                    or _bandcamp_fetch.bandcamp_rate_limited()
+                ):
+                    fetch_from_ytdlp()
+                    return
+
                 import urllib.request
                 import re
                 from urllib.parse import urlparse
@@ -12850,6 +14258,15 @@ class BandcampDownloaderGUI:
                 # Increased timeout to 20 seconds for throttled connections
                 with urllib.request.urlopen(req, timeout=20) as response:
                     html_content = response.read().decode('utf-8', errors='ignore')
+
+                # Fail closed on bot-challenge interstitials (never treat as track/album title)
+                if _bandcamp_fetch is not None and _bandcamp_fetch.html_looks_like_challenge(html_content):
+                    _bandcamp_fetch.bandcamp_note_challenge()
+                    self.root.after(0, lambda: self.log(
+                        "⚠ Bandcamp returned a client challenge page — not using page title as track metadata."
+                    ))
+                    fetch_from_ytdlp()
+                    return
                 
                 artist = None
                 album = None
@@ -13311,237 +14728,320 @@ class BandcampDownloaderGUI:
                 fetch_from_ytdlp()
         
         def fetch_from_ytdlp():
+            # NOTE: never assign to name `yt_dlp` here — it shadows the global and causes
+            # UnboundLocalError (previously swallowed, which left preview/art broken with a blank console).
             try:
-                if yt_dlp is None:
+                ydl_mod = self._ensure_ytdlp_loaded()
+                if ydl_mod is None:
+                    self._meta_trace(
+                        "yt-dlp unavailable — cannot resolve preview/art fallback",
+                        user_visible=True,
+                    )
                     return
-                
-                # Use yt-dlp to extract info without downloading (fast mode - no track processing)
-                # Enhanced options for restricted networks
-                ydl_opts = {
+
+                base_opts = {
                     "quiet": True,
                     "no_warnings": True,
-                    "extract_flat": True,
-                    "socket_timeout": 30,
-                    "retries": 5,
-                    "fragment_retries": 5,
+                    "socket_timeout": 20,
+                    "retries": 2,
+                    "fragment_retries": 2,
                     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "referer": "https://bandcamp.com/",
                 }
-                
-                # Ensure yt-dlp is loaded (lazy import)
-                yt_dlp = self._ensure_ytdlp_loaded()
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    
-                    # Extract artist, album, and year info
-                    artist = None
-                    album = None
-                    year = None
-                    artist_from_metadata = None  # Track if artist came from metadata (not URL fallback)
-                    
-                    if info:
-                        # Track whether artist came from actual metadata (not URL fallback)
-                        artist_from_metadata = (info.get("artist") or 
-                                               info.get("uploader") or 
-                                               info.get("channel") or
-                                               info.get("creator"))
-                        artist = artist_from_metadata
-                        
-                        # Try extracting from URL if not found (last resort)
-                        # But mark it as URL fallback so we don't overwrite HTML extraction results
-                        artist_from_url = None
-                        if not artist and "bandcamp.com" in url.lower():
+
+                artist = None
+                album = None
+                year = None
+                artist_from_metadata = None
+                thumbnail_url = None
+                cover_shown = False
+                info = {}
+                first_track_title = None
+                first_track_number = None
+                track_titles = []
+
+                def _apply_titles_now(artist, album, year, *, first_track_title=None, first_track_number=None, track_titles=None, album_artist=None):
+                    if not self._is_focused_release_url(url) or not (artist or album):
+                        return
+                    existing = self.album_info if isinstance(getattr(self, "album_info", None), dict) else {}
+                    self.album_info = {
+                        "artist": artist or existing.get("artist") or "Artist",
+                        "album": album or existing.get("album") or "Album",
+                        "title": existing.get("title") or "Track",
+                        "thumbnail_url": existing.get("thumbnail_url"),
+                        "year": year or existing.get("year"),
+                        "first_track_title": first_track_title or existing.get("first_track_title"),
+                        "first_track_number": first_track_number if first_track_number is not None else existing.get("first_track_number"),
+                        "track_titles": track_titles if track_titles is not None else (existing.get("track_titles") or []),
+                        "album_artist": album_artist or artist or existing.get("album_artist") or "Artist",
+                    }
+                    self.root.after(0, self.update_preview)
+                    self._meta_trace(f"yt-dlp: preview titles ready (artist={artist!r}, album={album!r})")
+
+                # Player path: cover/titles from the album/track *page* (art_id / og:image) — not a track extract.
+                # yt-dlp's HTTP session often gets real HTML when plain urllib hits a client challenge.
+                page_ok = False
+                cached_hit, _cache_key = self._release_cache_entry(url)
+                if (
+                    cached_hit.get("art_id")
+                    and (cached_hit.get("artist") or cached_hit.get("album"))
+                ):
+                    # Already painted from cache at fetch start — skip page/track network entirely
+                    artist = cached_hit.get("artist")
+                    album = cached_hit.get("album")
+                    year = cached_hit.get("year")
+                    artist_from_metadata = artist
+                    first_track_title = cached_hit.get("first_track_title")
+                    first_track_number = cached_hit.get("first_track_number")
+                    track_titles = cached_hit.get("track_titles") or []
+                    try:
+                        aid = int(cached_hit.get("art_id"))
+                    except (TypeError, ValueError):
+                        aid = None
+                    if aid and _bandcamp_fetch is not None:
+                        thumbnail_url = _bandcamp_fetch.bandcamp_bcbits_url_from_art_id(
+                            aid, fmt=getattr(_bandcamp_fetch, "BCBITS_PREVIEW_FMT", 2)
+                        )
+                        cover_shown = True
+                    page_ok = True
+                    self._meta_trace("yt-dlp: cache hit — skipped page HTML + track extract")
+                elif _bandcamp_fetch is not None:
+                    try:
+                        self._meta_trace("yt-dlp: fetching release page HTML (Player-style cover)…")
+                        html = _bandcamp_fetch.fetch_release_html_via_ytdlp(url, ydl_mod, timeout=12.0)
+                        if html:
+                            parsed = _bandcamp_fetch.metadata_and_cover_from_release_html(html, url)
+                            meta = parsed.get("metadata") or {}
+                            thumb = parsed.get("thumbnail_url") or meta.get("thumbnail_url")
+                            artist = meta.get("artist")
+                            album = meta.get("album")
+                            year = meta.get("year")
+                            artist_from_metadata = artist
+                            first_track_title = meta.get("first_track_title")
+                            first_track_number = meta.get("first_track_number")
+                            track_titles = meta.get("track_titles") or []
+                            thumbnail_url = thumb
+                            art_id = _bandcamp_fetch.art_id_from_bcbits_url(thumb) if thumb else None
+                            if not art_id and parsed.get("tralbum"):
+                                try:
+                                    art_id = _bandcamp_fetch._art_id_from_tralbum(parsed["tralbum"])
+                                except Exception:
+                                    art_id = None
                             try:
-                                from urllib.parse import urlparse
-                                import re
-                                parsed = urlparse(url)
-                                hostname = parsed.hostname or ""
-                                if ".bandcamp.com" in hostname:
-                                    subdomain = hostname.replace(".bandcamp.com", "")
-                                    
-                                    # First try splitting by hyphens (most common)
-                                    if "-" in subdomain:
-                                        artist_from_url = " ".join(word.capitalize() for word in subdomain.split("-"))
-                                    else:
-                                        # Handle camelCase (e.g., "samwebster" -> "Sam Webster")
-                                        # Split on capital letters: "samwebster" -> ["sam", "webster"]
-                                        words = re.findall(r'[a-z]+|[A-Z][a-z]*', subdomain)
-                                        if len(words) > 1:
-                                            artist_from_url = " ".join(word.capitalize() for word in words)
-                                        else:
-                                            # Just capitalize the whole thing as fallback
-                                            artist_from_url = subdomain.capitalize()
-                            except:
+                                self._remember_tralbum_ids(
+                                    url,
+                                    parsed.get("ids") or {},
+                                    extras={
+                                        "art_id": art_id,
+                                        "artist": artist,
+                                        "album": album,
+                                        "year": year,
+                                        "first_track_title": first_track_title,
+                                        "album_artist": meta.get("album_artist") or artist,
+                                    },
+                                )
+                            except Exception:
                                 pass
-                        
-                        # Only use URL fallback if we don't have metadata artist
-                        if not artist:
-                            artist = artist_from_url
-                        
-                        album = info.get("album") or info.get("title")
-                        
-                        # Extract year from release_date or upload_date
-                        date = info.get("release_date") or info.get("upload_date")
-                        if date:
-                            # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
-                            try:
-                                if len(date) >= 4:
-                                    year = date[:4]  # First 4 characters are the year
-                            except:
-                                pass
-                    
-                    # Get thumbnail URL for album art (second phase - won't slow down preview)
-                    # Prefer larger thumbnails for better quality (now that loading is fast)
-                    thumbnail_url = None
-                    
-                    def get_largest_thumbnail(thumbnails_list):
-                        """Get the largest/highest quality thumbnail URL from a list."""
-                        if not thumbnails_list:
-                            return None
-                        # Look for larger sizes first (better quality)
-                        for size in ["large", "default", "medium", "small"]:
-                            for thumb in thumbnails_list:
-                                if isinstance(thumb, dict):
-                                    if thumb.get("id") == size or thumb.get("preference", 0) > 5:
-                                        return thumb.get("url")
-                                    url = thumb.get("url")
-                                    if url and size in url.lower():
-                                        return url
-                                elif isinstance(thumb, str):
-                                    if size in thumb.lower():
-                                        return thumb
-                        # If no size match, return first available
-                        if isinstance(thumbnails_list[0], dict):
-                            return thumbnails_list[0].get("url")
-                        return thumbnails_list[0]
-                    
-                    # First try entries (tracks often have the album art)
-                    if info.get("entries"):
-                        entries = [e for e in info.get("entries", []) if e]  # Filter out None
-                        for entry in entries:
-                            if not entry:
-                                continue
-                            # Try thumbnails list first (may have multiple sizes)
-                            if entry.get("thumbnails"):
-                                thumbnail_url = get_largest_thumbnail(entry.get("thumbnails"))
-                            # Fallback to direct fields
-                            if not thumbnail_url:
-                                thumbnail_url = (entry.get("thumbnail") or 
-                                               entry.get("thumbnail_url") or
-                                               entry.get("artwork_url") or
-                                               entry.get("cover"))
+                            if artist or album:
+                                _apply_titles_now(
+                                    artist,
+                                    album,
+                                    year,
+                                    first_track_title=first_track_title,
+                                    first_track_number=first_track_number,
+                                    track_titles=track_titles,
+                                    album_artist=meta.get("album_artist") or artist,
+                                )
                             if thumbnail_url:
-                                break  # Found it, stop searching
-                    
-                    # If not found in entries, try top-level info
+                                self._meta_trace(f"yt-dlp: cover OK (page art_id/og) → {thumbnail_url}")
+                                self._display_preview_artwork(url, thumbnail_url)
+                                cover_shown = True
+                            if artist or album or thumbnail_url:
+                                page_ok = True
+                                self._meta_trace("yt-dlp: page HTML OK — skipped track extract")
+                                # Clear challenge backoff: yt-dlp session reached real Bandcamp HTML
+                                try:
+                                    _bandcamp_fetch.bandcamp_clear_challenge_backoff()
+                                except Exception:
+                                    pass
+                        else:
+                            self._meta_trace("yt-dlp: page HTML unavailable — falling back to extract")
+                    except Exception as page_err:
+                        self._meta_trace(f"yt-dlp: page HTML path failed: {page_err}")
+
+                if not page_ok:
+                    # Fallback race: flat titles + first-track cover extract
+                    race = {
+                        "info": None,
+                        "track_info": None,
+                        "thumbnail_url": None,
+                        "artist": None,
+                        "album": None,
+                        "year": None,
+                        "artist_from_metadata": None,
+                        "cover_shown": False,
+                    }
+                    race_lock = threading.Lock()
+
+                    def _artist_from_url_slug():
+                        try:
+                            from urllib.parse import urlparse
+                            import re
+                            parsed = urlparse(url)
+                            hostname = parsed.hostname or ""
+                            if ".bandcamp.com" not in hostname:
+                                return None
+                            subdomain = hostname.replace(".bandcamp.com", "")
+                            if "-" in subdomain:
+                                return " ".join(word.capitalize() for word in subdomain.split("-"))
+                            words = re.findall(r"[a-z]+|[A-Z][a-z]*", subdomain)
+                            if len(words) > 1:
+                                return " ".join(word.capitalize() for word in words)
+                            return subdomain.capitalize()
+                        except Exception:
+                            return None
+
+                    def _titles_worker():
+                        try:
+                            self._meta_trace("yt-dlp: fast flat extract…")
+                            flat_opts = dict(base_opts)
+                            flat_opts["extract_flat"] = True
+                            with ydl_mod.YoutubeDL(flat_opts) as ydl:
+                                flat_info = ydl.extract_info(url, download=False)
+                            a_meta = None
+                            a = None
+                            al = None
+                            y = None
+                            if flat_info:
+                                a_meta = (
+                                    flat_info.get("artist")
+                                    or flat_info.get("uploader")
+                                    or flat_info.get("channel")
+                                    or flat_info.get("creator")
+                                )
+                                a = a_meta or _artist_from_url_slug()
+                                al = flat_info.get("album") or flat_info.get("title")
+                                date = flat_info.get("release_date") or flat_info.get("upload_date")
+                                if date and len(str(date)) >= 4:
+                                    y = str(date)[:4]
+                            with race_lock:
+                                race["info"] = flat_info
+                                if a:
+                                    race["artist"] = a
+                                if al:
+                                    race["album"] = al
+                                if y:
+                                    race["year"] = y
+                                if a_meta:
+                                    race["artist_from_metadata"] = a_meta
+                            _apply_titles_now(a, al, y)
+                        except Exception as e:
+                            self._meta_trace(f"yt-dlp flat extract: {e}")
+
+                    def _cover_worker():
+                        try:
+                            self._meta_trace("yt-dlp: cover extract (first track only)…")
+                            cover_opts = dict(base_opts)
+                            cover_opts["extract_flat"] = False
+                            if "/album/" in (url or "").lower():
+                                cover_opts["playlist_items"] = "1"
+                            with ydl_mod.YoutubeDL(cover_opts) as cover_ydl:
+                                track_info = cover_ydl.extract_info(url, download=False)
+                            thumb = self._thumbnail_from_ytdlp_info(track_info)
+                            with race_lock:
+                                race["track_info"] = track_info
+                                race["thumbnail_url"] = thumb
+                                if track_info:
+                                    if not race.get("artist_from_metadata"):
+                                        am = (
+                                            track_info.get("artist")
+                                            or track_info.get("uploader")
+                                            or track_info.get("creator")
+                                        )
+                                        if am:
+                                            race["artist_from_metadata"] = am
+                                            race["artist"] = am
+                                    if not race.get("album"):
+                                        race["album"] = track_info.get("album") or race.get("album")
+                                    if not race.get("year"):
+                                        d = track_info.get("release_date") or track_info.get("upload_date")
+                                        if d and len(str(d)) >= 4:
+                                            race["year"] = str(d)[:4]
+                            if thumb:
+                                self._meta_trace(f"yt-dlp: cover OK → {thumb}")
+                                self._display_preview_artwork(url, thumb)
+                                with race_lock:
+                                    race["cover_shown"] = True
+                            else:
+                                self._meta_trace("yt-dlp: no cover URL in extract result")
+                            with race_lock:
+                                a, al, y = race.get("artist"), race.get("album"), race.get("year")
+                            if a or al:
+                                _apply_titles_now(a, al, y)
+                        except Exception as art_err:
+                            self._meta_trace(f"yt-dlp: cover extract failed: {art_err}")
+
+                    t_titles = threading.Thread(target=_titles_worker, daemon=True)
+                    t_cover = threading.Thread(target=_cover_worker, daemon=True)
+                    t_titles.start()
+                    t_cover.start()
+                    t_titles.join(timeout=60)
+                    t_cover.join(timeout=60)
+
+                    with race_lock:
+                        info = race.get("info") or race.get("track_info") or {}
+                        thumbnail_url = race.get("thumbnail_url")
+                        artist = race.get("artist")
+                        album = race.get("album")
+                        year = race.get("year")
+                        artist_from_metadata = race.get("artist_from_metadata")
+                        cover_shown = bool(race.get("cover_shown"))
+
+                    if not thumbnail_url and info:
+                        thumbnail_url = self._thumbnail_from_ytdlp_info(info)
+
                     if not thumbnail_url:
-                        # Try thumbnails list first (may have multiple sizes)
-                        if info.get("thumbnails"):
-                            thumbnail_url = get_largest_thumbnail(info.get("thumbnails"))
-                        # Fallback to direct fields
-                        if not thumbnail_url:
-                            thumbnail_url = (info.get("thumbnail") or 
-                                           info.get("thumbnail_url") or
-                                           info.get("artwork_url") or
-                                           info.get("cover"))
-                    
-                    # Extract track titles and numbers from entries if available
-                    first_track_title = None
-                    first_track_number = None
-                    track_titles = []  # Store multiple track titles for split album detection
-                    album_artist_from_ytdlp = None  # Album artist from yt-dlp metadata
-                    
+                        self._meta_trace("yt-dlp: no cover URL in extract result")
+
+                    if info is None:
+                        info = {}
+
+                    # Track titles from flat entries when page path was unavailable
                     if info.get("entries"):
-                        entries = [e for e in info.get("entries", []) if e]  # Filter out None
+                        entries = [e for e in info.get("entries", []) if e]
                         if entries:
                             first_entry = entries[0]
-                            # Get track title
                             raw_title = first_entry.get("title", "")
                             if raw_title:
-                                # Get artist for title cleaning
                                 entry_artist = first_entry.get("artist") or first_entry.get("uploader") or first_entry.get("creator") or artist
                                 first_track_title = self._clean_title(raw_title, entry_artist)
-                                # Store raw title (before cleaning) for split album detection
                                 track_titles.append(raw_title)
-                            
-                            # Get track number (yt-dlp uses "track_number" or "track")
                             first_track_number = first_entry.get("track_number") or first_entry.get("track")
                             if first_track_number:
                                 try:
-                                    # Handle formats like "3/10" or just "3"
                                     if isinstance(first_track_number, str):
                                         import re
                                         track_match = re.search(r'(\d+)', str(first_track_number))
-                                        if track_match:
-                                            first_track_number = int(track_match.group(1))
-                                        else:
-                                            first_track_number = None
+                                        first_track_number = int(track_match.group(1)) if track_match else None
                                     elif isinstance(first_track_number, (int, float)):
                                         first_track_number = int(first_track_number)
                                     else:
                                         first_track_number = None
                                 except (ValueError, TypeError):
                                     first_track_number = None
-                            
-                            # If extract_flat mode didn't provide track title, try extracting first track URL with full extraction
-                            if not first_track_title and first_entry.get("url"):
-                                try:
-                                    # Do a quick full extraction of just the first track to get its title
-                                    track_url = first_entry.get("url")
-                                    if track_url:
-                                        track_ydl_opts = {
-                                            "quiet": True,
-                                            "no_warnings": True,
-                                            "extract_flat": False,  # Full extraction to get track title
-                                            "socket_timeout": 20,  # Shorter timeout for single track
-                                            "retries": 3,
-                                            "fragment_retries": 3,
-                                            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                            "referer": "https://bandcamp.com/",
-                                        }
-                                        yt_dlp = self._ensure_ytdlp_loaded()
-                                        with yt_dlp.YoutubeDL(track_ydl_opts) as track_ydl:
-                                            track_info = track_ydl.extract_info(track_url, download=False)
-                                            if track_info:
-                                                raw_title = track_info.get("title", "")
-                                                if raw_title:
-                                                    entry_artist = track_info.get("artist") or track_info.get("uploader") or track_info.get("creator") or artist
-                                                    first_track_title = self._clean_title(raw_title, entry_artist)
-                                                    track_titles.append(raw_title)
-                                                    
-                                                    # Also get track number if available
-                                                    if not first_track_number:
-                                                        first_track_number = track_info.get("track_number") or track_info.get("track")
-                                                        if first_track_number:
-                                                            try:
-                                                                if isinstance(first_track_number, str):
-                                                                    import re
-                                                                    track_match = re.search(r'(\d+)', str(first_track_number))
-                                                                    if track_match:
-                                                                        first_track_number = int(track_match.group(1))
-                                                                    else:
-                                                                        first_track_number = None
-                                                                elif isinstance(first_track_number, (int, float)):
-                                                                    first_track_number = int(first_track_number)
-                                                                else:
-                                                                    first_track_number = None
-                                                            except (ValueError, TypeError):
-                                                                first_track_number = None
-                                except Exception:
-                                    # Silently fail - track title extraction is optional for preview
-                                    pass
-                            
-                            # Extract additional track titles (up to 3) for better split album detection
-                            for entry in entries[1:4]:  # Check next 3 tracks
+                            for entry in entries[1:4]:
                                 raw_title = entry.get("title", "")
                                 if raw_title:
                                     track_titles.append(raw_title)
-                    
-                    # Get album_artist from top-level info (if available)
-                    album_artist_from_ytdlp = (info.get("album_artist") or 
-                                             info.get("albumartist") or
-                                             info.get("artist") or  # Fallback to main artist
-                                             artist)
+
+                # Compatibility shim: keep one indented block for the apply/display logic below
+                if True:
+                    album_artist_from_ytdlp = (
+                        (info.get("album_artist") if isinstance(info, dict) else None)
+                        or (info.get("albumartist") if isinstance(info, dict) else None)
+                        or (info.get("artist") if isinstance(info, dict) else None)
+                        or artist
+                    )
                     
                     # Update album info (keep "Track" as placeholder) - preserve HTML extraction results
                     # Only update artist/album if:
@@ -13619,8 +15119,8 @@ class BandcampDownloaderGUI:
                         final_album_artist = existing_album_artist or album_artist_from_ytdlp
                         
                         # Always update preview, even for duplicate URLs, to ensure it shows the latest URL
-                        # Check if this URL is still the current one being processed (might have changed if user pasted another URL)
-                        if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
+                        # Compare normalized URLs (raw string equality often failed after paste/normalize)
+                        if self._is_focused_release_url(url):
                             self.album_info = {
                                 "artist": final_artist,
                                 "album": final_album,
@@ -13634,6 +15134,11 @@ class BandcampDownloaderGUI:
                             }
                             
                             self.root.after(0, self.update_preview)
+                            if _bandcamp_fetch is not None:
+                                try:
+                                    _bandcamp_fetch.bandcamp_clear_challenge_backoff()
+                                except Exception:
+                                    pass
                         # Also update Additional Settings dialog preview if open
                         if hasattr(self, '_additional_settings_dialogs'):
                             for dialog_ref in self._additional_settings_dialogs:
@@ -13646,181 +15151,97 @@ class BandcampDownloaderGUI:
                         # Don't update tags when yt-dlp metadata arrives - tags should only use HTML extraction (stage 1)
                         # This prevents tag updates from overriding other URLs that were pasted
                     
-                    # Store thumbnail URL if found (will be used by artwork list system)
-                    # Don't display directly - let the artwork list system handle it
-                    # Only update if this URL is still the current one being processed
-                    if thumbnail_url and hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
-                        self.current_thumbnail_url = thumbnail_url
-                        # Build artwork list and display if not already built
-                        if not self.artwork_list:
-                            self._build_artwork_list()
-                            if self.artwork_list:
-                                # Double-check URL is still current before displaying (race condition protection)
-                                def display_artwork():
-                                    if hasattr(self, 'current_url_being_processed') and self.current_url_being_processed == url:
-                                        self._display_artwork_at_index(0)
-                                self.root.after(0, display_artwork)
-                    
-                    # Try to detect format from first track (if entries available)
-                    detected_format = None
-                    if info.get("entries"):
-                        entries = [e for e in info.get("entries", []) if e]
-                        if entries:
-                            first_entry = entries[0]
-                            # With extract_flat, we might not have format info, so try to get it
-                            # Check if we have format info in the entry
-                            if first_entry.get("ext") or first_entry.get("acodec") or first_entry.get("container"):
-                                ext = first_entry.get("ext") or ""
-                                acodec = first_entry.get("acodec") or ""
-                                container = first_entry.get("container") or ""
-                                
-                                # Determine format
-                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
-                                    detected_format = "m4a"
-                                elif ext == "flac" or acodec == "flac":
-                                    detected_format = "flac"
-                                elif ext == "ogg" or acodec == "vorbis":
-                                    detected_format = "ogg"
-                                elif ext == "wav" or acodec == "pcm":
-                                    detected_format = "wav"
-                                elif ext == "mp3" or acodec == "mp3":
-                                    detected_format = "mp3"
-                            
-                            # If we don't have format info (extract_flat mode), do a quick extraction for first track
-                            if not detected_format and first_entry.get("url"):
-                                try:
-                                    track_url = first_entry.get("url")
-                                    if track_url:
-                                        # Quick format detection extraction
-                                        # Enhanced options for restricted networks
-                                        format_ydl_opts = {
-                                            "quiet": True,
-                                            "no_warnings": True,
-                                            "extract_flat": False,
-                                            "socket_timeout": 30,
-                                            "retries": 5,
-                                            "fragment_retries": 5,
-                                            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                            "referer": "https://bandcamp.com/",
-                                        }
-                                        # Ensure yt-dlp is loaded (lazy import)
-                                        yt_dlp = self._ensure_ytdlp_loaded()
-                                        with yt_dlp.YoutubeDL(format_ydl_opts) as format_ydl:
-                                            track_info = format_ydl.extract_info(track_url, download=False)
-                                            if track_info:
-                                                ext = track_info.get("ext") or ""
-                                                acodec = track_info.get("acodec") or ""
-                                                container = track_info.get("container") or ""
-                                                
-                                                # Determine format
-                                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
-                                                    detected_format = "m4a"
-                                                elif ext == "flac" or acodec == "flac":
-                                                    detected_format = "flac"
-                                                elif ext == "ogg" or acodec == "vorbis":
-                                                    detected_format = "ogg"
-                                                elif ext == "wav" or acodec == "pcm":
-                                                    detected_format = "wav"
-                                                elif ext == "mp3" or acodec == "mp3":
-                                                    detected_format = "mp3"
-                                except Exception as e:
-                                    # Log format detection failure for debugging (but don't show to user)
-                                    pass  # Silently fail format detection - will try again during download
-                            
-                            # Also try to get format from the album-level info if available
-                            if not detected_format and info:
-                                # Check if format info is available at album level
-                                ext = info.get("ext") or ""
-                                acodec = info.get("acodec") or ""
-                                container = info.get("container") or ""
-                                
-                                if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
-                                    detected_format = "m4a"
-                                elif ext == "flac" or acodec == "flac":
-                                    detected_format = "flac"
-                                elif ext == "ogg" or acodec == "vorbis":
-                                    detected_format = "ogg"
-                                elif ext == "wav" or acodec == "pcm":
-                                    detected_format = "wav"
-                                elif ext == "mp3" or acodec == "mp3":
-                                    detected_format = "mp3"
-                    
-                    # Update album_info with detected format
-                    if detected_format:
-                        self.album_info["detected_format"] = detected_format
-                        # Update preview to show detected format extension
-                        self.root.after(0, self.update_preview)
-                        # If format is not MP3, suggest Original format
-                        if detected_format != "mp3":
-                            self.root.after(0, lambda fmt=detected_format: self._suggest_format_for_detected(fmt))
+                    # Display cover via bcbits CDN (Player-style) — works even when HTML is challenged
+                    if thumbnail_url:
+                        if not cover_shown:
+                            self._meta_trace("yt-dlp: displaying cover in preview panel…")
+                            self._display_preview_artwork(url, thumbnail_url)
+                        # Remember art_id so later API/tralbum paths can rebuild the CDN URL
+                        if _bandcamp_fetch is not None:
+                            art_id = _bandcamp_fetch.art_id_from_bcbits_url(thumbnail_url)
+                            if art_id:
+                                key = self._normalize_release_url_key(url)
+                                if key:
+                                    cache = self.url_metadata_cache.setdefault(key, {})
+                                    cache["art_id"] = art_id
+                                    # Store download-tier URL for later embeds; preview uses small tier
+                                    hi = _bandcamp_fetch.upgrade_bcbits_art_url(
+                                        thumbnail_url,
+                                        prefer_fmt=getattr(_bandcamp_fetch, "BCBITS_DOWNLOAD_FMT", 10),
+                                    )
+                                    cache["thumbnail_url"] = hi or thumbnail_url
+                                self._remember_tralbum_ids(
+                                    url,
+                                    {},
+                                    extras={
+                                        "art_id": art_id,
+                                        "artist": artist,
+                                        "album": album,
+                                        "year": year,
+                                        "first_track_title": first_track_title,
+                                        "album_artist": album_artist_from_ytdlp or artist,
+                                    },
+                                )
                     else:
-                        # If format still not detected, try a full extraction of the album URL as fallback
-                        # This is more reliable than extracting individual tracks
-                        try:
-                            full_extract_opts = {
-                                "quiet": True,
-                                "no_warnings": True,
-                                "extract_flat": False,  # Full extraction
-                                "socket_timeout": 30,
-                                "retries": 3,
-                                "fragment_retries": 3,
-                                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                "referer": "https://bandcamp.com/",
-                            }
-                            # Ensure yt-dlp is loaded (lazy import)
-                            yt_dlp = self._ensure_ytdlp_loaded()
-                            with yt_dlp.YoutubeDL(full_extract_opts) as full_ydl:
-                                full_info = full_ydl.extract_info(url, download=False)
-                                if full_info:
-                                    # Try to get format from first entry
-                                    if full_info.get("entries"):
-                                        entries = [e for e in full_info.get("entries", []) if e]
-                                        if entries:
-                                            first_entry = entries[0]
-                                            ext = first_entry.get("ext") or ""
-                                            acodec = first_entry.get("acodec") or ""
-                                            container = first_entry.get("container") or ""
-                                            
-                                            # Determine format
-                                            if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
-                                                detected_format = "m4a"
-                                            elif ext == "flac" or acodec == "flac":
-                                                detected_format = "flac"
-                                            elif ext == "ogg" or acodec == "vorbis":
-                                                detected_format = "ogg"
-                                            elif ext == "wav" or acodec == "pcm":
-                                                detected_format = "wav"
-                                            elif ext == "mp3" or acodec == "mp3":
-                                                detected_format = "mp3"
-                                    
-                                    # If still not found, try album-level
-                                    if not detected_format:
-                                        ext = full_info.get("ext") or ""
-                                        acodec = full_info.get("acodec") or ""
-                                        container = full_info.get("container") or ""
-                                        
-                                        if ext in ["m4a", "mp4"] or acodec in ["alac", "aac"] or container in ["m4a", "mp4"]:
-                                            detected_format = "m4a"
-                                        elif ext == "flac" or acodec == "flac":
-                                            detected_format = "flac"
-                                        elif ext == "ogg" or acodec == "vorbis":
-                                            detected_format = "ogg"
-                                        elif ext == "wav" or acodec == "pcm":
-                                            detected_format = "wav"
-                                        elif ext == "mp3" or acodec == "mp3":
-                                            detected_format = "mp3"
-                                    
-                                    # Update if format was detected
-                                    if detected_format:
-                                        self.album_info["detected_format"] = detected_format
-                                        self.root.after(0, self.update_preview)
-                        except Exception:
-                            pass  # Silently fail - format detection is optional
-            except Exception:
-                pass  # Silently fail - HTML extraction is primary method
+                        self._meta_trace("yt-dlp: skipping cover display (no URL)")
+                    
+                    # Skip format-detection network calls here — download path handles that.
+                    # (Keeps paste→preview/art snappy under challenge.)
+                    self._meta_trace(
+                        f"yt-dlp: done (artist={artist!r}, album={album!r}, cover={'yes' if thumbnail_url else 'no'})"
+                    )
+            except Exception as e:
+                self._meta_trace(
+                    f"yt-dlp fallback FAILED: {type(e).__name__}: {e}",
+                    user_visible=True,
+                )
         
-        # Start with fast HTML extraction
-        threading.Thread(target=fetch_from_html, daemon=True).start()
+        # Race: start yt-dlp immediately (works under challenge) — never wait on challenged HTML first
+        def _run_metadata_fetch():
+            try:
+                prefer_ytdlp = bool(getattr(self, "_prefer_ytdlp_metadata", False))
+                challenged = bool(
+                    _bandcamp_fetch is not None
+                    and _bandcamp_fetch.bandcamp_challenge_remaining_sec() > 0
+                )
+                mode = "yt-dlp-first" if (prefer_ytdlp or challenged) else "racing yt-dlp + tralbum"
+                self._meta_trace(f"resolving {url} ({mode})")
+
+                ytdlp_done = threading.Event()
+
+                def _ytdlp_worker():
+                    try:
+                        fetch_from_ytdlp()
+                    finally:
+                        ytdlp_done.set()
+
+                # Working path first — do not wait for urllib/HTML challenge
+                threading.Thread(target=_ytdlp_worker, daemon=True).start()
+
+                # Parallel cheap tralbum/API (skip_html when session already knows wall is up)
+                try:
+                    outcome = self._try_tralbum_metadata_fetch(url)
+                    if outcome == "ok":
+                        self._meta_trace("tralbum/API OK (parallel with yt-dlp)")
+                except Exception as e:
+                    self._meta_trace(f"tralbum race: {e}")
+
+                # Legacy HTML scrape is skipped here: under challenge it only adds delay,
+                # and yt-dlp already owns titles + bcbits cover for the preview path.
+                ytdlp_done.wait(timeout=90)
+            except Exception as e:
+                self._meta_trace(
+                    f"metadata fetch FAILED: {type(e).__name__}: {e}",
+                    user_visible=True,
+                )
+            finally:
+                if fetch_key:
+                    try:
+                        self._metadata_fetch_inflight.discard(fetch_key)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_run_metadata_fetch, daemon=True).start()
     
     def _suggest_format_for_detected(self, detected_format):
         """Suggest Original format when a non-MP3 format is detected."""
@@ -13921,6 +15342,7 @@ class BandcampDownloaderGUI:
         self.current_bio_pic_url = None
         self.preloaded_album_art_image = None
         self.preloaded_album_art_pil = None
+        self._clear_focused_cover_pil()
     
     def _build_artwork_list(self, preserve_index=False):
         """Build unified artwork list: [album_art, *extra_artwork, bio_pic].
@@ -14403,7 +15825,9 @@ class BandcampDownloaderGUI:
         """Fetch thumbnail URL separately if not found with extract_flat (second attempt)."""
         def fetch():
             try:
-                if yt_dlp is None:
+                ydl_mod = self._ensure_ytdlp_loaded()
+                if ydl_mod is None:
+                    self._meta_trace("yt-dlp unavailable for cover fallback", user_visible=True)
                     return
                 
                 # Quick extraction without extract_flat to get thumbnail
@@ -14419,46 +15843,19 @@ class BandcampDownloaderGUI:
                     "referer": "https://bandcamp.com/",
                 }
                 
-                # Ensure yt-dlp is loaded (lazy import)
-                yt_dlp = self._ensure_ytdlp_loaded()
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                self._meta_trace("yt-dlp: separate cover fetch…")
+                with ydl_mod.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                     
                     if info:
-                        # Try to get thumbnail from various locations
-                        thumbnail_url = (info.get("thumbnail") or 
-                                       info.get("thumbnail_url") or
-                                       info.get("artwork_url") or
-                                       info.get("cover"))
+                        thumbnail_url = self._thumbnail_from_ytdlp_info(info)
                         
-                        # Try thumbnails list
-                        if not thumbnail_url and info.get("thumbnails"):
-                            thumbnails = info.get("thumbnails", [])
-                            if thumbnails:
-                                if isinstance(thumbnails[0], dict):
-                                    thumbnail_url = thumbnails[0].get("url")
-                                elif isinstance(thumbnails[0], str):
-                                    thumbnail_url = thumbnails[0]
-                        
-                        # Try first entry if still not found
-                        if not thumbnail_url and info.get("entries"):
-                            entries = [e for e in info.get("entries", []) if e]
-                            if entries and entries[0]:
-                                entry = entries[0]
-                                thumbnail_url = (entry.get("thumbnail") or 
-                                               entry.get("thumbnail_url") or
-                                               entry.get("artwork_url") or
-                                               entry.get("cover"))
-                        
-                        # If found, store it and use artwork list system (only if not already fetching)
-                        # Skip artwork updates during download (keep current download artwork visible)
-                        if thumbnail_url and not self.album_art_fetching and not self._is_downloading():
-                            self.current_thumbnail_url = thumbnail_url
-                            # Build artwork list and display if not already built
-                            if not self.artwork_list:
-                                self._build_artwork_list()
-                                if self.artwork_list:
-                                    self.root.after(0, lambda: self._display_artwork_at_index(0))
+                        # If found, store it and use artwork list system
+                        if thumbnail_url and not self._is_downloading():
+                            self._meta_trace(f"yt-dlp: separate cover OK → {thumbnail_url}")
+                            self._display_preview_artwork(url, thumbnail_url)
+                        else:
+                            self._meta_trace("yt-dlp: separate cover fetch found no URL")
                         
                         # Also detect format from this full extraction (since we have full info here)
                         # This is a good fallback if format wasn't detected earlier
@@ -14506,8 +15903,11 @@ class BandcampDownloaderGUI:
                             if detected_format:
                                 self.album_info["detected_format"] = detected_format
                                 self.root.after(0, self.update_preview)
-            except Exception:
-                pass  # Silently fail - thumbnail is optional
+            except Exception as e:
+                self._meta_trace(
+                    f"separate cover fetch FAILED: {type(e).__name__}: {e}",
+                    user_visible=True,
+                )
         
         threading.Thread(target=fetch, daemon=True).start()
     
@@ -14833,11 +16233,14 @@ class BandcampDownloaderGUI:
                 # Ensure PIL is loaded (lazy import)
                 Image, ImageTk = self._ensure_pil_loaded()
                 if Image is None or ImageTk is None:
+                    self._meta_trace("PIL/Pillow not available — cannot display album art")
                     self.root.after(0, lambda: self.log("Error: PIL/Pillow not available for album art display"))
                     return
                 
-                # Download the image with retry logic
+                # Download the image with retry logic (bcbits CDN — usually not challenged)
+                self._meta_trace(f"downloading cover bytes: {thumbnail_url}")
                 image_data = self._fetch_with_retry(thumbnail_url, max_retries=3, timeout=15)
+                self._meta_trace(f"cover bytes OK ({len(image_data)} bytes)")
                 
                 # Check if this fetch was cancelled during download
                 if fetch_id != self.artwork_fetch_id:
@@ -14897,6 +16300,9 @@ class BandcampDownloaderGUI:
                     
                     # Keep references to prevent garbage collection
                     self.album_art_image = photo
+                    self.preloaded_album_art_pil = img
+                    # Focused-release cover only (not bio / extras) → cover-art theme palette
+                    self._set_focused_cover_pil(img, thumbnail_url)
                     if blurred_bg:
                         # Store blurred background reference (will be replaced on next update)
                         if not hasattr(self, '_blurred_bg_image'):
@@ -14985,6 +16391,7 @@ class BandcampDownloaderGUI:
                     if self.album_art_mode in ["hidden", "album_art"] and not self._is_url_field_empty():
                         self.preloaded_album_art_image = photo
                         self.preloaded_album_art_pil = img  # Store PIL Image for blur effect
+                        self._set_focused_cover_pil(img, thumbnail_url)
                         # Keep a reference to prevent garbage collection
                         # We'll transfer this to album_art_image when displaying
                 
@@ -15250,6 +16657,9 @@ class BandcampDownloaderGUI:
     
     def update_preview(self):
         """Update the folder structure preview."""
+        # Guard: folder/path traces can fire during setup before preview_var exists
+        if not hasattr(self, "preview_var"):
+            return
         path = self.path_var.get().strip()
         choice = self._extract_structure_choice(self.folder_structure_var.get())
         
@@ -18442,26 +19852,44 @@ class BandcampDownloaderGUI:
             Tuple of (is_split_album, unique_artists_dict)
             - is_split_album: Boolean indicating if split album detected
             - unique_artists_dict: Dict mapping file paths to their track artists
+
+        Note: Soundtrack-style names ``AlbumArtist - Game - Song`` are NOT split albums
+        when every file shares the same first segment (the album artist).
         """
         unique_artists = {}
         track_artists = set()
+        label_parts = set()
         
         for audio_file in files_to_process:
             file_title = audio_file.stem
-            extracted_track_artist = None
-            
-            # Extract track artist from filename if it follows "Label - Track Artist - Track Title" pattern
             parts = file_title.split(" - ")
             if len(parts) >= 3:
+                label = parts[0].strip()
                 extracted_track_artist = parts[1].strip()
+                if label:
+                    label_parts.add(label.lower())
                 if extracted_track_artist and extracted_track_artist != "Artist":
                     unique_artists[audio_file] = extracted_track_artist
                     track_artists.add(extracted_track_artist)
         
-        # Check if we have multiple distinct track artists
-        is_split_album = len(track_artists) > 1
+        # Multiple mid-segments alone is not enough — soundtrack covers use
+        # "Artist - Game - Track" with a shared album artist as the first segment.
+        if len(track_artists) <= 1:
+            return False, unique_artists
+        if len(label_parts) == 1:
+            album_artist = None
+            try:
+                album_artist = (self.album_info_stored or {}).get("artist") or (self.album_info_stored or {}).get("album_artist")
+            except Exception:
+                album_artist = None
+            shared_label = next(iter(label_parts))
+            if album_artist and shared_label == str(album_artist).strip().lower():
+                return False, {}
+            # Even without album_info: one shared label + many "games" ⇒ soundtrack, not split
+            if len(files_to_process) >= 3 and len(unique_artists) >= max(3, len(files_to_process) // 2):
+                return False, {}
         
-        return is_split_album, unique_artists
+        return True, unique_artists
     
     def _format_split_album_artist(self, track_artist, all_track_artists, setting=None):
         """Format artist name based on split album display setting.
@@ -18530,61 +19958,69 @@ class BandcampDownloaderGUI:
         file_title = audio_file.stem
         
         # Extract track artist and label from filename
-        # Pattern 1: "Label - Track Artist - Track Title" (3+ parts) - split albums
+        # Pattern 1: "Label - Track Artist - Track Title" (3+ parts) - true split albums
+        # Pattern 1b: "AlbumArtist - Game - Song" (3+ parts) - soundtrack covers (NOT split)
         # Pattern 2: "Artist - Track Title" (2 parts) - regular albums
         extracted_track_artist = None
         extracted_label_artist = None
         parts = file_title.split(" - ")
+        is_confirmed_split = bool(
+            split_album_info
+            and (
+                (len(split_album_info) >= 1 and split_album_info[0])
+            )
+        )
+        soundtrack_style = False
         if len(parts) >= 3:
-            # First part is label, second part is track artist, rest is title
             extracted_label_artist = parts[0].strip()
             extracted_track_artist = parts[1].strip()
             if not extracted_track_artist or extracted_track_artist == "Artist":
                 extracted_track_artist = None
             if not extracted_label_artist or extracted_label_artist == "Artist":
                 extracted_label_artist = None
+            # Soundtrack when not a detected split: keep game in the title, album artist as artist
+            soundtrack_style = bool(extracted_label_artist and extracted_track_artist and not is_confirmed_split)
         elif len(parts) == 2:
-            # Regular album format: "Artist - Track Title"
-            # First part is the artist
             extracted_track_artist = parts[0].strip()
             if not extracted_track_artist or extracted_track_artist == "Artist":
                 extracted_track_artist = None
         
         # Try to get from download_info (if it exists)
         if hasattr(self, 'download_info') and self.download_info:
-            for title_key, info in self.download_info.items():
-                if file_title.lower() in title_key.lower() or title_key.lower() in file_title.lower():
-                    metadata = info.copy()
-                    # If we extracted a track artist from filename, prefer it over download_info artist
-                    # (especially if download_info has "Artist" placeholder or differs)
-                    if extracted_track_artist:
-                        if not metadata.get("artist") or metadata.get("artist") == "Artist" or extracted_track_artist != metadata.get("artist"):
-                            metadata["artist"] = extracted_track_artist
-                    break
+            matched = self._match_download_info_for_file(file_title)
+            if matched:
+                metadata = matched.copy()
         
-        # If we extracted track artist but don't have metadata yet, or metadata has placeholder, use extracted artist
-        if extracted_track_artist:
-            if not metadata:
-                metadata = {}
+        # Album / label artist for templates
+        stored = getattr(self, "album_info_stored", None) or {}
+        if stored:
+            for k, v in stored.items():
+                if v not in (None, "") and k not in metadata:
+                    metadata[k] = v
+            # Always prefer stored album artist when present
+            if stored.get("album_artist") or stored.get("artist"):
+                if not metadata.get("album_artist"):
+                    metadata["album_artist"] = stored.get("album_artist") or stored.get("artist")
+
+        if soundtrack_style:
+            # "Super Guitar Bros - Castlevania IV - Simon's Theme"
+            # → artist=Super Guitar Bros, title=Castlevania IV - Simon's Theme
+            metadata["artist"] = (
+                metadata.get("album_artist")
+                or stored.get("album_artist")
+                or stored.get("artist")
+                or extracted_label_artist
+            )
+            # Prefer the Game - Song portion as the track title when the stem matches
+            soundtrack_title = " - ".join(parts[1:]).strip()
+            if soundtrack_title:
+                track_title = soundtrack_title
+        elif extracted_track_artist and not soundtrack_style:
+            # 2-part "Artist - Title" or true split mid-segment
             if not metadata.get("artist") or metadata.get("artist") == "Artist":
                 metadata["artist"] = extracted_track_artist
-        
-        # Try to get from album_info_stored
-        if not metadata and hasattr(self, 'album_info_stored') and self.album_info_stored:
-            metadata.update(self.album_info_stored)
-            # If we extracted track artist, use it instead of album artist
-            if extracted_track_artist:
+            elif is_confirmed_split:
                 metadata["artist"] = extracted_track_artist
-        elif hasattr(self, 'album_info_stored') and self.album_info_stored:
-            # Merge album_info_stored but preserve extracted track artist if we have it
-            if extracted_track_artist:
-                # Save extracted artist before merging
-                track_artist = extracted_track_artist
-                metadata.update(self.album_info_stored)
-                # Restore extracted track artist (don't overwrite with label artist)
-                metadata["artist"] = track_artist
-            else:
-                metadata.update(self.album_info_stored)
         
         # Try to get from directory structure
         if not metadata.get("artist") or not metadata.get("album"):
@@ -18665,6 +20101,19 @@ class BandcampDownloaderGUI:
             except:
                 pass
         
+        # Prefer album artist for "Artist - Track" templates (not a mid-segment game name)
+        album_artist_name = (
+            metadata.get("album_artist")
+            or stored.get("album_artist")
+            or stored.get("artist")
+            or extracted_label_artist
+            or metadata.get("artist")
+        )
+        # Strip leading album-artist prefix only (keep "Game - Song" soundtrack titles intact)
+        track_title = self._clean_title(track_title, album_artist_name)
+        if soundtrack_style and album_artist_name:
+            metadata["artist"] = album_artist_name
+
         # Add title to metadata
         metadata["title"] = track_title
         
@@ -18722,8 +20171,27 @@ class BandcampDownloaderGUI:
                     elif re.match(r'^1\s', template):
                         track_prefix = f"{track_number} "
                     
+                    # Avoid "Game - Game - Song" when title already includes the track-artist/game prefix
+                    # (normalize fullwidth colons etc. so "Clair Obscur：" matches "Clair Obscur:")
+                    title_for_name = track_title
+                    def _norm_prefix(s):
+                        return (
+                            str(s or "")
+                            .replace("\uff1a", ":")
+                            .replace("\u2215", "/")
+                            .replace("\uff0f", "/")
+                            .strip()
+                            .lower()
+                        )
+                    prefix = f"{current_track_artist} - "
+                    if _norm_prefix(title_for_name).startswith(_norm_prefix(prefix)):
+                        # Slice using original length of prefix on a colon-normalized copy
+                        norm_title = title_for_name.replace("\uff1a", ":")
+                        norm_prefix_str = prefix.replace("\uff1a", ":")
+                        if norm_title.lower().startswith(norm_prefix_str.lower()):
+                            title_for_name = title_for_name[len(prefix):].strip() or track_title
                     # Return Bandcamp default format with optional track prefix: "01. Label - Track Artist - Track Title"
-                    return f"{track_prefix}{self.sanitize_filename(label_artist)} - {self.sanitize_filename(current_track_artist)} - {self.sanitize_filename(track_title)}"
+                    return f"{track_prefix}{self.sanitize_filename(label_artist)} - {self.sanitize_filename(current_track_artist)} - {self.sanitize_filename(title_for_name)}"
                 
                 # For other settings, format the artist and apply to template
                 if current_track_artist:
@@ -19093,7 +20561,11 @@ class BandcampDownloaderGUI:
                     if new_path != audio_file and not new_path.exists():
                         try:
                             audio_file.rename(new_path)
-                            self.root.after(0, lambda old=audio_file.name, new=new_name: self.log(f"Renamed: {old} → {new_name}"))
+                            # Bind both names in defaults — do not close over loop vars
+                            self.root.after(
+                                0,
+                                lambda old=audio_file.name, new=new_name: self.log(f"Renamed: {old} → {new}"),
+                            )
                         except Exception as e:
                             self.root.after(0, lambda name=audio_file.name: self.log(f"⚠ Could not rename: {name}"))
         except Exception as e:
@@ -19872,6 +21344,18 @@ class BandcampDownloaderGUI:
                         metadata = self.url_tag_metadata_cache[key]
                         if 'bio_pic_url' in metadata or 'bio_pic' in metadata:
                             self.log(f"DEBUG: Found bio_pic in cache for key: {key[:60]}...")
+
+            # Last chance for singles: Player-style resolve from current track / artist root
+            if not bio_pic_url and download_bio_pic and getattr(self, "is_singles_download", False):
+                resolve_from = (
+                    getattr(self, "current_url_being_processed", None)
+                    or (self.album_info.get("url") if getattr(self, "album_info", None) else None)
+                )
+                if resolve_from:
+                    self.log("Bio pic missing — trying artist root fallback...")
+                    bio_pic_url = self._resolve_and_cache_bio_pic(
+                        resolve_from, set_current=True, log_result=True
+                    )
             
             # Process each directory (album folder) separately
             for album_dir in directories_to_process:
@@ -21010,6 +22494,93 @@ class BandcampDownloaderGUI:
         """Check if a metadata dict represents a single track (no album or album is NA)."""
         album = metadata.get("album")
         return not album or album == "NA" or album.strip() == ""
+
+    def _url_is_track_release(self, url):
+        """True when URL is a Bandcamp /track/ page (a single), not an album."""
+        if not url:
+            return False
+        parsed = self._parse_bandcamp_url(url)
+        if parsed and len(parsed) >= 3 and parsed[2] == "track":
+            return True
+        return "/track/" in str(url).lower()
+
+    def _upgrade_bio_pic_url_quality(self, bio_pic_url):
+        """Prefer a larger bcbits size when the thumbnail is tiny (_16/_32/…)."""
+        if not bio_pic_url or ("_" not in bio_pic_url and "bcbits.com" not in bio_pic_url.lower()):
+            return bio_pic_url
+        for size in ["_500", "_300", "_200", "_100", "_64"]:
+            if size in bio_pic_url:
+                return bio_pic_url
+            test_url = (
+                bio_pic_url.replace("_16", size)
+                .replace("_32", size)
+                .replace("_64", size)
+                .replace("_100", size)
+            )
+            if test_url != bio_pic_url:
+                return test_url
+        return bio_pic_url
+
+    def _resolve_and_cache_bio_pic(self, page_url, *, set_current=True, log_result=True):
+        """Resolve artist bio pic (Player path: page HTML → artist root) and cache it.
+
+        Returns the bio pic URL or None. Track pages often omit the photo; the artist
+        homepage usually has it.
+        """
+        if not page_url or _bandcamp_fetch is None:
+            return None
+        try:
+            ydl_mod = None
+            try:
+                ydl_mod = self._ensure_ytdlp_loaded()
+            except Exception:
+                ydl_mod = None
+            bio_pic_url = _bandcamp_fetch.resolve_artist_bio_image_url(
+                page_url,
+                timeout=12.0,
+                should_stop=self._bandcamp_should_stop,
+                ydl_mod=ydl_mod,
+            )
+            if not bio_pic_url:
+                if log_result and self.debug_mode:
+                    self.log(f"DEBUG: Bio pic not found for: {page_url[:60]}...")
+                return None
+            # Skip obvious album-art CDN paths
+            low = bio_pic_url.lower()
+            if "tralbum-art" in low or "album-art" in low:
+                return None
+            bio_pic_url = self._upgrade_bio_pic_url_quality(bio_pic_url)
+            normalized_url = self._normalize_url(page_url)
+            if normalized_url not in self.url_tag_metadata_cache:
+                self.url_tag_metadata_cache[normalized_url] = {}
+            self.url_tag_metadata_cache[normalized_url]["bio_pic_url"] = bio_pic_url
+            if set_current:
+                self.current_bio_pic_url = bio_pic_url
+            if log_result:
+                self.log(f"Bio pic found: ...{bio_pic_url[-48:]}")
+            return bio_pic_url
+        except Exception as e:
+            if log_result:
+                self.log(f"⚠ Error resolving bio pic: {e}")
+            return None
+
+    def _outtmpl_for_current_item(self):
+        """Output template; force Artist/Singles/… for track URLs (also in mixed batches)."""
+        tmpl = self.get_outtmpl()
+        if not getattr(self, "is_singles_download", False):
+            return tmpl
+        import re
+        # Folder album tag → Singles (avoid yt-dlp's NA placeholder)
+        tmpl = tmpl.replace("%(album)s", "Singles")
+        tmpl = tmpl.replace("%(album|)s", "Singles")
+        # "Singles (Year)" when year is missing becomes "Singles (NA)" — drop the empty year clause
+        tmpl = re.sub(
+            r"Singles\s*\(\s*%\((?:release_date|upload_date)[^)]*\)s\s*\)",
+            "Singles",
+            tmpl,
+        )
+        tmpl = re.sub(r"Singles\s*\(\s*\)", "Singles", tmpl)
+        return tmpl
     
     def verify_and_fix_mp3_metadata(self, download_path):
         """Verify MP3 files have metadata and fix missing ones."""
@@ -21107,22 +22678,13 @@ class BandcampDownloaderGUI:
                         continue
                 
                 if not (has_title and has_artist and has_album):
-                    # Try to find metadata from download_info
-                    # Match by filename
+                    # Try to find metadata from download_info (precise match — avoid substring false hits)
                     metadata = None
                     filename = mp3_file.stem
-                    filename_lower = filename.lower()
-                    
-                    # Try matching by title (download_info is keyed by title)
-                    for title_key, track_meta in self.download_info.items():
-                        # Check if filename matches title
-                        if filename_lower in title_key or title_key in filename_lower:
-                            metadata = track_meta.copy()
-                            break
-                        # Also check if track title contains filename
-                        if track_meta.get("title") and filename_lower in track_meta["title"].lower():
-                            metadata = track_meta.copy()
-                            break
+                    if hasattr(self, "download_info") and self.download_info:
+                        metadata = self._match_download_info_for_file(filename)
+                        if metadata:
+                            metadata = metadata.copy()
                     
                     # If not found, use album-level info and filename as title
                     if not metadata:
@@ -21169,7 +22731,7 @@ class BandcampDownloaderGUI:
             self.root.after(0, lambda: self.log(f"Error verifying MP3 metadata: {str(e)}"))
     
     def _rename_na_folders_to_singles(self, download_path):
-        """Rename 'NA' folders to 'Singles' for singles downloads.
+        """Rename 'NA' / 'NA (NA)' folders to 'Singles' for track downloads.
         
         Only renames folders that were created during the current download session.
         """
@@ -21178,12 +22740,23 @@ class BandcampDownloaderGUI:
                 self._log_debug("Skipping NA folder rename: not a singles download")
             return
         
+        def _is_na_folder_name(name):
+            n = (name or "").strip()
+            if n == "NA":
+                return True
+            # Custom "Album (Year)" with missing tags → "NA (NA)"
+            if n.upper().startswith("NA") and all(
+                part.strip().upper() in ("NA", "")
+                for part in n.replace("(", " ").replace(")", " ").split()
+            ):
+                return True
+            return False
+
         try:
             base_path = Path(download_path)
             if not base_path.exists():
                 return
             
-            # Find all "NA" folders - search recursively from download path
             na_folders = []
             
             # Method 1: Check folders that contain downloaded files (most accurate)
@@ -21192,64 +22765,55 @@ class BandcampDownloaderGUI:
                     try:
                         file_path = Path(downloaded_file)
                         if file_path.exists():
-                            # Check parent directory
                             parent = file_path.parent
-                            if parent.name == "NA":
-                                if parent not in na_folders:
-                                    na_folders.append(parent)
-                            # Check grandparent (for nested structures like Artist/NA/Track)
+                            if _is_na_folder_name(parent.name) and parent not in na_folders:
+                                na_folders.append(parent)
                             grandparent = parent.parent
-                            if grandparent.name == "NA":
-                                if grandparent not in na_folders:
-                                    na_folders.append(grandparent)
+                            if _is_na_folder_name(grandparent.name) and grandparent not in na_folders:
+                                na_folders.append(grandparent)
                     except Exception:
                         pass
             
-            # Method 2: Also search the download path directly for "NA" folders (fallback)
-            # This catches cases where downloaded_files might not be fully populated
+            # Method 2: Search download path for NA-like folders
             try:
-                for item in base_path.rglob("NA"):
-                    if item.is_dir() and item.name == "NA":
-                        # Only include if it contains audio files (to avoid false positives)
-                        audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
-                        has_audio = False
-                        for ext in audio_extensions:
-                            if list(item.glob(f"*{ext}")):
-                                has_audio = True
-                                break
-                        if has_audio and item not in na_folders:
-                            na_folders.append(item)
+                audio_extensions = [".mp3", ".flac", ".ogg", ".oga", ".wav", ".m4a", ".mp4", ".aac", ".mpa", ".opus"]
+                for item in base_path.rglob("*"):
+                    if not item.is_dir() or not _is_na_folder_name(item.name):
+                        continue
+                    has_audio = any(list(item.glob(f"*{ext}")) for ext in audio_extensions)
+                    if has_audio and item not in na_folders:
+                        na_folders.append(item)
             except Exception:
                 pass
             
-            # Rename each "NA" folder to "Singles"
+            # Rename each NA-like folder to Singles
             for na_folder in na_folders:
                 try:
-                    if na_folder.exists() and na_folder.name == "NA":
-                        singles_folder = na_folder.parent / "Singles"
-                        
-                        # If "Singles" folder already exists, merge contents
-                        if singles_folder.exists():
-                            # Move files from NA to Singles
-                            for item in na_folder.iterdir():
-                                try:
-                                    target = singles_folder / item.name
-                                    if target.exists():
-                                        # File exists - skip or handle conflict
-                                        continue
-                                    item.rename(target)
-                                except Exception:
-                                    pass
-                            # Remove empty NA folder
+                    if not na_folder.exists() or not _is_na_folder_name(na_folder.name):
+                        continue
+                    singles_folder = na_folder.parent / "Singles"
+                    old_name = na_folder.name
+                    
+                    if singles_folder.exists():
+                        for item in na_folder.iterdir():
                             try:
-                                if not any(na_folder.iterdir()):
-                                    na_folder.rmdir()
+                                target = singles_folder / item.name
+                                if target.exists():
+                                    continue
+                                item.rename(target)
                             except Exception:
                                 pass
-                        else:
-                            # Rename NA to Singles
-                            na_folder.rename(singles_folder)
-                            self.root.after(0, lambda: self.log(f"Renamed folder: NA → Singles"))
+                        try:
+                            if not any(na_folder.iterdir()):
+                                na_folder.rmdir()
+                        except Exception:
+                            pass
+                    else:
+                        na_folder.rename(singles_folder)
+                        self.root.after(
+                            0,
+                            lambda o=old_name: self.log(f"Renamed folder: {o} → Singles"),
+                        )
                 except Exception as e:
                     if self.debug_mode:
                         self._log_debug(f"Could not rename NA folder to Singles: {str(e)}")
@@ -21659,6 +23223,9 @@ class BandcampDownloaderGUI:
     def download_single_album(self, album_url, album_index=0, total_albums=0):
         """Download a single album (used for both single album and discography mode)."""
         try:
+            # Per-URL: track pages → Singles folder even when mixed with albums in a batch
+            self.is_singles_download = self._url_is_track_release(album_url)
+
             # Get format settings
             format_val = self.format_var.get()
             base_format = self._extract_format(format_val)
@@ -21764,14 +23331,18 @@ class BandcampDownloaderGUI:
                     return "Cancelled by user"
                 return None  # None means accept the entry
             
-            # Add album_artist to track metadata if setting is enabled
+            # Add album_artist / Singles album tag for folder templates
             def modifyinfo(info):
-                """Modify track info to add album_artist if setting is enabled."""
+                """Modify track info for folder templates and singles."""
                 if hasattr(self, 'prefer_album_artist_for_folders_var') and self.prefer_album_artist_for_folders_var.get():
                     album_artist = self.album_info.get("album_artist") if hasattr(self, 'album_info') else None
                     if album_artist:
-                        # Add album_artist to track metadata so it's available in outtmpl
                         info['album_artist'] = album_artist
+                if getattr(self, "is_singles_download", False):
+                    # Track pages often have empty/NA album — force Singles for paths + tags
+                    info["album"] = "Singles"
+                    if hasattr(self, "album_info") and isinstance(self.album_info, dict):
+                        self.album_info["album"] = "Singles"
                 return info
             
             # yt-dlp options
@@ -21791,7 +23362,7 @@ class BandcampDownloaderGUI:
             
             ydl_opts = {
                 "format": format_selector,
-                "outtmpl": self.get_outtmpl(),
+                "outtmpl": self._outtmpl_for_current_item(),
                 "ffmpeg_location": str(self.ffmpeg_path),
                 "writethumbnail": True,
                 "postprocessors": postprocessors,
@@ -21850,6 +23421,10 @@ class BandcampDownloaderGUI:
             # Phase 2: Full extraction for detailed metadata (slower, but user already sees progress)
             self.root.after(0, lambda: self.progress_var.set("Fetching album information..."))
             self.root.after(0, lambda: self.log("Fetching album information..."))
+            # Shared Bandcamp budget (Player-style): short capped wait before extract
+            # (client-challenge must not invent multi-minute pauses — yt-dlp often still works)
+            if not self._wait_for_bandcamp_budget(log_status=True, max_wait=20.0):
+                return False
             
             # Check if this is a track URL (single track, not album)
             is_track_url = False
@@ -21887,6 +23462,13 @@ class BandcampDownloaderGUI:
                             self.total_tracks = len(entries)
                             self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s)"))
                             self.root.after(0, lambda count=len(entries): self.progress_var.set(f"Found {count} track(s) - Fetching track data..."))
+                        # yt-dlp reached Bandcamp successfully — drop any stale urllib cooldown noise
+                        if self.total_tracks > 0 and _bandcamp_fetch is not None:
+                            try:
+                                _bandcamp_fetch.bandcamp_clear_rate_limit()
+                                _bandcamp_fetch.bandcamp_clear_challenge_backoff()
+                            except Exception:
+                                pass
             except Exception:
                 # If quick extraction fails, continue to full extraction
                 pass
@@ -22023,54 +23605,160 @@ class BandcampDownloaderGUI:
                 if not self.album_info_stored or not self.album_info_stored.get("artist") or not self.album_info_stored.get("album"):
                     self.album_info_stored = self.album_info_stored or {}
             
-            # Check if we found any tracks - if not, retry extraction once
+            # Check if we found any tracks - if not, retry with budget-aware backoff
             if self.total_tracks == 0:
                 self.root.after(0, lambda: self.log("DEBUG: No tracks found in initial extraction, retrying..."))
-                time.sleep(1.5)  # Brief delay before retry
-                
-                # Retry extraction
-                try:
-                    retry_opts = ydl_opts.copy()
-                    retry_opts["extract_flat"] = False
-                    retry_opts["quiet"] = True
-                    retry_opts["no_warnings"] = True
-                    retry_opts["socket_timeout"] = 15  # Longer timeout for retry
-                    retry_opts["retries"] = 5  # More retries for retry
+                # Prefer tralbum/API to distinguish challenge / rate-limit from a truly empty release
+                if _bandcamp_fetch is not None:
+                    try:
+                        key = self._normalize_release_url_key(album_url)
+                        cached_ids = self._tralbum_ids_cache.get(key) if key else None
+                        tri = _bandcamp_fetch.fetch_release_metadata(
+                            album_url,
+                            cached_ids=cached_ids,
+                            should_stop=self._bandcamp_should_stop,
+                        )
+                        if tri.get("ids"):
+                            self._remember_tralbum_ids(album_url, tri["ids"])
+                        if tri.get("status") in ("challenge", "rate_limited"):
+                            msg = tri.get("message") or tri.get("status")
+                            self.root.after(0, lambda m=msg: self.log(f"⚠ {m}"))
+                            _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                                should_stop=self._bandcamp_should_stop
+                            )
+                            if self._bandcamp_should_stop():
+                                return False
+                        elif tri.get("status") == "ok":
+                            meta = tri.get("metadata") or {}
+                            tc = int(meta.get("track_count") or 0)
+                            if tc > 0:
+                                self.total_tracks = tc
+                                self.root.after(
+                                    0,
+                                    lambda c=tc: self.log(
+                                        f"Found {c} track(s) via Bandcamp tralbum metadata"
+                                    ),
+                                )
+                                if meta.get("first_track_title"):
+                                    self.album_info_stored = self.album_info_stored or {}
+                                    self.album_info_stored.setdefault(
+                                        "artist", meta.get("artist")
+                                    )
+                                    self.album_info_stored.setdefault(
+                                        "album", meta.get("album")
+                                    )
+                    except Exception as e:
+                        self.root.after(
+                            0, lambda err=str(e): self.log(f"DEBUG: tralbum probe failed: {err}")
+                        )
+
+                if self.total_tracks == 0:
+                    self._wait_for_bandcamp_budget(log_status=True)
+                    time.sleep(1.5)  # Brief delay before retry
                     
-                    # Ensure yt-dlp is loaded (lazy import)
-                    yt_dlp = self._ensure_ytdlp_loaded()
-                    with yt_dlp.YoutubeDL(retry_opts) as retry_ydl:
-                        retry_info = retry_ydl.extract_info(album_url, download=False)
-                        if retry_info:
-                            # Handle track URLs: if no entries, treat info itself as the track
-                            if is_track_url and "entries" not in retry_info:
-                                # Single track URL - info itself is the track
-                                self.total_tracks = 1
-                                self.root.after(0, lambda: self.log("Found 1 track (retry)"))
-                                # Add to download_info if not already there
-                                if not self.download_info:
-                                    raw_title = retry_info.get("title", "")
-                                    if raw_title:
-                                        artist = retry_info.get("artist") or retry_info.get("uploader") or retry_info.get("creator") or self.album_info_stored.get("artist")
-                                        cleaned_title = self._clean_title(raw_title, artist)
-                                        self.download_info[raw_title.lower()] = {
-                                            "title": cleaned_title,
-                                            "artist": artist,
-                                            "album": retry_info.get("album") or retry_info.get("title") or self.album_info_stored.get("album"),
-                                            "track_number": retry_info.get("track_number") or retry_info.get("track"),
-                                            "date": retry_info.get("release_date") or retry_info.get("upload_date") or self.album_info_stored.get("date"),
-                                        }
-                            elif "entries" in retry_info:
-                                entries = [e for e in retry_info.get("entries", []) if e]
-                                if entries:
-                                    self.total_tracks = len(entries)
-                                    self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s) (retry)"))
-                except Exception as e:
-                    self.root.after(0, lambda err=str(e): self.log(f"DEBUG: Retry extraction also failed: {err}"))
+                    # Retry extraction
+                    try:
+                        retry_opts = ydl_opts.copy()
+                        retry_opts["extract_flat"] = False
+                        retry_opts["quiet"] = True
+                        retry_opts["no_warnings"] = True
+                        retry_opts["socket_timeout"] = 15  # Longer timeout for retry
+                        retry_opts["retries"] = 5  # More retries for retry
+                        
+                        # Ensure yt-dlp is loaded (lazy import)
+                        yt_dlp = self._ensure_ytdlp_loaded()
+                        with yt_dlp.YoutubeDL(retry_opts) as retry_ydl:
+                            retry_info = retry_ydl.extract_info(album_url, download=False)
+                            if retry_info:
+                                # Handle track URLs: if no entries, treat info itself as the track
+                                if is_track_url and "entries" not in retry_info:
+                                    # Single track URL - info itself is the track
+                                    self.total_tracks = 1
+                                    self.root.after(0, lambda: self.log("Found 1 track (retry)"))
+                                    # Add to download_info if not already there
+                                    if not self.download_info:
+                                        raw_title = retry_info.get("title", "")
+                                        if raw_title and not (
+                                            _bandcamp_fetch
+                                            and _bandcamp_fetch.is_challenge_title(raw_title)
+                                        ):
+                                            artist = retry_info.get("artist") or retry_info.get("uploader") or retry_info.get("creator") or self.album_info_stored.get("artist")
+                                            cleaned_title = self._clean_title(raw_title, artist)
+                                            self.download_info[raw_title.lower()] = {
+                                                "title": cleaned_title,
+                                                "artist": artist,
+                                                "album": retry_info.get("album") or retry_info.get("title") or self.album_info_stored.get("album"),
+                                                "track_number": retry_info.get("track_number") or retry_info.get("track"),
+                                                "date": retry_info.get("release_date") or retry_info.get("upload_date") or self.album_info_stored.get("date"),
+                                            }
+                                        elif raw_title and _bandcamp_fetch and _bandcamp_fetch.is_challenge_title(raw_title):
+                                            self.total_tracks = 0
+                                            self.root.after(0, lambda: self.log(
+                                                "⚠ yt-dlp returned a challenge title — not treating as a track."
+                                            ))
+                                elif "entries" in retry_info:
+                                    entries = [e for e in retry_info.get("entries", []) if e]
+                                    if entries:
+                                        self.total_tracks = len(entries)
+                                        self.root.after(0, lambda count=len(entries): self.log(f"Found {count} track(s) (retry)"))
+                    except Exception as e:
+                        err_s = str(e)
+                        if _bandcamp_fetch is not None:
+                            _bandcamp_fetch.bandcamp_note_rate_limit_from_message(err_s)
+                        self.root.after(0, lambda err=err_s: self.log(f"DEBUG: Retry extraction also failed: {err}"))
             
+            # If still no tracks found: one more cooldown + retry before skipping the album
+            if self.total_tracks == 0 and _bandcamp_fetch is not None and not self._bandcamp_should_stop():
+                # Budget-aware second chance for flaky / challenged extracts
+                msg = _bandcamp_fetch.bandcamp_rate_limit_status_message()
+                if msg:
+                    self.root.after(0, lambda m=msg: self.log(f"⏸ {m} (before final extract retry)"))
+                else:
+                    self.root.after(0, lambda: self.log(
+                        "⏸ Waiting before final extract retry (Bandcamp safe limits)…"
+                    ))
+                    time.sleep(3.0)
+                _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                    should_stop=self._bandcamp_should_stop
+                )
+                if not self._bandcamp_should_stop():
+                    try:
+                        self._wait_for_bandcamp_budget(log_status=False)
+                        yt_dlp = self._ensure_ytdlp_loaded()
+                        final_opts = ydl_opts.copy()
+                        final_opts["extract_flat"] = False
+                        final_opts["quiet"] = True
+                        final_opts["no_warnings"] = True
+                        with yt_dlp.YoutubeDL(final_opts) as final_ydl:
+                            final_info = final_ydl.extract_info(album_url, download=False)
+                            if final_info:
+                                if is_track_url and "entries" not in final_info:
+                                    title = final_info.get("title") or ""
+                                    if title and not _bandcamp_fetch.is_challenge_title(title):
+                                        self.total_tracks = 1
+                                        self.root.after(0, lambda: self.log("Found 1 track (final retry)"))
+                                elif "entries" in final_info:
+                                    entries = [e for e in final_info.get("entries", []) if e]
+                                    if entries:
+                                        self.total_tracks = len(entries)
+                                        self.root.after(
+                                            0,
+                                            lambda count=len(entries): self.log(
+                                                f"Found {count} track(s) (final retry)"
+                                            ),
+                                        )
+                    except Exception as e:
+                        _bandcamp_fetch.bandcamp_note_rate_limit_from_message(str(e))
+                        self.root.after(
+                            0, lambda err=str(e): self.log(f"DEBUG: Final extract retry failed: {err}")
+                        )
+
             # If still no tracks found, skip download
             if self.total_tracks == 0:
-                self.root.after(0, lambda: self.log("⚠ No tracks found for this album. Skipping download."))
+                self.root.after(0, lambda: self.log(
+                    "⚠ No tracks found for this album after retries. Skipping download "
+                    "(often Bandcamp rate-limit / client challenge — try again later)."
+                ))
                 return False
             
             # Get download path
@@ -22237,14 +23925,18 @@ class BandcampDownloaderGUI:
                     return "Cancelled by user"
                 return None  # None means accept the entry
             
-            # Add album_artist to track metadata if setting is enabled
+            # Add album_artist / Singles album tag for folder templates
             def modifyinfo(info):
-                """Modify track info to add album_artist if setting is enabled."""
+                """Modify track info for folder templates and singles."""
                 if hasattr(self, 'prefer_album_artist_for_folders_var') and self.prefer_album_artist_for_folders_var.get():
                     album_artist = self.album_info.get("album_artist") if hasattr(self, 'album_info') else None
                     if album_artist:
-                        # Add album_artist to track metadata so it's available in outtmpl
                         info['album_artist'] = album_artist
+                if getattr(self, "is_singles_download", False):
+                    # Track pages often have empty/NA album — force Singles for paths + tags
+                    info["album"] = "Singles"
+                    if hasattr(self, "album_info") and isinstance(self.album_info, dict):
+                        self.album_info["album"] = "Singles"
                 return info
             
             # yt-dlp options
@@ -22264,7 +23956,7 @@ class BandcampDownloaderGUI:
             
             ydl_opts = {
                 "format": format_selector,
-                "outtmpl": self.get_outtmpl(),
+                "outtmpl": self._outtmpl_for_current_item(),
                 "ffmpeg_location": str(self.ffmpeg_path),
                 "writethumbnail": True,
                 "postprocessors": postprocessors,
@@ -22367,47 +24059,82 @@ class BandcampDownloaderGUI:
                 # Download each album individually
                 successful_albums = 0
                 failed_albums = 0
+                if _bandcamp_fetch is not None and len(album_urls) >= 8:
+                    _bandcamp_fetch.bandcamp_set_request_pacing_slow(True, source="discography")
+                    self.root.after(0, lambda: self.log(
+                        "Using slower Bandcamp request pacing for this discography…"
+                    ))
                 
-                for idx, album_url in enumerate(album_urls):
-                    # Check for cancellation
-                    if self.is_cancelling:
-                        self.root.after(0, self.download_complete, False, "Download cancelled by user.")
-                        return
-                    
-                    # Update current album counter
-                    self.current_album = idx
-                    if self.current_album >= self.total_albums:
-                        self.total_albums = self.current_album + 1
-                    
-                    # Log which album we're starting
-                    album_num = idx + 1
-                    self.root.after(0, lambda num=album_num, total=self.total_albums, url=album_url: 
-                                  self.log(f"Downloading album {num} of {total}: {url}"))
-                    
-                    # Update preview and artwork for current album
-                    # Fetch metadata and artwork (will update preview and artwork)
-                    self.fetch_album_metadata(album_url)
-                    
-                    # Reset download_start_time for this album to ensure timestamp filtering works correctly
-                    self.download_start_time = time.time()
-                    
-                    # Download this album
-                    success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_urls))
-                    
-                    if success:
-                        successful_albums += 1
-                        # Add completed tracks from this album
-                        if self.total_tracks > 0:
-                            self.completed_tracks_all_albums += self.total_tracks
-                    else:
-                        failed_albums += 1
-                        self.root.after(0, lambda num=album_num, url=album_url: 
-                                      self.log(f"⚠ Failed to download album {num}: {url}"))
-                    
-                    # Reset track counter for next album
-                    self.current_track = 0
-                    self.total_tracks = 0
-                    self.downloaded_files = set()  # Clear for next album
+                try:
+                    for idx, album_url in enumerate(album_urls):
+                        # Check for cancellation
+                        if self.is_cancelling:
+                            self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                            return
+                        
+                        # Update current album counter
+                        self.current_album = idx
+                        if self.current_album >= self.total_albums:
+                            self.total_albums = self.current_album + 1
+                        
+                        # Log which album we're starting
+                        album_num = idx + 1
+                        self.root.after(0, lambda num=album_num, total=self.total_albums, url=album_url: 
+                                      self.log(f"Downloading album {num} of {total}: {url}"))
+                        
+                        # Adaptive gap between albums (Player-style)
+                        if idx > 0:
+                            if _bandcamp_fetch is not None:
+                                if _bandcamp_fetch.bandcamp_rate_limited():
+                                    status = _bandcamp_fetch.bandcamp_rate_limit_status_message()
+                                    if status:
+                                        self.root.after(0, lambda m=status: self.log(f"⏸ {m}"))
+                                    _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                                        should_stop=self._bandcamp_should_stop
+                                    )
+                                else:
+                                    gap = 2.5 if _bandcamp_fetch.bandcamp_is_request_pacing_slow() else 2.0
+                                    time.sleep(gap)
+                            else:
+                                time.sleep(1.0)
+                        
+                        # Update preview and artwork for current album
+                        # Fetch metadata and artwork (will update preview and artwork)
+                        self.fetch_album_metadata(album_url)
+                        
+                        # Reset download_start_time for this album to ensure timestamp filtering works correctly
+                        self.download_start_time = time.time()
+                        
+                        # Download this album
+                        success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_urls))
+                        
+                        if success:
+                            successful_albums += 1
+                            # Add completed tracks from this album
+                            if self.total_tracks > 0:
+                                self.completed_tracks_all_albums += self.total_tracks
+                        else:
+                            failed_albums += 1
+                            self.root.after(0, lambda num=album_num, url=album_url: 
+                                          self.log(f"⚠ Failed to download album {num}: {url}"))
+                            if _bandcamp_fetch is not None and not self._bandcamp_should_stop():
+                                if _bandcamp_fetch.bandcamp_rate_limited():
+                                    _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                                        should_stop=self._bandcamp_should_stop
+                                    )
+                                else:
+                                    time.sleep(3.0)
+                        
+                        # Reset track counter for next album
+                        self.current_track = 0
+                        self.total_tracks = 0
+                        self.downloaded_files = set()  # Clear for next album
+                finally:
+                    if _bandcamp_fetch is not None:
+                        try:
+                            _bandcamp_fetch.bandcamp_set_request_pacing_slow(False, source="discography")
+                        except Exception:
+                            pass
                 
                 # Final summary
                 if successful_albums > 0:
@@ -22461,97 +24188,18 @@ class BandcampDownloaderGUI:
                         with yt_dlp.YoutubeDL(extract_opts_quick) as extract_ydl:
                             info = extract_ydl.extract_info(url, download=False)
                             
-                            # For track pages (singles), also extract bio pic from HTML synchronously
-                            # This ensures bio pic is available for download_extras_files()
+                            # Track pages: resolve bio pic via Player path (page → artist root)
                             if '/track/' in url:
                                 if self.debug_mode:
-                                    self.log(f"DEBUG: Attempting to extract bio pic from track page: {url[:60]}...")
-                                try:
-                                    # Extract bio pic synchronously (not in background thread)
-                                    import urllib.request
-                                    import re
-                                    from urllib.parse import urlparse
-                                    
-                                    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                                    headers = {
-                                        'User-Agent': user_agent,
-                                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                                        'Accept-Language': 'en-US,en;q=0.9',
-                                        'Connection': 'keep-alive',
-                                        'Referer': 'https://bandcamp.com/',
-                                    }
-                                    req = urllib.request.Request(url, headers=headers)
-                                    with urllib.request.urlopen(req, timeout=15) as response:
-                                        html_content = response.read().decode('utf-8', errors='ignore')
-                                    
-                                    # Extract bio pic using same patterns as fetch_thumbnail_from_html
-                                    # Also add pattern specifically for bio-container structure
-                                    bio_pic_url = None
-                                    bio_pic_patterns = [
-                                        # Pattern 1: Look inside bio-container first (most specific)
-                                        r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                                        # Pattern 2: artists-bio-pic with nested divs
-                                        r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>(?:[^<]|<(?!a[^>]*popupImage))*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                                        # Pattern 3: popupImage with band-photo img inside
-                                        r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
-                                        # Pattern 4: artists-bio-pic with any nesting
-                                        r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                                        # Pattern 5: band-photo img src
-                                        r'<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                                        # Pattern 6: bio-pic class
-                                        r'<div[^>]*class=["\'][^"]*bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                                        # Pattern 7: Look in bio-container for any popupImage
-                                        r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                                    ]
-                                    
-                                    for pattern_idx, pattern in enumerate(bio_pic_patterns):
-                                        match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
-                                        if match:
-                                            bio_pic_url = match.group(1)
-                                            if bio_pic_url.startswith('//'):
-                                                bio_pic_url = 'https:' + bio_pic_url
-                                            elif bio_pic_url.startswith('/'):
-                                                parsed_url = urlparse(url)
-                                                bio_pic_url = f"{parsed_url.scheme}://{parsed_url.netloc}{bio_pic_url}"
-                                            # Verify it's not the album art (check if it contains common album art indicators)
-                                            if bio_pic_url and 'tralbum-art' not in bio_pic_url.lower() and 'album-art' not in bio_pic_url.lower():
-                                                # Upgrade to higher quality
-                                                if bio_pic_url and ('_' in bio_pic_url or 'bcbits.com' in bio_pic_url):
-                                                    for size in ['_500', '_300', '_200', '_100', '_64']:
-                                                        if size in bio_pic_url:
-                                                            break
-                                                        test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
-                                                        if test_url != bio_pic_url:
-                                                            bio_pic_url = test_url
-                                                            break
-                                                if self.debug_mode:
-                                                    self.log(f"DEBUG: Found bio pic via pattern {pattern_idx + 1}: ...{bio_pic_url[-40:]}")
-                                                break
-                                            else:
-                                                bio_pic_url = None  # Reset if it's actually album art
-                                                if self.debug_mode:
-                                                    self.log(f"DEBUG: Pattern {pattern_idx + 1} matched but was album art, continuing...")
-                                    
-                                    # Store in metadata cache
-                                    if bio_pic_url:
-                                        normalized_url = self._normalize_url(url)
-                                        if normalized_url not in self.url_tag_metadata_cache:
-                                            self.url_tag_metadata_cache[normalized_url] = {}
-                                        self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = bio_pic_url
-                                        if self.debug_mode:
-                                            self.log(f"DEBUG: Extracted and cached bio pic from track page: ...{bio_pic_url[-40:]}")
-                                    else:
-                                        if self.debug_mode:
-                                            self.log(f"DEBUG: Bio pic not found in HTML for track page: {url[:60]}...")
-                                except Exception as e:
-                                    if self.debug_mode:
-                                        self.log(f"DEBUG: Could not extract bio pic from track page: {str(e)}")
-                                    import traceback
-                                    if self.debug_mode:
-                                        self.log(f"DEBUG: Traceback: {traceback.format_exc()}")
+                                    self.log(f"DEBUG: Resolving bio pic for track: {url[:60]}...")
+                                self._resolve_and_cache_bio_pic(
+                                    url, set_current=False, log_result=self.debug_mode
+                                )
                             
                             if info:
+                                is_track_url = self._url_is_track_release(url)
                                 album_name = info.get("album") or info.get("title") or url
+                                track_title = info.get("track") or info.get("title")
                                 
                                 # Try to get artist from various sources
                                 artist_name = (info.get("artist") or 
@@ -22566,6 +24214,8 @@ class BandcampDownloaderGUI:
                                                  first_entry.get("uploader") or 
                                                  first_entry.get("creator") or 
                                                  None)
+                                    if not track_title:
+                                        track_title = first_entry.get("title")
                                 
                                 # If still not found, try extracting from URL subdomain (last resort)
                                 if not artist_name and "bandcamp.com" in url.lower():
@@ -22604,31 +24254,54 @@ class BandcampDownloaderGUI:
                                                    artist_name)
                                 
                                 track_count = len(info.get("entries", [])) if "entries" in info else 0
+                                if is_track_url:
+                                    # Track pages are one song; yt-dlp flat often reports 0 entries
+                                    track_count = max(1, track_count)
+                                    album_name = "Singles"
+                                    display_name = track_title or info.get("title") or "Single"
+                                else:
+                                    display_name = album_name
                                 album_metadata.append({
                                     "url": url,
                                     "name": album_name,
+                                    "display_name": display_name,
                                     "artist": artist_name,
                                     "album_artist": album_artist_name,
                                     "track_count": track_count,
+                                    "is_single": is_track_url,
                                     "info": info
                                 })
-                                self.root.after(0, lambda name=album_name, artist=artist_name, count=track_count:
-                                              self.log(f"  ✓ {artist} - {name} ({count} tracks)"))
+                                if is_track_url:
+                                    self.root.after(
+                                        0,
+                                        lambda name=display_name, artist=artist_name: self.log(
+                                            f"  ✓ {artist} - {name} (single)"
+                                        ),
+                                    )
+                                else:
+                                    self.root.after(0, lambda name=album_name, artist=artist_name, count=track_count:
+                                                  self.log(f"  ✓ {artist} - {name} ({count} tracks)"))
                             else:
+                                is_track_fallback = self._url_is_track_release(url)
                                 album_metadata.append({
                                     "url": url,
-                                    "name": url,
+                                    "name": "Singles" if is_track_fallback else url,
+                                    "display_name": url,
                                     "artist": "Unknown",
-                                    "track_count": 0,
+                                    "track_count": 1 if is_track_fallback else 0,
+                                    "is_single": is_track_fallback,
                                     "info": None
                                 })
                                 self.root.after(0, lambda u=url: self.log(f"  ⚠ Could not fetch metadata for: {u}"))
                     except Exception as e:
+                        is_track_fallback = self._url_is_track_release(url)
                         album_metadata.append({
                             "url": url,
-                            "name": url,
+                            "name": "Singles" if is_track_fallback else url,
+                            "display_name": url,
                             "artist": "Unknown",
-                            "track_count": 0,
+                            "track_count": 1 if is_track_fallback else 0,
+                            "is_single": is_track_fallback,
                             "info": None
                         })
                         self.root.after(0, lambda u=url, err=str(e): self.log(f"  ⚠ Error fetching metadata for {u}: {err}"))
@@ -22639,168 +24312,259 @@ class BandcampDownloaderGUI:
                 
                 self.total_albums = len(album_metadata)
                 total_tracks = sum(meta.get("track_count", 0) for meta in album_metadata)
-                self.root.after(0, lambda count=len(album_metadata), tracks=total_tracks:
-                              self.log(f"\nFound {count} album(s) with {tracks} total track(s)"))
+                singles_in_batch = sum(1 for meta in album_metadata if meta.get("is_single"))
+                albums_in_batch = len(album_metadata) - singles_in_batch
+                if singles_in_batch and albums_in_batch:
+                    self.root.after(
+                        0,
+                        lambda a=albums_in_batch, s=singles_in_batch, tracks=total_tracks: self.log(
+                            f"\nFound {a} album(s) and {s} single(s) ({tracks} total track(s))"
+                        ),
+                    )
+                elif singles_in_batch:
+                    self.root.after(
+                        0,
+                        lambda s=singles_in_batch, tracks=total_tracks: self.log(
+                            f"\nFound {s} single(s) ({tracks} total track(s))"
+                        ),
+                    )
+                else:
+                    self.root.after(0, lambda count=len(album_metadata), tracks=total_tracks:
+                                  self.log(f"\nFound {count} album(s) with {tracks} total track(s)"))
                 self.root.after(0, lambda: self.log(""))
                 
                 # Phase 2: Download each album
                 successful_albums = 0
                 failed_albums = 0
+                successful_singles = 0
+                failed_singles = 0
+                # Large queues: slow shared pacing (~0.5 req/s) like the Player backfill path
+                if _bandcamp_fetch is not None and len(album_metadata) >= 8:
+                    _bandcamp_fetch.bandcamp_set_request_pacing_slow(True, source="batch")
+                    self.root.after(0, lambda: self.log(
+                        "Using slower Bandcamp request pacing for this large batch…"
+                    ))
                 
-                for idx, meta in enumerate(album_metadata):
-                    # Check for cancellation
-                    if self.is_cancelling:
-                        self.root.after(0, self.download_complete, False, "Download cancelled by user.")
-                        return
-                    
-                    # Update current album counter
-                    self.current_album = idx
-                    album_url = meta["url"]
-                    album_name = meta["name"]
-                    artist_name = meta["artist"]
-                    
-                    # Log which album we're starting
-                    album_num = idx + 1
-                    self.root.after(0, lambda num=album_num, total=self.total_albums, name=album_name, artist=artist_name:
-                                  self.log(f"Downloading album {num} of {total}: {artist} - {name}"))
-                    self.root.after(0, lambda u=album_url: self.log(f"  URL: {u}"))
-                    
-                    # Update preview and artwork for current album
-                    # Set current_url_being_processed so fetch_album_metadata can update album_info
-                    self.current_url_being_processed = album_url
-                    
-                    # Update album_info with metadata we already have
-                    # Extract album_artist from metadata (for prefer_album_artist_for_folders setting)
-                    album_artist_name = meta.get("album_artist") or artist_name or "Artist"
-                    
-                    # Try to extract first track title from batch metadata if available
-                    first_track_title = None
-                    first_track_number = None
-                    year = None
-                    genre = None
-                    label = None
-                    catalog_number = None
-                    track_titles = []
-                    
-                    if meta.get("info"):
-                        info = meta["info"]
-                        entries = info.get("entries", [])
-                        if entries and len(entries) > 0:
-                            first_entry = entries[0]
-                            # In flat mode, title might be available
-                            first_track_title = first_entry.get("title")
-                            first_track_number = first_entry.get("track_number") or first_entry.get("track")
-                            # Collect all track titles for split album detection
-                            track_titles = [e.get("title") for e in entries if e.get("title")]
+                try:
+                    for idx, meta in enumerate(album_metadata):
+                        # Check for cancellation
+                        if self.is_cancelling:
+                            self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                            return
                         
-                        # Extract year from release_date or upload_date
-                        # Note: Flat extraction may not include dates, so this might be None
-                        date = info.get("release_date") or info.get("upload_date")
-                        if date:
-                            try:
-                                # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
-                                if len(date) >= 4:
-                                    year = date[:4]  # First 4 characters are the year
-                            except:
-                                pass
+                        # Update current album counter
+                        self.current_album = idx
+                        album_url = meta["url"]
+                        album_name = meta["name"]
+                        artist_name = meta["artist"]
+                        item_is_single = bool(meta.get("is_single")) or self._url_is_track_release(album_url)
+                        display_name = meta.get("display_name") or album_name
                         
-                        # Extract other metadata fields if available
-                        genre = info.get("genre")
-                        label = info.get("label") or info.get("publisher")
-                        catalog_number = info.get("catalog_number") or info.get("catalognumber")
-                    
-                    self.album_info = {
-                        "artist": artist_name or "Artist",
-                        "album": album_name or "Album",
-                        "title": "Track",
-                        "thumbnail_url": None,
-                        "album_artist": album_artist_name,  # Set album_artist so get_outtmpl() can use it
-                        "first_track_title": first_track_title,  # Add first track title if available
-                        "first_track_number": first_track_number,  # Add first track number if available
-                        "year": year,  # Add year if available from batch metadata (may be None if flat extraction)
-                        "genre": genre,  # Add genre if available
-                        "label": label,  # Add label if available
-                        "catalog_number": catalog_number,  # Add catalog number if available
-                        "track_titles": track_titles  # Add track titles for split album detection
-                    }
-                    self.root.after(0, self.update_preview)
-                    
-                    # Fetch and display album art for this album
-                    # Try to get thumbnail from metadata info if available
-                    thumbnail_url = None
-                    if meta.get("info"):
-                        info = meta["info"]
-                        # Try to get thumbnail from various locations
-                        thumbnail_url = (info.get("thumbnail") or 
-                                       info.get("thumbnail_url") or
-                                       info.get("artwork_url") or
-                                       info.get("cover"))
-                        # Try thumbnails list
-                        if not thumbnail_url and info.get("thumbnails"):
-                            thumbnails = info.get("thumbnails")
-                            if thumbnails and len(thumbnails) > 0:
-                                if isinstance(thumbnails[0], dict):
-                                    thumbnail_url = thumbnails[0].get("url")
-                                else:
-                                    thumbnail_url = thumbnails[0]
-                    
-                    # If we have thumbnail, display it; otherwise fetch it
-                    if thumbnail_url:
-                        self.album_info["thumbnail_url"] = thumbnail_url
-                        self.current_thumbnail_url = thumbnail_url
-                        self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
-                        # Even if we have thumbnail, fetch metadata to get year and other metadata
-                        # (flat extraction doesn't include dates, so we need HTML extraction)
-                        self.fetch_album_metadata(album_url)
-                    else:
-                        # Fetch metadata and artwork (will update preview and artwork)
-                        # This will extract year from HTML and update album_info
-                        self.fetch_album_metadata(album_url)
-                    
-                    # Reset download_start_time for this album to ensure timestamp filtering works correctly
-                    self.download_start_time = time.time()
-                    
-                    # Add a small delay between albums in batch mode to avoid rate limiting
-                    # (except for the first album)
-                    if idx > 0:
-                        time.sleep(1.0)  # 1 second delay between albums
-                    
-                    # Download this album
-                    success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_metadata))
-                    
-                    if success:
-                        successful_albums += 1
-                        # Add completed tracks from this album
-                        if self.total_tracks > 0:
-                            self.completed_tracks_all_albums += self.total_tracks
-                    else:
-                        failed_albums += 1
-                        self.root.after(0, lambda num=album_num, name=album_name:
-                                      self.log(f"⚠ Failed to download album {num}: {name}"))
-                    
-                    # Reset track counter for next album
-                    self.current_track = 0
-                    self.total_tracks = 0
-                    self.downloaded_files = set()  # Clear for next album
-                
-                # Final summary
-                if successful_albums > 0:
-                    # Check if this was a singles download
-                    if self.is_singles_download:
-                        if successful_albums == 1:
-                            msg = f"Downloaded {successful_albums} single"
+                        # Log which album/single we're starting
+                        album_num = idx + 1
+                        if item_is_single:
+                            self.root.after(
+                                0,
+                                lambda num=album_num, total=self.total_albums, name=display_name, artist=artist_name:
+                                self.log(f"Downloading item {num} of {total}: {artist} - {name} (single)"),
+                            )
                         else:
-                            msg = f"Downloaded {successful_albums} singles"
-                    else:
-                        msg = f"Downloaded {successful_albums} album(s)"
-                    if failed_albums > 0:
-                        msg += f" ({failed_albums} failed)"
+                            self.root.after(0, lambda num=album_num, total=self.total_albums, name=album_name, artist=artist_name:
+                                          self.log(f"Downloading album {num} of {total}: {artist} - {name}"))
+                        self.root.after(0, lambda u=album_url: self.log(f"  URL: {u}"))
+                        
+                        # Update preview and artwork for current album
+                        # Set current_url_being_processed so fetch_album_metadata can update album_info
+                        self.current_url_being_processed = album_url
+                        
+                        # Update album_info with metadata we already have
+                        # Extract album_artist from metadata (for prefer_album_artist_for_folders setting)
+                        album_artist_name = meta.get("album_artist") or artist_name or "Artist"
+                        
+                        # Try to extract first track title from batch metadata if available
+                        first_track_title = None
+                        first_track_number = None
+                        year = None
+                        genre = None
+                        label = None
+                        catalog_number = None
+                        track_titles = []
+                        
+                        if meta.get("info"):
+                            info = meta["info"]
+                            entries = info.get("entries", [])
+                            if entries and len(entries) > 0:
+                                first_entry = entries[0]
+                                # In flat mode, title might be available
+                                first_track_title = first_entry.get("title")
+                                first_track_number = first_entry.get("track_number") or first_entry.get("track")
+                                # Collect all track titles for split album detection
+                                track_titles = [e.get("title") for e in entries if e.get("title")]
+                            
+                            # Extract year from release_date or upload_date
+                            # Note: Flat extraction may not include dates, so this might be None
+                            date = info.get("release_date") or info.get("upload_date")
+                            if date:
+                                try:
+                                    # Extract year from date (format: YYYYMMDD or YYYY-MM-DD)
+                                    if len(date) >= 4:
+                                        year = date[:4]  # First 4 characters are the year
+                                except Exception:
+                                    pass
+                            
+                            # Extract other metadata fields if available
+                            genre = info.get("genre")
+                            label = info.get("label") or info.get("publisher")
+                            catalog_number = info.get("catalog_number") or info.get("catalognumber")
+                        
+                        if item_is_single and not first_track_title:
+                            first_track_title = display_name if display_name != "Singles" else None
+                        
+                        self.album_info = {
+                            "url": album_url,
+                            "artist": artist_name or "Artist",
+                            "album": "Singles" if item_is_single else (album_name or "Album"),
+                            "title": (first_track_title or display_name or "Track") if item_is_single else "Track",
+                            "thumbnail_url": None,
+                            "album_artist": album_artist_name,  # Set album_artist so get_outtmpl() can use it
+                            "first_track_title": first_track_title,  # Add first track title if available
+                            "first_track_number": first_track_number,  # Add first track number if available
+                            "year": year,  # Add year if available from batch metadata (may be None if flat extraction)
+                            "genre": genre,  # Add genre if available
+                            "label": label,  # Add label if available
+                            "catalog_number": catalog_number,  # Add catalog number if available
+                            "track_titles": track_titles  # Add track titles for split album detection
+                        }
+                        self.root.after(0, self.update_preview)
+                        
+                        # Fetch and display album art for this album
+                        # Try to get thumbnail from metadata info if available
+                        thumbnail_url = None
+                        if meta.get("info"):
+                            info = meta["info"]
+                            # Try to get thumbnail from various locations
+                            thumbnail_url = (info.get("thumbnail") or
+                                           info.get("thumbnail_url") or
+                                           info.get("artwork_url") or
+                                           info.get("cover"))
+                            # Try thumbnails list
+                            if not thumbnail_url and info.get("thumbnails"):
+                                thumbnails = info.get("thumbnails")
+                                if thumbnails and len(thumbnails) > 0:
+                                    if isinstance(thumbnails[0], dict):
+                                        thumbnail_url = thumbnails[0].get("url")
+                                    else:
+                                        thumbnail_url = thumbnails[0]
+                        
+                        # If we have thumbnail, display it; otherwise fetch it
+                        if thumbnail_url:
+                            self.album_info["thumbnail_url"] = thumbnail_url
+                            self.current_thumbnail_url = thumbnail_url
+                            self.root.after(0, lambda url=thumbnail_url: self.fetch_and_display_album_art(url))
+                            # Even if we have thumbnail, fetch metadata to get year and other metadata
+                            # (flat extraction doesn't include dates, so we need HTML extraction)
+                            self.fetch_album_metadata(album_url)
+                        else:
+                            # Fetch metadata and artwork (will update preview and artwork)
+                            # This will extract year from HTML and update album_info
+                            self.fetch_album_metadata(album_url)
+                        
+                        # Reset download_start_time for this album to ensure timestamp filtering works correctly
+                        self.download_start_time = time.time()
+                        
+                        # Adaptive gap between albums (Player-style): honor 429 cooldown, else 2s base
+                        if idx > 0:
+                            if _bandcamp_fetch is not None:
+                                if _bandcamp_fetch.bandcamp_rate_limited():
+                                    status = _bandcamp_fetch.bandcamp_rate_limit_status_message()
+                                    if status:
+                                        self.root.after(0, lambda m=status: self.log(f"⏸ {m}"))
+                                    _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                                        should_stop=self._bandcamp_should_stop
+                                    )
+                                else:
+                                    gap = 2.5 if _bandcamp_fetch.bandcamp_is_request_pacing_slow() else 2.0
+                                    time.sleep(gap)
+                            else:
+                                time.sleep(1.0)
+                        
+                        # Download this album/single (is_singles_download set inside from URL)
+                        success = self.download_single_album(album_url, album_index=idx, total_albums=len(album_metadata))
+                        
+                        if success:
+                            if item_is_single:
+                                successful_singles += 1
+                            else:
+                                successful_albums += 1
+                            # Add completed tracks from this album
+                            if self.total_tracks > 0:
+                                self.completed_tracks_all_albums += self.total_tracks
+                        else:
+                            if item_is_single:
+                                failed_singles += 1
+                                self.root.after(
+                                    0,
+                                    lambda num=album_num, name=display_name: self.log(
+                                        f"⚠ Failed to download single {num}: {name}"
+                                    ),
+                                )
+                            else:
+                                failed_albums += 1
+                                self.root.after(0, lambda num=album_num, name=album_name:
+                                              self.log(f"⚠ Failed to download album {num}: {name}"))
+                            # After a failure, pause briefly / honor cooldown before the next album
+                            if _bandcamp_fetch is not None and not self._bandcamp_should_stop():
+                                if _bandcamp_fetch.bandcamp_rate_limited():
+                                    _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                                        should_stop=self._bandcamp_should_stop
+                                    )
+                                else:
+                                    time.sleep(3.0)
+                        
+                        # Reset track counter for next album
+                        self.current_track = 0
+                        self.total_tracks = 0
+                        self.downloaded_files = set()  # Clear for next album
+                
+                finally:
+                    if _bandcamp_fetch is not None:
+                        try:
+                            _bandcamp_fetch.bandcamp_set_request_pacing_slow(False, source="batch")
+                        except Exception:
+                            pass
+                
+                # Final summary (mixed batches: report albums + singles separately)
+                total_ok = successful_albums + successful_singles
+                total_fail = failed_albums + failed_singles
+                if total_ok > 0:
+                    parts = []
+                    if successful_albums:
+                        parts.append(
+                            f"{successful_albums} album" + ("s" if successful_albums != 1 else "")
+                        )
+                    if successful_singles:
+                        parts.append(
+                            f"{successful_singles} single" + ("s" if successful_singles != 1 else "")
+                        )
+                    msg = "Downloaded " + " and ".join(parts)
+                    if total_fail > 0:
+                        msg += f" ({total_fail} failed)"
                     self.root.after(0, self.download_complete, True, msg + "!")
                 else:
-                    # Check if this was a singles download for error message
-                    if self.is_singles_download:
-                        self.root.after(0, self.download_complete, False,
-                                      f"Failed to download any singles. {failed_albums} single(s) failed.")
+                    if singles_in_batch and not albums_in_batch:
+                        self.root.after(
+                            0,
+                            self.download_complete,
+                            False,
+                            f"Failed to download any singles. {failed_singles} single(s) failed.",
+                        )
+                    elif singles_in_batch and albums_in_batch:
+                        self.root.after(
+                            0,
+                            self.download_complete,
+                            False,
+                            f"Failed to download any items. {total_fail} failed.",
+                        )
                     else:
                         self.root.after(0, self.download_complete, False,
                                       f"Failed to download any albums. {failed_albums} album(s) failed.")
@@ -22838,105 +24602,21 @@ class BandcampDownloaderGUI:
     
     def _do_album_download_and_processing(self, album_url, ydl_opts, format_val, base_format, skip_postprocessing, download_path):
         """Helper method to perform the actual download and processing of a single album."""
-        # For track pages (singles), extract bio pic synchronously before download
-        # This ensures bio pic is available for download_extras_files()
+        # Track pages: Player-style bio resolve (page HTML → artist root) before download
         if '/track/' in album_url:
-            # Always log this (not just debug) to confirm code is running
-            self.log(f"Extracting bio pic from track page...")
+            self.log("Resolving bio pic for single (page → artist root)...")
+            # Prefer cache from batch prefetch; otherwise fetch now
+            cached = None
             try:
-                if self.debug_mode:
-                    self.log(f"DEBUG: Single URL download - extracting bio pic from: {album_url[:60]}...")
-                # Extract bio pic synchronously (same code as batch mode)
-                import urllib.request
-                import re
-                from urllib.parse import urlparse
-                
-                user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                headers = {
-                    'User-Agent': user_agent,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Connection': 'keep-alive',
-                    'Referer': 'https://bandcamp.com/',
-                }
-                req = urllib.request.Request(album_url, headers=headers)
-                with urllib.request.urlopen(req, timeout=15) as response:
-                    html_content = response.read().decode('utf-8', errors='ignore')
-                
-                # Extract bio pic using same patterns as batch mode
-                bio_pic_url = None
-                bio_pic_patterns = [
-                    r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>(?:[^<]|<(?!a[^>]*popupImage))*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                    r'<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))[^>]*>.*?<img[^>]*class=["\'][^"]*band-photo',
-                    r'<div[^>]*class=["\'][^"]*artists-bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                    r'<img[^>]*class=["\'][^"]*band-photo[^"]*["\'][^>]*src=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                    r'<div[^>]*class=["\'][^"]*bio-pic[^"]*["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                    r'<div[^>]*id=["\']bio-container["\'][^>]*>.*?<a[^>]*class=["\'][^"]*popupImage[^"]*["\'][^>]*href=["\']([^"\']+\.(jpg|jpeg|png|webp))',
-                ]
-                
-                for pattern_idx, pattern in enumerate(bio_pic_patterns):
-                    match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
-                    if match:
-                        bio_pic_url = match.group(1)
-                        if bio_pic_url.startswith('//'):
-                            bio_pic_url = 'https:' + bio_pic_url
-                        elif bio_pic_url.startswith('/'):
-                            parsed_url = urlparse(album_url)
-                            bio_pic_url = f"{parsed_url.scheme}://{parsed_url.netloc}{bio_pic_url}"
-                        # Verify it's not the album art
-                        if bio_pic_url and 'tralbum-art' not in bio_pic_url.lower() and 'album-art' not in bio_pic_url.lower():
-                            # Upgrade to higher quality
-                            if bio_pic_url and ('_' in bio_pic_url or 'bcbits.com' in bio_pic_url):
-                                for size in ['_500', '_300', '_200', '_100', '_64']:
-                                    if size in bio_pic_url:
-                                        break
-                                    test_url = bio_pic_url.replace('_16', size).replace('_32', size).replace('_64', size).replace('_100', size)
-                                    if test_url != bio_pic_url:
-                                        bio_pic_url = test_url
-                                        break
-                            # Always log when bio pic is found (not just debug)
-                            self.log(f"Bio pic found via pattern {pattern_idx + 1}: ...{bio_pic_url[-40:]}")
-                            if self.debug_mode:
-                                self.log(f"DEBUG: Found bio pic via pattern {pattern_idx + 1}: ...{bio_pic_url[-40:]}")
-                            break
-                        else:
-                            bio_pic_url = None
-                
-                # Store in metadata cache AND set current_bio_pic_url
-                if bio_pic_url:
-                    normalized_url = self._normalize_url(album_url)
-                    if normalized_url not in self.url_tag_metadata_cache:
-                        self.url_tag_metadata_cache[normalized_url] = {}
-                    self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = bio_pic_url
-                    # Also set current_bio_pic_url so download_extras_files() can find it immediately
-                    self.current_bio_pic_url = bio_pic_url
-                    # Always log when bio pic is cached (not just debug)
-                    self.log(f"Extracted and cached bio pic: ...{bio_pic_url[-40:]}")
-                    if self.debug_mode:
-                        self.log(f"DEBUG: Extracted and cached bio pic for single URL download: ...{bio_pic_url[-40:]}")
-                        self.log(f"DEBUG: Also set current_bio_pic_url and stored in cache with key: {normalized_url[:60]}...")
-                else:
-                    if self.debug_mode:
-                        self.log(f"DEBUG: Bio pic not found in HTML for single URL: {album_url[:60]}...")
-                        # Debug: check if bio-container exists
-                        if 'bio-container' in html_content:
-                            self.log("DEBUG: bio-container found in HTML but bio pic URL not extracted")
-                            # Try to find any popupImage in bio-container as fallback
-                            bio_container_match = re.search(r'<div[^>]*id=["\']bio-container["\'][^>]*>(.*?)</div>', html_content, re.IGNORECASE | re.DOTALL)
-                            if bio_container_match:
-                                bio_content = bio_container_match.group(1)
-                                popup_match = re.search(r'href=["\']([^"\']+\.(jpg|jpeg|png|webp))', bio_content, re.IGNORECASE)
-                                if popup_match:
-                                    self.log(f"DEBUG: Found image URL in bio-container (but not extracted): ...{popup_match.group(1)[-40:]}")
-                        else:
-                            self.log("DEBUG: bio-container not found in HTML")
-            except Exception as e:
-                # Always log errors (not just debug) so we can see what's wrong
-                self.log(f"⚠ Error extracting bio pic from track page: {str(e)}")
-                if self.debug_mode:
-                    import traceback
-                    self.log(f"DEBUG: Traceback: {traceback.format_exc()}")
+                norm = self._normalize_url(album_url)
+                cached = (self.url_tag_metadata_cache.get(norm) or {}).get("bio_pic_url")
+            except Exception:
+                cached = None
+            if cached:
+                self.current_bio_pic_url = cached
+                self.log(f"Bio pic (cached): ...{cached[-48:]}")
+            else:
+                self._resolve_and_cache_bio_pic(album_url, set_current=True, log_result=True)
         
         # Initialize downloaded_files set for this album (important for batch/discography mode)
         if not hasattr(self, 'downloaded_files'):
@@ -23121,22 +24801,42 @@ class BandcampDownloaderGUI:
                     "antispam" in error_lower or
                     "http error 429" in error_lower
                 )
+                if is_rate_limit and _bandcamp_fetch is not None:
+                    _bandcamp_fetch.bandcamp_note_rate_limit(code=429)
                 
                 # If this is a retry attempt, try again
                 if download_attempt < max_download_retries:
                     if is_rate_limit:
-                        # Enhanced backoff for rate limits: exponential with longer base delay
-                        # 5s, 10s, 20s, 40s (more aggressive than normal errors)
-                        retry_delay = 5.0 * (2.0 ** download_attempt)
-                        self.root.after(0, lambda delay=retry_delay, attempt=download_attempt: 
-                            self.log(f"⚠ Rate limited by Bandcamp. Waiting {delay:.1f}s before retry {attempt + 2}/{max_download_retries + 1}..."))
+                        # Player-style: honor shared cooldown (45s+ / Retry-After), not a short 5s poke
+                        if _bandcamp_fetch is not None:
+                            status = _bandcamp_fetch.bandcamp_rate_limit_status_message()
+                            remaining = _bandcamp_fetch.bandcamp_rate_limit_remaining_sec()
+                            self.root.after(
+                                0,
+                                lambda m=status, attempt=download_attempt, r=remaining: self.log(
+                                    f"⚠ Rate limited by Bandcamp. {m or f'Waiting {int(r)+1}s…'} "
+                                    f"(retry {attempt + 2}/{max_download_retries + 1})"
+                                ),
+                            )
+                            _bandcamp_fetch.bandcamp_rate_limit_sleep_if_needed(
+                                should_stop=self._bandcamp_should_stop
+                            )
+                            if self._bandcamp_should_stop():
+                                self.ydl_instance = None
+                                return False
+                            retry_delay = 0.0
+                        else:
+                            retry_delay = 5.0 * (2.0 ** download_attempt)
+                            self.root.after(0, lambda delay=retry_delay, attempt=download_attempt: 
+                                self.log(f"⚠ Rate limited by Bandcamp. Waiting {delay:.1f}s before retry {attempt + 2}/{max_download_retries + 1}..."))
                     else:
                         # Existing backoff for all other errors (unchanged)
-                        retry_delay = 2.0 * download_attempt
+                        retry_delay = 2.0 * max(1, download_attempt)
                         self.root.after(0, lambda err=error_msg[:100], attempt=download_attempt: 
                             self.log(f"DEBUG: Download error on attempt {attempt + 1}, will retry: {err}"))
                     
-                    time.sleep(retry_delay)
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
                     continue
                 
                 # Final attempt failed
@@ -24590,6 +26290,17 @@ class BandcampDownloaderGUI:
             self.settings_menu.add_command(
                 label=theme_label,
                 command=self.toggle_theme
+            )
+
+            # Cover-art palette overlay (augments Light/Dark for the focused release)
+            if not hasattr(self, 'apply_cover_palette_var'):
+                self.apply_cover_palette_var = BooleanVar(
+                    value=bool(getattr(self, 'apply_cover_palette', False))
+                )
+            self.settings_menu.add_checkbutton(
+                label="Apply Palette from Cover Art",
+                variable=self.apply_cover_palette_var,
+                command=self.on_apply_cover_palette_change
             )
             
             # URL Tag Color Scheme submenu
