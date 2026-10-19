@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 import sys
 import subprocess
@@ -1772,9 +1772,16 @@ class BandcampDownloaderGUI:
         # Default on so the feature is front-and-center; users can toggle off in Settings
         self.apply_cover_palette = bool(settings.get("apply_palette_from_cover_art", True))
         self.apply_cover_palette_var = BooleanVar(value=self.apply_cover_palette)
+        # Per-URL tag chips use cover accent when parent palette is on (default on)
+        self.url_tags_match_cover = bool(settings.get("url_tags_match_cover_art", True))
+        self.url_tags_match_cover_var = BooleanVar(value=self.url_tags_match_cover)
         self._focused_cover_pil = None  # cover for focused URL (not bio/extra carousel frames)
         self._cover_palette_fp = None
         self._cover_palette_refresh_after_id = None
+        # Cover-accent cache for URL tags: {(mode, thumb_key): accent_hex}, {(mode, url_key): accent_hex}
+        self._tag_cover_accent_by_thumb = {}
+        self._tag_cover_accent_by_url = {}
+        self._tag_cover_accent_inflight = set()
         self.theme_colors = ThemeColors(self.current_theme)
         
         # Batch URL mode tracking
@@ -2240,6 +2247,12 @@ class BandcampDownloaderGUI:
         if self.status_detached:
             self._apply_theme_to_detached_window()
         
+        # Cover-accent tag colors are mode-specific — refresh chips after Dark/Light switch
+        try:
+            self._refresh_all_url_tag_colors()
+        except Exception:
+            pass
+        
         # Save preference
         self._save_theme_preference()
 
@@ -2322,11 +2335,230 @@ class BandcampDownloaderGUI:
             self._focused_cover_pil = img
         if getattr(self, 'apply_cover_palette', False):
             self._schedule_cover_palette_refresh()
+        # Reuse already-decoded cover for the focused URL tag accent (no extra download)
+        if self._url_tags_match_cover_effective():
+            page_url = getattr(self, 'current_url_being_processed', None)
+            if page_url:
+                self._schedule_url_tag_cover_accent(
+                    page_url, thumbnail_url=thumbnail_url or cover_url, pil_image=self._focused_cover_pil
+                )
 
     def _clear_focused_cover_pil(self):
         self._focused_cover_pil = None
         if getattr(self, 'apply_cover_palette', False):
             self._schedule_cover_palette_refresh()
+
+    def _url_tags_match_cover_effective(self):
+        """True when cover palette is on and URL tags should use per-cover accents."""
+        return bool(getattr(self, 'apply_cover_palette', False)) and bool(
+            getattr(self, 'url_tags_match_cover', False)
+        )
+
+    def _tag_cover_theme_mode(self):
+        return self.current_theme if getattr(self, 'current_theme', None) in ('dark', 'light') else 'dark'
+
+    def _tag_cover_thumb_key(self, thumbnail_url):
+        if not thumbnail_url:
+            return None
+        try:
+            return self._normalize_image_url_for_comparison(thumbnail_url) or str(thumbnail_url).strip().lower()
+        except Exception:
+            return str(thumbnail_url).strip().lower()
+
+    def _accent_hex_from_pil(self, pil_image):
+        """Sample cover palette accent (same role as download button / progress)."""
+        if pil_image is None:
+            return None
+        try:
+            mode = self._tag_cover_theme_mode()
+            pal = _cover_palette.palette_from_pil(pil_image, mode=mode)
+            if not pal or not _cover_palette.album_palette_is_usable(pal):
+                return None
+            accent = (pal.get('accent') or '').strip()
+            return accent or None
+        except Exception:
+            return None
+
+    def _store_tag_cover_accent(self, url_key, thumbnail_url, accent, mode=None):
+        if not accent or not url_key:
+            return
+        mode = mode or self._tag_cover_theme_mode()
+        if not hasattr(self, '_tag_cover_accent_by_url'):
+            self._tag_cover_accent_by_url = {}
+        if not hasattr(self, '_tag_cover_accent_by_thumb'):
+            self._tag_cover_accent_by_thumb = {}
+        self._tag_cover_accent_by_url[(mode, url_key)] = accent
+        thumb_key = self._tag_cover_thumb_key(thumbnail_url)
+        if thumb_key:
+            self._tag_cover_accent_by_thumb[(mode, thumb_key)] = accent
+
+    def _get_cached_tag_cover_accent_for_url(self, page_url):
+        """Return cached accent hex for a release URL, or None."""
+        if not page_url or not self._url_tags_match_cover_effective():
+            return None
+        mode = self._tag_cover_theme_mode()
+        url_key = self._normalize_release_url_key(page_url)
+        accent = getattr(self, '_tag_cover_accent_by_url', {}).get((mode, url_key))
+        if accent:
+            return accent
+        meta = getattr(self, 'url_tag_metadata_cache', {}).get(url_key) or {}
+        thumb = meta.get('thumbnail_url')
+        thumb_key = self._tag_cover_thumb_key(thumb)
+        if thumb_key:
+            return getattr(self, '_tag_cover_accent_by_thumb', {}).get((mode, thumb_key))
+        return None
+
+    def _schedule_url_tag_cover_accent(self, page_url, thumbnail_url=None, pil_image=None):
+        """Sample cover accent for a URL tag (cache + in-place recolor). Uses scheme color until ready."""
+        if not self._url_tags_match_cover_effective() or not page_url:
+            return
+        url_key = self._normalize_release_url_key(page_url)
+        if not url_key:
+            return
+        mode = self._tag_cover_theme_mode()
+
+        if pil_image is not None:
+            def sample_pil():
+                accent = self._accent_hex_from_pil(pil_image)
+                if not accent:
+                    return
+                self._store_tag_cover_accent(url_key, thumbnail_url, accent, mode=mode)
+                try:
+                    self.root.after(0, lambda a=accent, u=url_key: self._apply_cover_accent_to_url_tags(u, a))
+                except Exception:
+                    pass
+            threading.Thread(target=sample_pil, daemon=True).start()
+            return
+
+        thumb = thumbnail_url
+        if not thumb:
+            meta = getattr(self, 'url_tag_metadata_cache', {}).get(url_key) or {}
+            thumb = meta.get('thumbnail_url')
+        if not thumb:
+            return
+
+        cached = self._get_cached_tag_cover_accent_for_url(page_url)
+        if cached:
+            try:
+                self.root.after(0, lambda a=cached, u=url_key: self._apply_cover_accent_to_url_tags(u, a))
+            except Exception:
+                pass
+            return
+
+        thumb_key = self._tag_cover_thumb_key(thumb)
+        inflight_key = (mode, thumb_key or url_key)
+        if not hasattr(self, '_tag_cover_accent_inflight'):
+            self._tag_cover_accent_inflight = set()
+        if inflight_key in self._tag_cover_accent_inflight:
+            return
+        self._tag_cover_accent_inflight.add(inflight_key)
+
+        def fetch_and_sample():
+            try:
+                fetch_url = thumb
+                if _bandcamp_fetch is not None:
+                    try:
+                        fetch_url = (
+                            _bandcamp_fetch.upgrade_bcbits_art_url(
+                                thumb, prefer_fmt=_bandcamp_fetch.BCBITS_PREVIEW_FMT
+                            )
+                            or thumb
+                        )
+                    except Exception:
+                        fetch_url = thumb
+                import io
+                Image, _ImageTk = self._ensure_pil_loaded()
+                if Image is None:
+                    return
+                image_data = self._fetch_with_retry(fetch_url, max_retries=2, timeout=10)
+                if not image_data:
+                    return
+                img = Image.open(io.BytesIO(image_data))
+                img = img.convert('RGB')
+                # Small sample is enough for palette designer
+                try:
+                    resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                    img.thumbnail((96, 96), resample)
+                except Exception:
+                    pass
+                accent = self._accent_hex_from_pil(img)
+                if not accent:
+                    return
+                self._store_tag_cover_accent(url_key, thumb, accent, mode=mode)
+                try:
+                    self.root.after(0, lambda a=accent, u=url_key: self._apply_cover_accent_to_url_tags(u, a))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    self._tag_cover_accent_inflight.discard(inflight_key)
+                except Exception:
+                    pass
+
+        threading.Thread(target=fetch_and_sample, daemon=True).start()
+
+    def _apply_cover_accent_to_url_tags(self, url_key, accent):
+        """Recolor any URL tag chips matching *url_key* to cover accent (in place)."""
+        if not accent or not self._url_tags_match_cover_effective():
+            return
+        text_widget = getattr(self, 'url_text_widget', None)
+        if text_widget is None or not getattr(self, 'url_tag_mapping', None):
+            return
+        fg = self._get_tag_text_color(accent)
+        try:
+            for tag_id, full_url in list(self.url_tag_mapping.items()):
+                if self._normalize_release_url_key(full_url) != url_key:
+                    continue
+                self.url_tag_colors[tag_id] = (accent, fg)
+                try:
+                    text_widget.tag_config(
+                        f"url_tag_{tag_id}",
+                        background=accent,
+                        foreground=fg,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _refresh_all_url_tag_colors(self):
+        """Re-apply scheme or cover-accent colors to every URL tag (setting / theme change)."""
+        text_widget = getattr(self, 'url_text_widget', None)
+        if text_widget is None or not getattr(self, 'url_tag_mapping', None):
+            return
+        # Order tags by text position for stable scheme rotation
+        ordered = []
+        for tag_id, pos in getattr(self, 'url_tag_positions', {}).items():
+            try:
+                start = pos[0] if isinstance(pos, (tuple, list)) else pos
+                ordered.append((self._tk_text_index_sort_key(start), tag_id))
+            except Exception:
+                ordered.append((0, tag_id))
+        ordered.sort()
+        match_cover = self._url_tags_match_cover_effective()
+        for index, (_key, tag_id) in enumerate(ordered):
+            full_url = self.url_tag_mapping.get(tag_id)
+            accent = self._get_cached_tag_cover_accent_for_url(full_url) if match_cover else None
+            if accent:
+                bg, fg = accent, self._get_tag_text_color(accent)
+            else:
+                bg = self._get_tag_color_sequential(index)
+                fg = self._get_tag_text_color(bg)
+                if match_cover and full_url:
+                    # Kick off sampling; recolor lands async when ready
+                    meta = getattr(self, 'url_tag_metadata_cache', {}).get(
+                        self._normalize_release_url_key(full_url)
+                    ) or {}
+                    thumb = meta.get('thumbnail_url')
+                    if thumb:
+                        self._schedule_url_tag_cover_accent(full_url, thumbnail_url=thumb)
+            self.url_tag_colors[tag_id] = (bg, fg)
+            try:
+                text_widget.tag_config(f"url_tag_{tag_id}", background=bg, foreground=fg)
+            except Exception:
+                pass
 
     def on_apply_cover_palette_change(self):
         """Settings: toggle cover-art palette overlay on/off."""
@@ -2334,6 +2566,7 @@ class BandcampDownloaderGUI:
         self.apply_cover_palette = enabled
         settings = self._load_settings()
         settings["apply_palette_from_cover_art"] = enabled
+        settings["url_tags_match_cover_art"] = bool(getattr(self, 'url_tags_match_cover', True))
         self._save_settings(settings)
         prev = getattr(self, '_cover_palette_fp', None)
         self._rebuild_theme_colors()
@@ -2351,12 +2584,42 @@ class BandcampDownloaderGUI:
                 self._update_structure_dropdown()
         except Exception:
             pass
+        # Child setting is gated by this toggle; refresh tag colors either way
+        try:
+            self._refresh_all_url_tag_colors()
+        except Exception:
+            pass
+        self._sync_url_tags_match_cover_menu_state()
+
+    def on_url_tags_match_cover_change(self):
+        """Settings: toggle per-URL cover accents on tag chips."""
+        enabled = bool(self.url_tags_match_cover_var.get())
+        self.url_tags_match_cover = enabled
+        settings = self._load_settings()
+        settings["url_tags_match_cover_art"] = enabled
+        self._save_settings(settings)
+        try:
+            self._refresh_all_url_tag_colors()
+        except Exception:
+            pass
+
+    def _sync_url_tags_match_cover_menu_state(self):
+        """Enable/disable the URL Tags Match Cover Art checkbutton based on parent palette."""
+        menu = getattr(self, 'settings_menu', None)
+        if menu is None:
+            return
+        try:
+            state = 'normal' if getattr(self, 'apply_cover_palette', False) else 'disabled'
+            menu.entryconfig('URL Tags Match Cover Art', state=state)
+        except Exception:
+            pass
     
     def _save_theme_preference(self):
         """Save current theme preference to settings."""
         settings = self._load_settings()
         settings["theme"] = self.current_theme
         settings["apply_palette_from_cover_art"] = bool(getattr(self, 'apply_cover_palette', False))
+        settings["url_tags_match_cover_art"] = bool(getattr(self, 'url_tags_match_cover', True))
         self._save_settings(settings)
     
     def _refresh_all_widgets(self):
@@ -3265,6 +3528,7 @@ class BandcampDownloaderGUI:
                 "custom_structure_templates": (self.custom_structure_templates if hasattr(self, 'custom_structure_templates') and self.custom_structure_templates else []),
                 "theme": self.current_theme if hasattr(self, 'current_theme') else 'dark',
                 "apply_palette_from_cover_art": bool(getattr(self, 'apply_cover_palette', False)),
+                "url_tags_match_cover_art": bool(getattr(self, 'url_tags_match_cover', True)),
             }
         
         settings_file = self._get_settings_file()
@@ -10111,10 +10375,24 @@ class BandcampDownloaderGUI:
                                 tag_text_color = pending_new_tag_info['fg_color']
                                 matched = True
                     
-                    # If still not matched, use sequential color
+                    # If still not matched, use sequential color (URL Tag Theme)
                     if not matched:
                         tag_color = self._get_tag_color_sequential(tag_id_counter)
                         tag_text_color = self._get_tag_text_color(tag_color)
+
+                    # Cover accent overrides theme color when available (else keep scheme until art loads)
+                    if self._url_tags_match_cover_effective():
+                        cover_accent = self._get_cached_tag_cover_accent_for_url(full_url)
+                        if cover_accent:
+                            tag_color = cover_accent
+                            tag_text_color = self._get_tag_text_color(tag_color)
+                        else:
+                            meta = getattr(self, 'url_tag_metadata_cache', {}).get(
+                                self._normalize_release_url_key(full_url)
+                            ) or {}
+                            thumb = meta.get('thumbnail_url')
+                            if thumb:
+                                self._schedule_url_tag_cover_accent(full_url, thumbnail_url=thumb)
                     
                     # Create new tag_id if not preserved
                     if tag_id is None:
@@ -13959,6 +14237,8 @@ class BandcampDownloaderGUI:
         }
         self.url_metadata_cache[normalized_url] = metadata
         self.url_tag_metadata_cache[normalized_url] = dict(metadata)
+        if thumbnail_url:
+            self._schedule_url_tag_cover_accent(url, thumbnail_url=thumbnail_url)
 
         if self._is_focused_release_url(url):
             self.album_info = {
@@ -15761,6 +16041,8 @@ class BandcampDownloaderGUI:
                         self.url_tag_metadata_cache[normalized_url]['bio_pic_url'] = high_quality_bio_pic if bio_pic_url else None
                         self.url_tag_metadata_cache[normalized_url]['thumbnail_url'] = high_quality_thumbnail if thumbnail_url else None
                         self.url_tag_metadata_cache[normalized_url]['extra_artwork_urls'] = extra_artwork_urls
+                        if high_quality_thumbnail:
+                            self._schedule_url_tag_cover_accent(url, thumbnail_url=high_quality_thumbnail)
                         if self.debug_mode and high_quality_bio_pic:
                             self.log(f"DEBUG: Stored bio pic in metadata cache for: {normalized_url[:60]}...")
                     except Exception as e:
@@ -26305,6 +26587,17 @@ class BandcampDownloaderGUI:
                 variable=self.apply_cover_palette_var,
                 command=self.on_apply_cover_palette_change
             )
+
+            if not hasattr(self, 'url_tags_match_cover_var'):
+                self.url_tags_match_cover_var = BooleanVar(
+                    value=bool(getattr(self, 'url_tags_match_cover', True))
+                )
+            self.settings_menu.add_checkbutton(
+                label="URL Tags Match Cover Art",
+                variable=self.url_tags_match_cover_var,
+                command=self.on_url_tags_match_cover_change
+            )
+            self._sync_url_tags_match_cover_menu_state()
             
             # URL Tag Color Scheme submenu
             colors = self.theme_colors
@@ -26365,6 +26658,9 @@ class BandcampDownloaderGUI:
         except Exception:
             # If rebuilding fails, continue anyway - menu should still work
             pass
+
+        # Parent palette gates the cover-match checkbutton
+        self._sync_url_tags_match_cover_menu_state()
         
         # Show menu at cursor position
         try:
