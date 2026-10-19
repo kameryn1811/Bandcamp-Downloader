@@ -18,7 +18,7 @@ Bandcamp Downloader (Python Edition) provides a simple way to download the freel
 
 *The main download interface with URL Tags (Download Queue), Settings Panel, Album Art and Path Previews, and Status log.*
 
-<img width="600" alt="screenshot-main" src="images/screenshot-main-v1.3.9b.png" />
+<img width="548" height="640" alt="image" src="https://github.com/user-attachments/assets/ceae9904-941c-4370-b50d-98ddef212ac8" />
 
 ## Key Features
 
