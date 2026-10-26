@@ -25,7 +25,7 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 import sys
 import subprocess
@@ -4835,7 +4835,7 @@ class BandcampDownloaderGUI:
         # MP3 skip re-encoding checkbox
         mp3_checkbox = Checkbutton(
             mp3_content,
-            text="Skip re-encoding if bandcamp file is an MP3 (When using MP3 format)",
+            text="Skip re-encoding if Bandcamp file is an MP3 (when using MP3 format)",
             variable=self.skip_mp3_reencode_var,
             command=self._on_skip_mp3_reencode_change,
             font=("Segoe UI", 9),
@@ -4865,7 +4865,7 @@ class BandcampDownloaderGUI:
         # Prefer Album Artist for Folders checkbox (in MP3 panel)
         prefer_album_artist_checkbox = Checkbutton(
             mp3_content,
-            text="Prefer Album Artist for Folders (use album artist instead of track artist when available)",
+            text="Prefer Album Artist for Folders (use Album Artist instead of Track Artist when available)",
             variable=self.prefer_album_artist_for_folders_var,
             command=self._on_prefer_album_artist_for_folders_change,
             font=("Segoe UI", 9),
@@ -4883,7 +4883,7 @@ class BandcampDownloaderGUI:
         # Note about flexibility
         album_artist_note_label = Label(
             mp3_content,
-            text="Note: For more flexibility, you can disable this option and use 'Album Artist' field in folder structure instead.",
+            text="Note: For more flexibility, you can disable this option and use \"Album Artist\" field in folder structure instead.",
             font=("Segoe UI", 8),
             bg=main_bg,
             fg=colors.disabled_fg,
@@ -4913,7 +4913,7 @@ class BandcampDownloaderGUI:
         # Note explaining progress bar swap behavior
         show_overall_note_label = Label(
             mp3_content,
-            text="Note: When enabled, progress bars swap so overall progress is shown in the large bar and track progress is shown in the thin bar.",
+            text="Note: When enabled, progress bars swap so Overall Progress is shown in the Large Bar and track progress is shown in the Thin Bar.",
             font=("Segoe UI", 8),
             bg=main_bg,
             fg=colors.disabled_fg,
@@ -6143,7 +6143,7 @@ class BandcampDownloaderGUI:
     def setup_ui(self):
         """Create the GUI interface."""
         # Main container with compact padding
-        main_frame = ttk.Frame(self.root, padding="8")
+        main_frame = ttk.Frame(self.root, padding="5")
         main_frame.grid(row=0, column=0, sticky=(W, E, N, S))
         self.main_frame = main_frame  # Store reference for detachable status window
         
@@ -6158,7 +6158,7 @@ class BandcampDownloaderGUI:
         # "Path:" with Segoe UI 9pt is approximately 40-45 pixels
         path_label_width = 45  # Fixed estimate - avoids blocking update_idletasks() call
         
-        main_frame.columnconfigure(0, weight=0, minsize=path_label_width)  # Column 0 sized for Path label
+        main_frame.columnconfigure(1, weight=0, minsize=path_label_width)  # Column 0 sized for Path label
         main_frame.columnconfigure(1, weight=1)
         main_frame.columnconfigure(2, weight=0)  # Album art column doesn't expand
         main_frame.rowconfigure(10, weight=1)  # Status log row expands
@@ -6395,7 +6395,7 @@ class BandcampDownloaderGUI:
         # This will be positioned over the ScrolledText but won't interfere with editing
         placeholder_label = Label(
             url_text_frame,
-            text="Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs",
+            text="Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.",
             font=("Tahoma", 9),
             bg=colors.entry_bg,
             fg=colors.disabled_fg,
@@ -7169,7 +7169,7 @@ class BandcampDownloaderGUI:
             bg=settings_frame_bg,
             fg=colors.disabled_fg,
             cursor='hand2',
-            width=2
+            width=1
         )
         # Always add to grid so it's always visible and can toggle panel visibility
         self.show_album_art_btn.grid(row=0, column=2, sticky=E, padx=(4, 0), pady=1)
@@ -7732,7 +7732,7 @@ class BandcampDownloaderGUI:
             font=("Consolas", 8),
             bg=preview_frame_bg,
             fg=colors.preview_link,
-            wraplength=422,  # Reduced to ensure proper wrapping
+            wraplength=428,  # Reduced to ensure proper wrapping
             justify='left',
             anchor='w',  # Left-align the text
             cursor='hand2'  # Hand cursor to indicate Clickability
@@ -8582,7 +8582,7 @@ class BandcampDownloaderGUI:
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get().strip()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 content = ""
         else:
             content = ""
@@ -8657,7 +8657,7 @@ class BandcampDownloaderGUI:
             # Currently in Entry mode - expand to ScrolledText
             content = self.url_var.get().strip()
             # Remove placeholder text if present
-            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 content = ""
             # Expand to multi-line
             self._expand_to_multiline(content)
@@ -8713,7 +8713,7 @@ class BandcampDownloaderGUI:
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             # Entry is visible - clear it and restore placeholder
             self.url_var.set("")
-            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.")
             # Unfocus
             self.root.focus_set()
         
@@ -8742,7 +8742,7 @@ class BandcampDownloaderGUI:
         # Clear placeholder text if present before pasting
         if self.url_entry_widget:
             current_content = self.url_var.get()
-            if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 # Clear placeholder text
                 self.url_entry_widget.delete(0, END)
                 self.url_entry_widget.config(foreground='#CCCCCC')  # Normal text color
@@ -8800,7 +8800,7 @@ class BandcampDownloaderGUI:
             current_content_raw = self.url_var.get()
             current_content = current_content_raw.strip()
             # Skip placeholder text
-            if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 current_content = ""
                 current_content_raw = ""
             
@@ -9115,7 +9115,7 @@ class BandcampDownloaderGUI:
         if self.url_entry_widget:
             content = self.url_var.get()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 content = ""
             if '\n' in content:
                 # Has newlines - expand to multi-line
@@ -9133,7 +9133,7 @@ class BandcampDownloaderGUI:
         if self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 return
             if '\n' in content:
                 # Has newlines - expand to multi-line
@@ -9148,7 +9148,7 @@ class BandcampDownloaderGUI:
             elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
                 current_content = self.url_var.get().strip()
                 # Skip placeholder text
-                if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+                if current_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                     current_content = ""
             else:
                 current_content = ""
@@ -9236,9 +9236,9 @@ class BandcampDownloaderGUI:
                 self._expand_to_multiline(previous_content)
             else:
                 # Handle empty content - clear preview and artwork
-                if not previous_content or not previous_content.strip() or previous_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+                if not previous_content or not previous_content.strip() or previous_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                     self.url_var.set("")
-                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.")
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self._reset_artwork_state()
@@ -9264,7 +9264,7 @@ class BandcampDownloaderGUI:
             
             # Clear the field
             self.url_var.set("")
-            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
+            self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.")
             # Immediately clear preview and artwork
             self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
             self._reset_artwork_state()
@@ -9310,9 +9310,9 @@ class BandcampDownloaderGUI:
                 self._expand_to_multiline(next_content)
             else:
                 # Handle empty content - clear preview and artwork
-                if not next_content or not next_content.strip() or next_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+                if not next_content or not next_content.strip() or next_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                     self.url_var.set("")
-                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs")
+                    self._set_entry_placeholder(self.url_entry_widget, "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.")
                     # Immediately clear preview and artwork
                     self.album_info = {"artist": None, "album": None, "title": None, "thumbnail_url": None, "detected_format": None, "year": None}
                     self._reset_artwork_state()
@@ -9632,7 +9632,7 @@ class BandcampDownloaderGUI:
         if not initial_content and self.url_entry_widget:
             initial_content = self.url_var.get()
             # Remove placeholder text if present
-            if initial_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if initial_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 initial_content = ""
         
         # Extract URLs from the single-line content (handles multiple URLs on one line)
@@ -9755,7 +9755,7 @@ class BandcampDownloaderGUI:
         if not text or not text.strip():
             return 0
         # Skip placeholder text
-        if text.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+        if text.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
             return 0
         # Count occurrences of 'bandcamp.com' (case-insensitive)
         text_lower = text.lower()
@@ -11268,7 +11268,7 @@ class BandcampDownloaderGUI:
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             content = self.url_var.get().strip()
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 content = ""
         else:
             content = ""
@@ -13287,7 +13287,7 @@ class BandcampDownloaderGUI:
         if not content or not content.strip():
             return []
         # Skip placeholder text
-        if content.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+        if content.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
             return []
         
         # Check if we have URL tags (tag mapping exists and has entries)
@@ -13337,7 +13337,7 @@ class BandcampDownloaderGUI:
         
         for line in lines:
             line = line.strip()
-            if not line or line == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if not line or line == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 continue
             
             # Check if line contains multiple URLs (by counting 'bandcamp.com' or 'https://' patterns)
@@ -13414,11 +13414,11 @@ class BandcampDownloaderGUI:
             if not text_content:
                 return []
             # Skip placeholder text
-            if text_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if text_content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 return []
             # Split by lines and filter out empty lines and placeholder
             urls = [line.strip() for line in text_content.split('\n') 
-                   if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs"]
+                   if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs."]
             return urls
         elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
             # Fallback to Entry widget
@@ -13426,12 +13426,12 @@ class BandcampDownloaderGUI:
             if not content:
                 return []
             # Skip placeholder text
-            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 return []
             # Check if it has newlines (shouldn't happen in Entry, but handle it)
             if '\n' in content:
                 urls = [line.strip() for line in content.split('\n') 
-                       if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs"]
+                       if line.strip() and line.strip() != "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs."]
                 return urls
             return [content] if content else []
         return []
@@ -13442,7 +13442,7 @@ class BandcampDownloaderGUI:
             return ""
         
         # Remove placeholder text if present
-        if text.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+        if text.strip() == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
             return ""
         
         import re
@@ -13455,7 +13455,7 @@ class BandcampDownloaderGUI:
                 continue
             
             # Skip placeholder text
-            if line == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+            if line == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                 continue
             
             # Check if line contains multiple 'bandcamp.com' occurrences
@@ -13830,7 +13830,7 @@ class BandcampDownloaderGUI:
         url = url.strip() if url else ""
         
         # Reset metadata if URL is empty or just whitespace
-        if not url or url == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+        if not url or url == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
             # Cancel any in-flight artwork fetches
             self.artwork_fetch_id += 1
             self.current_url_being_processed = None
@@ -16235,7 +16235,7 @@ class BandcampDownloaderGUI:
             elif self.url_entry_widget and self.url_entry_widget.winfo_viewable():
                 content = self.url_var.get().strip()
                 # Skip placeholder text
-                if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or CTRL+V to Paste; or Drag and Drop URLs":
+                if content == "Paste one URL or multiple to create a batch.\nUse ➕, Right Click or Ctrl+V to paste; or Drag and Drop URLs.":
                     content = ""
             else:
                 content = ""
