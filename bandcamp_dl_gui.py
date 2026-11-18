@@ -13,8 +13,12 @@ Features:
 
 Requirements:
 - Python 3.11+
-- yt-dlp (pip install -U yt-dlp)
+- yt-dlp with curl_cffi (pip install -U "yt-dlp[default,curl-cffi]" curl_cffi)
 - ffmpeg.exe in same folder as script
+
+Bandcamp fingerprints plain Python TLS (urllib) and serves a "Client Challenge" page.
+The Player fixed this with curl_cffi browser impersonation; the Downloader uses the same
+approach for metadata/cover, and a current yt-dlp that retries Bandcamp with impersonation.
 """
 
 # ============================================================================
@@ -25,7 +29,11 @@ SHOW_SKIP_POSTPROCESSING_OPTION = False
 # ============================================================================
 
 # Application version (update this when releasing)
-__version__ = "1.4.3"
+__version__ = "1.4.4"
+
+# yt-dlp versions before Bandcamp browser-impersonation retries fail with empty tracklists
+# under client-challenge pages (see yt-dlp #17410 / #18029).
+_MIN_YTDLP_VERSION = (2026, 8, 19)
 
 import sys
 import subprocess
@@ -40,11 +48,220 @@ import json
 import html
 from pathlib import Path
 
+
+def _parse_ytdlp_version_tuple(version_str: str):
+    """Parse yt-dlp version like '2026.10.26' → (2026, 10, 26)."""
+    try:
+        parts = []
+        for bit in str(version_str).strip().split("."):
+            digits = "".join(ch for ch in bit if ch.isdigit())
+            if digits:
+                parts.append(int(digits))
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+def _ytdlp_needs_upgrade() -> bool:
+    try:
+        import yt_dlp
+        ver = getattr(getattr(yt_dlp, "version", None), "__version__", None) or getattr(yt_dlp, "__version__", "")
+        return _parse_ytdlp_version_tuple(ver) < _MIN_YTDLP_VERSION
+    except Exception:
+        return True
+
+
+def _pip_install(*packages: str) -> bool:
+    """Install packages with pip; return True on success."""
+    if not packages:
+        return True
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", *packages, "--disable-pip-version-check"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode == 0:
+            import importlib
+            importlib.invalidate_caches()
+            return True
+        print(f"pip install failed for {packages}: {(result.stderr or result.stdout or '')[:300]}")
+        return False
+    except Exception as e:
+        print(f"pip install error for {packages}: {e}")
+        return False
+
+
+def _ensure_bandcamp_tls_stack() -> bool:
+    """Install curl_cffi + activate urllib TLS impersonation for bandcamp.com hosts.
+
+    Mirrors Beni's Bandcamp Player ``bandcamp_http`` fix. Safe to call multiple times.
+    Returns True when impersonation is available.
+    """
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        print("Installing curl_cffi (required for Bandcamp TLS / client-challenge bypass)...")
+        if not _pip_install("curl_cffi"):
+            return False
+        try:
+            import curl_cffi  # noqa: F401
+        except ImportError:
+            print("Warning: curl_cffi installed but import still fails — restart may be required.")
+            return False
+
+    # Prefer sibling module (same as Player); fall back to a minimal inline patch for
+    # auto-update installs that only received bandcamp_dl_gui.py.
+    try:
+        from bandcamp_http import install_urllib_bandcamp_patch, bandcamp_http_impersonation_available
+        ok = install_urllib_bandcamp_patch()
+        return bool(ok or bandcamp_http_impersonation_available())
+    except ImportError:
+        pass
+
+    try:
+        import io
+        import urllib.error
+        import urllib.request
+        from email.message import Message
+        from urllib.parse import urlparse
+        from curl_cffi import requests as _cffi_requests
+
+        if getattr(urllib.request, "_bandcamp_tls_patched", False):
+            return True
+
+        _orig = urllib.request.urlopen
+        _local = threading.local()
+
+        def _session():
+            session = getattr(_local, "session", None)
+            if session is None:
+                session = _cffi_requests.Session(impersonate="chrome")
+                _local.session = session
+            return session
+
+        def _is_bc(url: str) -> bool:
+            try:
+                host = (urlparse(url).hostname or "").lower()
+            except Exception:
+                return False
+            return host == "bandcamp.com" or host.endswith(".bandcamp.com")
+
+        def _urlopen(url, data=None, timeout=None, *, cafile=None, capath=None, cadefault=False, context=None):
+            try:
+                req = url if isinstance(url, urllib.request.Request) else urllib.request.Request(url, data=data)
+                target = req.full_url
+            except Exception:
+                return _orig(url, data=data, timeout=timeout, cafile=cafile, capath=capath, cadefault=cadefault, context=context)
+            if not _is_bc(target):
+                return _orig(url, data=data, timeout=timeout, cafile=cafile, capath=capath, cadefault=cadefault, context=context)
+            headers = {k: v for k, v in req.header_items() if k.lower() != "user-agent"}
+            try:
+                resp = _session().request(
+                    req.get_method(), req.full_url, headers=headers, data=req.data, timeout=timeout, allow_redirects=True
+                )
+            except Exception as e:
+                raise urllib.error.URLError(e) from e
+            msg = Message()
+            try:
+                for k, v in resp.headers.items():
+                    msg[k] = v
+            except Exception:
+                pass
+            if resp.status_code >= 400:
+                raise urllib.error.HTTPError(
+                    str(resp.url), resp.status_code, getattr(resp, "reason", "") or "", msg, io.BytesIO(resp.content)
+                )
+
+            class _Resp:
+                def __init__(self):
+                    self.url = str(resp.url)
+                    self.status = resp.status_code
+                    self.headers = msg
+                    self._body = io.BytesIO(resp.content)
+
+                def read(self, amt=-1):
+                    return self._body.read(-1 if amt is None else amt)
+
+                def getcode(self):
+                    return self.status
+
+                def geturl(self):
+                    return self.url
+
+                def info(self):
+                    return self.headers
+
+                def close(self):
+                    self._body.close()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_a):
+                    self.close()
+
+            return _Resp()
+
+        urllib.request.urlopen = _urlopen  # type: ignore[assignment]
+        urllib.request._bandcamp_tls_patched = True  # type: ignore[attr-defined]
+        return True
+    except Exception as e:
+        print(f"Warning: could not enable Bandcamp TLS impersonation: {e}")
+        return False
+
+
+def _ensure_ytdlp_for_bandcamp() -> bool:
+    """Ensure yt-dlp is present, current enough, and paired with curl_cffi."""
+    need_install = False
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        need_install = True
+
+    needs_upgrade = need_install or _ytdlp_needs_upgrade()
+    if needs_upgrade:
+        print("Installing/upgrading yt-dlp with curl-cffi support (Bandcamp client-challenge fix)...")
+        # Explicit curl_cffi package as well — some environments don't pull extras cleanly.
+        if not _pip_install("yt-dlp[default,curl-cffi]", "curl_cffi"):
+            if need_install:
+                return False
+            print("Warning: yt-dlp upgrade failed; downloads may hit Bandcamp client challenges.")
+            return True
+        # Drop the stale in-process module so later imports see the upgraded package.
+        import importlib
+        import sys as _sys
+        for name in list(_sys.modules):
+            if name == "yt_dlp" or name.startswith("yt_dlp."):
+                _sys.modules.pop(name, None)
+        try:
+            importlib.invalidate_caches()
+            import yt_dlp  # noqa: F401
+            ver = getattr(getattr(yt_dlp, "version", None), "__version__", "?")
+            print(f"yt-dlp ready ({ver})")
+        except ImportError:
+            print("Warning: yt-dlp upgraded but import still fails — restart the app.")
+            return False
+    return True
+
+
+# Install TLS / yt-dlp stack before Bandcamp fetch helpers import urllib paths.
+_ensure_bandcamp_tls_stack()
+_ensure_ytdlp_for_bandcamp()
+_ensure_bandcamp_tls_stack()  # re-activate patch after any pip installs
+
 # Player-style Bandcamp tralbum/API fetch + shared request pacing (sibling module)
 try:
     import bandcamp_fetch as _bandcamp_fetch
 except ImportError:
     _bandcamp_fetch = None
+
+# If bandcamp_fetch was already imported elsewhere with plain urllib, re-assert the TLS patch.
+_ensure_bandcamp_tls_stack()
 
 # ============================================================================
 # COVER-ART PALETTE (inlined so auto-update stays a single .py)
@@ -416,15 +633,18 @@ def check_and_install_dependencies():
     """
     # Skip if running as bundled executable (dependencies are already included)
     if hasattr(sys, 'frozen'):
+        # Still activate TLS patch when possible (bundled envs may have curl_cffi).
+        _ensure_bandcamp_tls_stack()
         return True
-    
-    missing_deps = []
-    
-    # Check yt-dlp (required)
-    try:
-        import yt_dlp  # noqa: F401
-    except ImportError:
-        missing_deps.append("yt-dlp")
+
+    # Bandcamp client-challenge stack (curl_cffi TLS + current yt-dlp)
+    if not _ensure_ytdlp_for_bandcamp():
+        print("Failed to install yt-dlp with curl-cffi support.")
+        print('Please run: pip install -U "yt-dlp[default,curl-cffi]" curl_cffi\n')
+        return False
+    if not _ensure_bandcamp_tls_stack():
+        print("Warning: curl_cffi TLS impersonation unavailable — Bandcamp metadata/cover may fail.")
+        print("Install with: pip install -U curl_cffi\n")
     
     # Check mutagen (optional but recommended)
     try:
@@ -439,46 +659,6 @@ def check_and_install_dependencies():
     except ImportError:
         # PIL is optional, we'll install it but won't fail if it doesn't work
         pass
-    
-    # If core dependencies are missing, install them
-    if missing_deps:
-        print(f"\nMissing dependencies: {', '.join(missing_deps)}")
-        print("Attempting to install automatically...\n")
-        
-        # Install missing dependencies
-        for dep in missing_deps:
-            try:
-                print(f"Installing {dep}...")
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "--upgrade", dep,
-                     "--disable-pip-version-check"],
-                    check=False,
-                    capture_output=True,
-                    text=True
-                )
-                if result.returncode == 0:
-                    print(f"{dep} installed successfully!\n")
-                    # Clear import cache to allow newly installed packages to be imported
-                    import importlib
-                    importlib.invalidate_caches()
-                else:
-                    print(f"Failed to install {dep} automatically.")
-                    print(f"Please run: pip install -U {dep}\n")
-                    return False
-            except Exception as e:
-                print(f"Error installing {dep}: {e}")
-                print(f"Please install manually: pip install -U {dep}\n")
-                return False
-        
-        # Verify yt-dlp can now be imported
-        if "yt-dlp" in missing_deps:
-            try:
-                import yt_dlp  # noqa: F401
-                print("yt-dlp verified successfully!\n")
-            except ImportError:
-                print("Warning: yt-dlp was installed but import still fails.")
-                print("You may need to restart the application.\n")
-                return False
     
     # Try to install optional dependencies (mutagen, Pillow) if missing
     # These are optional so we don't fail if they can't be installed
@@ -522,6 +702,8 @@ if not hasattr(sys, 'frozen'):
         print("Please install them manually and try again.")
         input("Press Enter to exit...")
         sys.exit(1)
+else:
+    _ensure_bandcamp_tls_stack()
 
 # Now safe to import GUI libraries
 from tkinter import (
@@ -2031,7 +2213,7 @@ class BandcampDownloaderGUI:
         cancel_bg = entry_bg if self.current_theme == 'light' else select_bg
         style.configure('Cancel.TButton', background=cancel_bg, foreground=fg_color,
                        borderwidth=0, bordercolor=cancel_bg, relief='flat',
-                       padding=(14, 7), width=29)  # Slightly wider than download button to match visual size
+                       padding=(14, 7), width=24)  # Match/narrower than download (25); 29 was too wide on some DPI/fonts
         style.map('Cancel.TButton',
                  background=[('active', hover_bg), ('pressed', cancel_bg)],
                  bordercolor=[('active', cancel_bg), ('pressed', cancel_bg)])  # Match background to hide borders
@@ -5950,8 +6132,21 @@ class BandcampDownloaderGUI:
             webbrowser.open("https://www.python.org/downloads/")
             return False
         
+        # Ensure Bandcamp TLS impersonation is active (Player-style curl_cffi path)
+        try:
+            if _ensure_bandcamp_tls_stack():
+                self._log_debug("Bandcamp TLS impersonation (curl_cffi) active")
+            else:
+                self._log_debug("Bandcamp TLS impersonation unavailable — metadata/cover may hit client challenges")
+        except Exception:
+            pass
+
         # Check yt-dlp (actually try importing it - more reliable than find_spec)
         try:
+            if _ytdlp_needs_upgrade():
+                print("yt-dlp is outdated for current Bandcamp bot-protection; upgrading...")
+                if _ensure_ytdlp_for_bandcamp():
+                    print("yt-dlp upgraded for Bandcamp client-challenge support.")
             import yt_dlp  # noqa: F401
             # yt-dlp is available - no need to prompt
         except ImportError:
@@ -5959,11 +6154,11 @@ class BandcampDownloaderGUI:
             print("yt-dlp not found, attempting automatic installation...")
             try:
                 result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+                    [sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default,curl-cffi]", "curl_cffi"],
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    timeout=180
                 )
                 if result.returncode == 0:
                     # Clear import cache and try importing again
@@ -5996,7 +6191,7 @@ class BandcampDownloaderGUI:
                         messagebox.showinfo(
                             "Installation Required",
                             "Please install yt-dlp manually:\n\n"
-                            "python -m pip install -U yt-dlp\n\n"
+                            'python -m pip install -U "yt-dlp[default,curl-cffi]" curl_cffi\n\n'
                             "Then restart this application."
                         )
                         webbrowser.open("https://github.com/yt-dlp/yt-dlp#installation")
@@ -6015,7 +6210,7 @@ class BandcampDownloaderGUI:
                     messagebox.showinfo(
                         "Installation Required",
                         "Please install yt-dlp manually:\n\n"
-                        "python -m pip install -U yt-dlp\n\n"
+                        'python -m pip install -U "yt-dlp[default,curl-cffi]" curl_cffi\n\n'
                         "Then restart this application."
                     )
                     webbrowser.open("https://github.com/yt-dlp/yt-dlp#installation")
@@ -6101,25 +6296,30 @@ class BandcampDownloaderGUI:
         )
     
     def install_ytdlp(self):
-        """Install yt-dlp in a separate thread."""
+        """Install yt-dlp (+ curl_cffi) in a separate thread."""
         global yt_dlp
         def install():
             try:
                 subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+                    [sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default,curl-cffi]", "curl_cffi"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
                 # Try to import after installation
                 import importlib
                 import sys
-                if 'yt_dlp' in sys.modules:
-                    del sys.modules['yt_dlp']
+                for name in list(sys.modules):
+                    if name == "yt_dlp" or name.startswith("yt_dlp."):
+                        sys.modules.pop(name, None)
                 import yt_dlp
                 globals()['yt_dlp'] = yt_dlp
+                try:
+                    _ensure_bandcamp_tls_stack()
+                except Exception:
+                    pass
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Success",
-                    "yt-dlp installed successfully!\n\nPlease restart this application."
+                    "yt-dlp (with curl_cffi) installed successfully!\n\nPlease restart this application."
                 ))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror(
@@ -6127,13 +6327,13 @@ class BandcampDownloaderGUI:
                     f"Failed to install yt-dlp automatically.\n\n"
                     f"Error: {str(e)}\n\n"
                     "Please install manually:\n"
-                    "python -m pip install -U yt-dlp"
+                    'python -m pip install -U "yt-dlp[default,curl-cffi]" curl_cffi'
                 ))
         
         threading.Thread(target=install, daemon=True).start()
         messagebox.showinfo(
             "Installing",
-            "Installing yt-dlp...\n\nThis may take a moment.\n\n"
+            "Installing yt-dlp + curl_cffi...\n\nThis may take a moment.\n\n"
             "You'll be notified when it's complete."
         )
     
@@ -6261,7 +6461,7 @@ class BandcampDownloaderGUI:
         self.url_clear_btn.bind("<Button-1>", lambda e: self._clear_url_field())
         self.url_clear_btn.bind("<Enter>", lambda e: self.url_clear_btn.config(fg=colors.hover_fg))
         self.url_clear_btn.bind("<Leave>", lambda e: self.url_clear_btn.config(fg=colors.disabled_fg))
-        self._create_tooltip(self.url_clear_btn, "Clear all URLs from the input field.")
+        self._create_tooltip(self.url_clear_btn, "Clear all URLs from the input field")
         # Always visible - no grid_remove()
         
         # Expand/Collapse button - toggles between Entry and ScrolledText modes
@@ -7080,7 +7280,8 @@ class BandcampDownloaderGUI:
         # Inner frame for content
         self.settings_content = Frame(self.settings_frame, bg=settings_frame_bg)
         # Start at row 0 (no separate header row)
-        self.settings_content.grid(row=0, column=0, sticky=(W, E), padx=6, pady=(4, 8))  # Balanced padding: less top, more bottom
+        # Win7: slightly less top padding so the Webdings eye reads larger/clearer
+        self.settings_content.grid(row=0, column=0, sticky=(W, E), padx=6, pady=(3, 8) if self._is_windows_7() else (4, 8))
         self.settings_frame.columnconfigure(0, weight=1)
         # Configure columns: label, combo, button (right-aligned)
         self.settings_content.columnconfigure(1, weight=1)  # Allow combo to expand
@@ -7161,7 +7362,7 @@ class BandcampDownloaderGUI:
         # Always keep it in grid to allow toggling panel visibility
         # Eye icon for showing/hiding album art (Win7 compatible)
         eye_icon = self._get_icon('eye')
-        eye_font = ("Webdings", 12) if self._is_windows_7() else ("Segoe UI", 10)
+        eye_font = ("Webdings", 13) if self._is_windows_7() else ("Segoe UI", 10)
         self.show_album_art_btn = Label(
             self.settings_content,
             text=eye_icon,
@@ -7278,7 +7479,7 @@ class BandcampDownloaderGUI:
         # Store reference before adding tooltip (tooltip needs the widget reference)
         self.filename_customize_btn = filename_customize_btn
         # Add tooltip first, then add color change handlers with add='+' so they don't interfere
-        self._create_tooltip(filename_customize_btn, "Create/Edit Custom Filename Formats")
+        self._create_tooltip(filename_customize_btn, "Create/Edit custom filename formats")
         # Use self.theme_colors to ensure correct colors after theme switches
         filename_customize_btn.bind("<Enter>", lambda e: filename_customize_btn.config(fg=self.theme_colors.hover_fg), add='+')
         filename_customize_btn.bind("<Leave>", lambda e: filename_customize_btn.config(fg=self.theme_colors.disabled_fg), add='+')
@@ -7522,7 +7723,7 @@ class BandcampDownloaderGUI:
         customize_btn.bind("<Button-1>", lambda e: self._show_customize_dialog())
         # Store reference and add tooltip first
         self.customize_btn = customize_btn
-        self._create_tooltip(customize_btn, "Create/Edit Custom Folder Structures")
+        self._create_tooltip(customize_btn, "Create/Edit custom folder structures")
         # Add color change handlers with add='+' so they don't interfere with tooltip
         # Use self.theme_colors to ensure correct colors after theme switches
         customize_btn.bind("<Enter>", lambda e: customize_btn.config(fg=self.theme_colors.hover_fg), add='+')
@@ -7623,7 +7824,7 @@ class BandcampDownloaderGUI:
         )
         download_cover_art_check.pack(side=LEFT, padx=(0, 12))
         self.download_cover_art_check = download_cover_art_check  # Store reference for theme updates
-        self._create_tooltip(download_cover_art_check, "Save album art to the download folder.")
+        self._create_tooltip(download_cover_art_check, "Save Album Art to the download folder")
         
         # Save bio pic checkbox
         download_bio_pic_check = Checkbutton(
@@ -7640,7 +7841,7 @@ class BandcampDownloaderGUI:
         )
         download_bio_pic_check.pack(side=LEFT, padx=(0, 12))
         self.download_bio_pic_check = download_bio_pic_check  # Store reference for theme updates
-        self._create_tooltip(download_bio_pic_check, "Save artist bio pic image to the download folder.")
+        self._create_tooltip(download_bio_pic_check, "Save artist Bio Pic image to the download folder")
         
         # Save extras checkbox (extra artwork only, not bio pic)
         download_extras_check = Checkbutton(
@@ -7657,7 +7858,7 @@ class BandcampDownloaderGUI:
         )
         download_extras_check.pack(side=LEFT)
         self.download_extras_check = download_extras_check  # Store reference for theme updates
-        self._create_tooltip(download_extras_check, "Save additional artwork to the download folder.")
+        self._create_tooltip(download_extras_check, "Save additional artwork to the download folder")
         
         # Create playlist checkbox (below Save copy of cover art)
         create_playlist_check = Checkbutton(
@@ -7976,7 +8177,7 @@ class BandcampDownloaderGUI:
             state='normal'
         )
         self.detach_btn.grid(row=0, column=1, sticky=E, padx=(0, 6), pady=(0, 0))
-        self._create_tooltip(self.detach_btn, "Detach status log into a separate window")
+        self._create_tooltip(self.detach_btn, "Detach Status Log into a separate window")
         
         # Clear log button (between Status label and Debug toggle) - styled like Browse button
         # Use same font size as Debug toggle (8) for consistency in header
@@ -18579,7 +18780,7 @@ class BandcampDownloaderGUI:
         self.detached_link_toggle = detached_link_toggle
         self.detached_link_var = detached_link_var
         # Add tooltip for Link checkbox
-        self._create_tooltip(detached_link_toggle, "When linked, the detached window moves with the main window.")
+        self._create_tooltip(detached_link_toggle, "When linked, the detached window moves with the main window")
         
         # If linking is already enabled, initialize it immediately after window is ready
         # This ensures linking works even if the checkbox was already checked when detaching
@@ -18614,9 +18815,9 @@ class BandcampDownloaderGUI:
             state='normal'
         )
         # Add tooltip for Attach button
-        self._create_tooltip(self.attach_btn, "Reattach the status log to the main window.")
+        self._create_tooltip(self.attach_btn, "Reattach the Status Log to the main window")
         self.attach_btn.grid(row=0, column=2, sticky=E, padx=(0, 6), pady=(0, 0))
-        #self._create_tooltip(self.attach_btn, "Reattach status log to main window")
+        #self._create_tooltip(self.attach_btn, "Reattach Status Log to main window")
         
         # Clear Log button - create new one that calls the same function
         detached_clear_btn = ttk.Button(
@@ -24351,7 +24552,7 @@ class BandcampDownloaderGUI:
                     for idx, album_url in enumerate(album_urls):
                         # Check for cancellation
                         if self.is_cancelling:
-                            self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                            self.root.after(0, self.download_complete, False, "Download cancelled by user!")
                             return
                         
                         # Update current album counter
@@ -24458,7 +24659,7 @@ class BandcampDownloaderGUI:
                 
                 for idx, url in enumerate(urls):
                     if self.is_cancelling:
-                        self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                        self.root.after(0, self.download_complete, False, "Download cancelled by user!")
                         return
                     
                     try:
@@ -24631,7 +24832,7 @@ class BandcampDownloaderGUI:
                     for idx, meta in enumerate(album_metadata):
                         # Check for cancellation
                         if self.is_cancelling:
-                            self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                            self.root.after(0, self.download_complete, False, "Download cancelled by user!")
                             return
                         
                         # Update current album counter
@@ -24855,18 +25056,18 @@ class BandcampDownloaderGUI:
             # Single album mode - download normally
             # Check for cancellation before starting download
             if self.is_cancelling:
-                self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                self.root.after(0, self.download_complete, False, "Download cancelled by user!")
                 return
             
             success = self.download_single_album(urls[0], album_index=0, total_albums=1)
             if not success:
                 # Check if this was a cancellation
                 if self.is_cancelling:
-                    self.root.after(0, self.download_complete, False, "Download cancelled by user.")
+                    self.root.after(0, self.download_complete, False, "Download cancelled by user!")
                 else:
                     # Error already logged in download_single_album
                     # Still need to restore UI
-                    self.root.after(0, self.download_complete, False, "Download failed.")
+                    self.root.after(0, self.download_complete, False, "Download failed!")
                 return
             
             # Success
@@ -25320,7 +25521,7 @@ class BandcampDownloaderGUI:
         
         # Check cancellation first - if cancelled, raise KeyboardInterrupt to stop current track immediately
         if self.is_cancelling:
-            raise KeyboardInterrupt("Download cancelled by user")
+            raise KeyboardInterrupt("Download cancelled by user!")
         
         try:
             status = d.get('status', '')
@@ -27050,7 +27251,7 @@ class BandcampDownloaderGUI:
             return response.json()
         except requests.exceptions.RequestException as e:
             messagebox.showerror(
-                "Download Failed",
+                "Download failed!",
                 f"Could not fetch themes from GitHub:\n\n{str(e)}\n\n"
                 "Please check your internet connection and try again."
             )
@@ -31812,12 +32013,12 @@ This tool downloads the freely available 128 kbps MP3 streams from Bandcamp. For
             is_cancelled = "cancelled" in message.lower()
             
             if is_cancelled:
-                self.progress_var.set("Download cancelled")
+                self.progress_var.set("Download cancelled!")
                 self.log("")
                 self.log(f"[X] {message}")
                 messagebox.showinfo("Cancelled", message)
             else:
-                self.progress_var.set("Download failed")
+                self.progress_var.set("Download failed!")
                 self.log("")
                 self.log(f"[X] {message}")
                 messagebox.showerror("Error", message)
