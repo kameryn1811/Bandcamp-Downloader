@@ -1021,23 +1021,23 @@ class ThemeColors:
     """Color palette for application themes."""
     def __init__(self, mode='dark'):
         if mode == 'dark':
-            # Dark mode - preserve exact existing colors
-            self.bg = '#1E1E1E'  # Very dark background (consistent everywhere)
+            # Dark mode - subtle teal lean (community / alabx palette)
+            self.bg = '#1B1B1A'  # Very dark background (consistent everywhere)
             self.fg = '#D4D4D4'  # Soft light text
             self.select_bg = '#252526'  # Slightly lighter for inputs only
             self.select_fg = '#FFFFFF'
             self.entry_bg = '#252526'  # Dark input background
             self.entry_fg = '#CCCCCC'  # Light input text
             self.border = '#3E3E42'  # Subtle borders
-            self.accent = '#007ACC'  # Blue accent (more modern than green)
-            self.success = '#2dacd5'  # Bandcamp blue for download btn / progress
+            self.accent = '#147EA7'  # Blue accent (more modern than green)
+            self.success = '#17A0C4'  # Bandcamp blue for download btn / progress
             self.hover_bg = '#3E3E42'  # Hover state
             self.hover_fg = '#D4D4D4'  # Hover text
             self.disabled_fg = '#808080'  # Disabled text
             self.warning = '#FFA500'  # Orange for warnings
-            self.preview_link = '#2dacd5'  # Preview path text
+            self.preview_link = '#2DACD5'  # Preview path text
             self.preview_link_hover = '#4FC3F7'  # Preview path hover
-            self.preview_bg = '#1E1E1E'  # Preview strip background (matches bg)
+            self.preview_bg = '#1B1B1A'  # Preview strip background (matches bg)
             self.preview_prefix_fg = '#D4D4D4'  # "Preview:" label
         elif mode == 'light':
             # Light mode - modern Windows light mode aesthetic
@@ -1048,14 +1048,14 @@ class ThemeColors:
             self.entry_bg = '#F5F5F5'  # Light gray input background
             self.entry_fg = '#1E1E1E'  # Dark input text
             self.border = '#D0D0D0'  # Medium gray borders (consistent for all sections)
-            self.accent = '#007ACC'  # Same blue accent (consistent)
-            self.success = '#2dacd5'  # Same Bandcamp blue (consistent)
+            self.accent = '#147EA7'  # Same blue accent (consistent)
+            self.success = '#17A0C4'  # Same Bandcamp blue (consistent)
             self.hover_bg = '#E8E8E8'  # Light hover state
             self.hover_fg = '#000000'  # Dark hover text
             self.disabled_fg = '#808080'  # Gray disabled text
             self.warning = '#FF8C00'  # Slightly darker orange for light mode
-            self.preview_link = '#005A9E'  # Darker blue for preview links (better contrast in light mode)
-            self.preview_link_hover = '#007ACC'  # Lighter blue on hover (still readable)
+            self.preview_link = '#006384'  # Darker blue for preview links (better contrast in light mode)
+            self.preview_link_hover = '#0098CA'  # Lighter blue on hover (still readable)
             self.preview_bg = '#F5F5F5'  # Preview strip background (matches select_bg / entry_bg)
             self.preview_prefix_fg = '#1E1E1E'  # "Preview:" label
 
